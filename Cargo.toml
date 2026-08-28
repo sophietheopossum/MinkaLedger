@@ -1,0 +1,17 @@
+[package]
+name = "minka-ledger"
+version = "0.1.0"
+edition = "2021"
+description = "Forecast-first personal ledger: double-entry core, RFC 5545 recurrence, pure-function projection"
+license = "MIT"
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 2
