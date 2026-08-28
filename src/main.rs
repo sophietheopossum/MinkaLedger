@@ -12,6 +12,7 @@
 mod db;
 mod recur;
 mod entry;
+mod forecast;
 mod money;
 
 use std::io::{BufRead, Write};
@@ -236,6 +237,132 @@ fn dispatch(
             let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
             entry::delete(conn, id)?;
             Ok(serde_json::json!({ "deleted": id }))
+        }
+
+        // ---- recurring series (req 1) ----
+        "series.create" => {
+            let desc = params.get("description").and_then(|v| v.as_str()).ok_or_else(|| bad("description"))?;
+            let rrule = params.get("rrule").and_then(|v| v.as_str()).ok_or_else(|| bad("rrule"))?;
+            let dtstart = params.get("dtstart").and_then(|v| v.as_str()).ok_or_else(|| bad("dtstart"))?;
+            let until = params.get("until_on").and_then(|v| v.as_str());
+            let weekend = params.get("weekend_rule").and_then(|v| v.as_str()).unwrap_or("none");
+            let scenario = params.get("scenario_id").and_then(|v| v.as_i64());
+            let supersedes = params.get("supersedes_id").and_then(|v| v.as_i64());
+            let postings = params.get("postings").and_then(|v| v.as_array()).ok_or_else(|| bad("postings"))?.clone();
+
+            let tx = conn.transaction().map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            tx.execute(
+                "INSERT INTO series(description, rrule, dtstart, until_on, weekend_rule, scenario_id, supersedes_id)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![desc, rrule, dtstart, until, weekend, scenario, supersedes],
+            ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            let sid = tx.last_insert_rowid();
+            for p in &postings {
+                let acc = p.get("account_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("account_id"))?;
+                let amt = p.get("amount_minor").and_then(|v| v.as_i64()).ok_or_else(|| bad("amount_minor"))?;
+                let role = p.get("role").and_then(|v| v.as_str()).unwrap_or("other");
+                // Currency comes from the account, never from the caller -- same rule as entry.rs.
+                let cur: String = tx.query_row("SELECT currency FROM account WHERE id = ?1", [acc], |r| r.get(0))
+                    .map_err(|_| Error { code: "no_such_account", message: format!("no such account: {acc}") })?;
+                tx.execute(
+                    "INSERT INTO series_posting(series_id, account_id, currency, amount_minor, role)
+                     VALUES(?1,?2,?3,?4,?5)",
+                    rusqlite::params![sid, acc, cur, amt, role],
+                ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            }
+            tx.commit().map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::json!({ "id": sid }))
+        }
+
+        "series.list" => {
+            let mut stmt = conn.prepare(
+                "SELECT s.id, s.description, s.rrule, s.dtstart, s.until_on, s.weekend_rule, s.scenario_id,
+                        (SELECT COUNT(*) FROM series_posting sp WHERE sp.series_id = s.id)
+                   FROM series s ORDER BY s.id",
+            ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            let rows: Vec<serde_json::Value> = stmt.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "description": r.get::<_, String>(1)?,
+                    "rrule": r.get::<_, String>(2)?,
+                    "dtstart": r.get::<_, String>(3)?,
+                    "until_on": r.get::<_, Option<String>>(4)?,
+                    "weekend_rule": r.get::<_, String>(5)?,
+                    "scenario_id": r.get::<_, Option<i64>>(6)?,
+                    "postings": r.get::<_, i64>(7)?,
+                }))
+            }).and_then(|m| m.collect()).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::Value::Array(rows))
+        }
+
+        // req 4: alter or skip ONE occurrence
+        "series.override" => {
+            let sid = params.get("series_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("series_id"))?;
+            let on = params.get("occurrence_on").and_then(|v| v.as_str()).ok_or_else(|| bad("occurrence_on"))?;
+            let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("amend");
+            let moved = params.get("moved_to").and_then(|v| v.as_str());
+            let amount = params.get("amount_minor").and_then(|v| v.as_i64());
+            let desc = params.get("description").and_then(|v| v.as_str());
+            conn.execute(
+                "INSERT INTO series_override(series_id, occurrence_on, action, moved_to, amount_minor, description)
+                 VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(series_id, occurrence_on) DO UPDATE SET
+                   action=excluded.action, moved_to=excluded.moved_to,
+                   amount_minor=excluded.amount_minor, description=excluded.description",
+                rusqlite::params![sid, on, action, moved, amount, desc],
+            ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::json!({ "series_id": sid, "occurrence_on": on, "action": action }))
+        }
+
+        "series.clear_override" => {
+            let sid = params.get("series_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("series_id"))?;
+            let on = params.get("occurrence_on").and_then(|v| v.as_str()).ok_or_else(|| bad("occurrence_on"))?;
+            let n = conn.execute(
+                "DELETE FROM series_override WHERE series_id = ?1 AND occurrence_on = ?2",
+                rusqlite::params![sid, on],
+            ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::json!({ "cleared": n }))
+        }
+
+        // ---- scenarios (req 8) ----
+        "scenario.create" => {
+            let name = params.get("name").and_then(|v| v.as_str()).ok_or_else(|| bad("name"))?;
+            let note = params.get("note").and_then(|v| v.as_str());
+            conn.execute("INSERT INTO scenario(name, note) VALUES(?1,?2)", rusqlite::params![name, note])
+                .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::json!({ "id": conn.last_insert_rowid() }))
+        }
+
+        "scenario.list" => {
+            let mut stmt = conn.prepare("SELECT id, name, note FROM scenario ORDER BY id")
+                .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            let rows: Vec<serde_json::Value> = stmt.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?,
+                    "note": r.get::<_, Option<String>>(2)?,
+                }))
+            }).and_then(|m| m.collect()).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::Value::Array(rows))
+        }
+
+        // ---- the projection (req 2, 8) ----
+        "forecast.project" => {
+            let parse = |k: &str| -> Result<chrono::NaiveDate, Error> {
+                let s = params.get(k).and_then(|v| v.as_str()).ok_or_else(|| bad(k))?;
+                chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                    .map_err(|_| bad(&format!("{k} must be YYYY-MM-DD")))
+            };
+            let as_of = parse("as_of")?;
+            let horizon = parse("horizon")?;
+            let active: std::collections::HashSet<i64> = params
+                .get("scenarios").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+                .unwrap_or_default();
+            let snap = forecast::load::snapshot(conn, as_of)
+                .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            let proj = forecast::project(&recur::RRuleCrate, &snap, as_of, horizon, &active)
+                .map_err(|e| Error { code: "bad_rule", message: e.to_string() })?;
+            serde_json::to_value(proj).map_err(|e| Error { code: "internal", message: e.to_string() })
         }
 
         other => Err(Error::unknown_method(other)),
