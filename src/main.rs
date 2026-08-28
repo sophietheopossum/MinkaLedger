@@ -12,6 +12,7 @@
 mod db;
 mod recur;
 mod entry;
+mod export;
 mod forecast;
 mod fx;
 mod importer;
@@ -155,6 +156,13 @@ impl From<importer::ImportError> for Error {
             I::Csv(_) => "csv",
             I::Sql(_) => "sql",
         };
+        Error { code, message: e.to_string() }
+    }
+}
+
+impl From<export::ExportError> for Error {
+    fn from(e: export::ExportError) -> Self {
+        let code = match e { export::ExportError::Io(_) => "io", _ => "sql" };
         Error { code, message: e.to_string() }
     }
 }
@@ -679,6 +687,50 @@ fn dispatch(
                     g("set_far_account_id")],
             ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
             Ok(serde_json::json!({ "id": conn.last_insert_rowid() }))
+        }
+
+        // ---- export (req 7) ----
+        "export.bundle" => {
+            let opt = export::Options {
+                from: params.get("from").and_then(|v| v.as_str()),
+                to: params.get("to").and_then(|v| v.as_str()),
+                redact: params.get("redact").and_then(|v| v.as_bool()).unwrap_or(false),
+                forecast_to: params.get("forecast_to").and_then(|v| v.as_str()),
+            };
+            let doc = export::bundle(conn, &opt)?;
+            match params.get("path").and_then(|v| v.as_str()) {
+                Some(path) => {
+                    std::fs::write(path, serde_json::to_string_pretty(&doc).unwrap_or_default())
+                        .map_err(|e| Error { code: "io", message: format!("{path}: {e}") })?;
+                    Ok(serde_json::json!({ "written": path,
+                        "lines": doc["lines"].as_array().map(|a| a.len()).unwrap_or(0) }))
+                }
+                None => Ok(doc),
+            }
+        }
+
+        "export.csv" => {
+            let opt = export::Options {
+                from: params.get("from").and_then(|v| v.as_str()),
+                to: params.get("to").and_then(|v| v.as_str()),
+                redact: params.get("redact").and_then(|v| v.as_bool()).unwrap_or(false),
+                forecast_to: None,
+            };
+            let text = export::csv(conn, &opt)?;
+            match params.get("path").and_then(|v| v.as_str()) {
+                Some(path) => {
+                    std::fs::write(path, &text)
+                        .map_err(|e| Error { code: "io", message: format!("{path}: {e}") })?;
+                    Ok(serde_json::json!({ "written": path, "rows": text.lines().count() - 1 }))
+                }
+                None => Ok(serde_json::json!({ "csv": text })),
+            }
+        }
+
+        "export.snapshot" => {
+            let path = params.get("path").and_then(|v| v.as_str()).ok_or_else(|| bad("path"))?;
+            export::snapshot_db(conn, path)?;
+            Ok(serde_json::json!({ "written": path }))
         }
 
         other => Err(Error::unknown_method(other)),
