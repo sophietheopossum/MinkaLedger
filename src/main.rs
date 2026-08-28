@@ -10,6 +10,7 @@
 //! returned as an error: a malformed request must not take the session down.
 
 mod db;
+mod recur;
 mod entry;
 mod money;
 
