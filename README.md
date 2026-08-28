@@ -39,9 +39,21 @@ ending the session.
 
 ## Status
 
-Build step 1 of 9 (schema, money, RPC skeleton). Steps 2-9: accounts and manual entry, recurrence
+All nine build steps are done: schema, accounts and manual entry, recurrence and forecast,
+journeys, multi-currency, interest, CSV import, export, and the QML frontend.
 and forecast, journeys, multi-currency, interest, CSV import, export, QML frontend.
 
 Deferred deliberately, unblocked by the schema: crypto Section 104 pooling, and income
-categorisation for self-assessment. Both are pure functions over history that a ledger already
+categorisation for self-assessment. Both are pure functions over history the ledger already
 stores, so neither needs a schema change.
+## The UI
+
+A Quickshell app in `ui/`, talking to the core over its stdio.
+
+    MINKA_LEDGER_BIN=./target/debug/minka-ledger \
+    MINKA_LEDGER_DB=~/book.db \
+    qs -p /absolute/path/to/MinkaLedger/ui
+
+Themed through Proustite and using MinkaLink's `NdjsonRpc` — the same request/response client
+ShojiClient uses, over a child process instead of a socket. Charts are hand-drawn on `Canvas`
+following MinkaMon's house pattern; QtCharts is deliberately not a dependency.
