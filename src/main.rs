@@ -13,6 +13,7 @@ mod db;
 mod recur;
 mod entry;
 mod forecast;
+mod fx;
 mod journey;
 mod money;
 
@@ -122,6 +123,20 @@ impl From<journey::JourneyError> for Error {
             J::NotFound(_) => "not_found",
             J::NoSuchTxn(_) => "no_such_txn",
             J::Sql(_) => "sql",
+        };
+        Error { code, message: e.to_string() }
+    }
+}
+
+impl From<fx::FxError> for Error {
+    fn from(e: fx::FxError) -> Self {
+        use fx::FxError as F;
+        let code = match e {
+            F::NoRate { .. } => "no_rate",
+            F::UnknownCurrency(_) => "unknown_currency",
+            F::SameCurrency(_) => "same_currency",
+            F::BadRate(_) => "bad_rate",
+            F::Sql(_) => "sql",
         };
         Error { code, message: e.to_string() }
     }
@@ -411,6 +426,80 @@ fn dispatch(
         "journey.for_txn" => {
             let t = params.get("txn_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("txn_id"))?;
             Ok(serde_json::Value::Array(journey::for_txn(conn, t)?))
+        }
+
+        // ---- multi-currency ----
+        "fx.put_rate" => {
+            let base = params.get("base").and_then(|v| v.as_str()).ok_or_else(|| bad("base"))?;
+            let quote = params.get("quote").and_then(|v| v.as_str()).ok_or_else(|| bad("quote"))?;
+            let as_of = params.get("as_of").and_then(|v| v.as_str()).ok_or_else(|| bad("as_of"))?;
+            let source = params.get("source").and_then(|v| v.as_str()).unwrap_or("manual");
+            // Accept either an exact rational or a decimal string, which is parsed EXACTLY into one.
+            let rate = if let (Some(n), Some(d)) =
+                (params.get("num").and_then(|v| v.as_i64()), params.get("den").and_then(|v| v.as_i64()))
+            {
+                fx::Rate { num: n, den: d }
+            } else {
+                let text = params.get("rate").and_then(|v| v.as_str()).ok_or_else(|| bad("rate or num/den"))?;
+                let (whole, frac) = match text.split_once('.') {
+                    Some((w, f)) => (w, f),
+                    None => (text, ""),
+                };
+                let digits: String = format!("{whole}{frac}");
+                let num: i64 = digits.parse().map_err(|_| bad("rate must be a decimal"))?;
+                fx::Rate { num, den: 10i64.pow(frac.len() as u32) }
+            };
+            fx::put_rate(conn, base, quote, as_of, source, rate)?;
+            Ok(serde_json::json!({ "base": base, "quote": quote, "as_of": as_of,
+                                   "num": rate.num, "den": rate.den }))
+        }
+
+        "fx.rate" => {
+            let base = params.get("base").and_then(|v| v.as_str()).ok_or_else(|| bad("base"))?;
+            let quote = params.get("quote").and_then(|v| v.as_str()).ok_or_else(|| bad("quote"))?;
+            let on = params.get("on").and_then(|v| v.as_str()).ok_or_else(|| bad("on"))?;
+            let on = chrono::NaiveDate::parse_from_str(on, "%Y-%m-%d").map_err(|_| bad("on"))?;
+            let (r, as_of) = fx::resolve_rate(conn, base, quote, on)?;
+            Ok(serde_json::json!({ "num": r.num, "den": r.den, "as_of": as_of,
+                                   "approx": r.as_f64_for_display() }))
+        }
+
+        "fx.convert" => {
+            let amount = params.get("amount_minor").and_then(|v| v.as_i64()).ok_or_else(|| bad("amount_minor"))?;
+            let from = params.get("from").and_then(|v| v.as_str()).ok_or_else(|| bad("from"))?;
+            let to = params.get("to").and_then(|v| v.as_str()).ok_or_else(|| bad("to"))?;
+            let on = params.get("on").and_then(|v| v.as_str()).ok_or_else(|| bad("on"))?;
+            let on = chrono::NaiveDate::parse_from_str(on, "%Y-%m-%d").map_err(|_| bad("on"))?;
+            let (out, r, as_of) = fx::convert(conn, amount, from, to, on)?;
+            Ok(serde_json::json!({ "amount_minor": out, "rate_as_of": as_of,
+                                   "num": r.num, "den": r.den }))
+        }
+
+        "fx.fetch" => {
+            let on = params.get("on").and_then(|v| v.as_str())
+                .map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| bad("on")))
+                .transpose()?
+                .unwrap_or_else(|| chrono::Local::now().date_naive());
+            let (reported, n) = fx::fetch::rates_for(conn, on)?;
+            Ok(serde_json::json!({ "requested": on.to_string(), "reported": reported, "stored": n }))
+        }
+
+        "fx.position" => {
+            let on = params.get("on").and_then(|v| v.as_str()).ok_or_else(|| bad("on"))?;
+            let on = chrono::NaiveDate::parse_from_str(on, "%Y-%m-%d").map_err(|_| bad("on"))?;
+            Ok(fx::fx_position(conn, on)?)
+        }
+
+        // The ONLY way to create a cross-currency transaction.
+        "txn.convert" => {
+            let on = params.get("occurred_on").and_then(|v| v.as_str()).ok_or_else(|| bad("occurred_on"))?;
+            let desc = params.get("description").and_then(|v| v.as_str()).unwrap_or("currency conversion");
+            let fa = params.get("from_account").and_then(|v| v.as_i64()).ok_or_else(|| bad("from_account"))?;
+            let fm = params.get("from_minor").and_then(|v| v.as_i64()).ok_or_else(|| bad("from_minor"))?;
+            let ta = params.get("to_account").and_then(|v| v.as_i64()).ok_or_else(|| bad("to_account"))?;
+            let tm = params.get("to_minor").and_then(|v| v.as_i64()).ok_or_else(|| bad("to_minor"))?;
+            let id = fx::build_conversion(conn, on, desc, fa, fm, ta, tm)?;
+            Ok(serde_json::json!({ "id": id }))
         }
 
         other => Err(Error::unknown_method(other)),
