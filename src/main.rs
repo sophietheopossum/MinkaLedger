@@ -13,6 +13,7 @@ mod db;
 mod recur;
 mod entry;
 mod forecast;
+mod journey;
 mod money;
 
 use std::io::{BufRead, Write};
@@ -109,6 +110,18 @@ impl From<entry::EntryError> for Error {
             E::SystemAccount(_) => "system_account",
             E::NotFound(_) => "not_found",
             E::Sql(_) => "sql",
+        };
+        Error { code, message: e.to_string() }
+    }
+}
+
+impl From<journey::JourneyError> for Error {
+    fn from(e: journey::JourneyError) -> Self {
+        use journey::JourneyError as J;
+        let code = match e {
+            J::NotFound(_) => "not_found",
+            J::NoSuchTxn(_) => "no_such_txn",
+            J::Sql(_) => "sql",
         };
         Error { code, message: e.to_string() }
     }
@@ -363,6 +376,41 @@ fn dispatch(
             let proj = forecast::project(&recur::RRuleCrate, &snap, as_of, horizon, &active)
                 .map_err(|e| Error { code: "bad_rule", message: e.to_string() })?;
             serde_json::to_value(proj).map_err(|e| Error { code: "internal", message: e.to_string() })
+        }
+
+        // ---- journeys (req 5, 10) ----
+        "journey.create" => {
+            let label = params.get("label").and_then(|v| v.as_str()).ok_or_else(|| bad("label"))?;
+            let on = params.get("opened_on").and_then(|v| v.as_str()).ok_or_else(|| bad("opened_on"))?;
+            Ok(serde_json::json!({ "id": journey::create(conn, label, on)? }))
+        }
+        "journey.list" => Ok(serde_json::Value::Array(journey::list(conn)?)),
+        "journey.get" => {
+            let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
+            Ok(journey::get(conn, id)?)
+        }
+        "journey.attach" => {
+            let j = params.get("journey_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("journey_id"))?;
+            let t = params.get("txn_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("txn_id"))?;
+            let seq = params.get("seq").and_then(|v| v.as_i64()).unwrap_or(0);
+            let role = params.get("role").and_then(|v| v.as_str()).unwrap_or("leg");
+            journey::attach(conn, j, t, seq, role)?;
+            Ok(serde_json::json!({ "journey_id": j, "txn_id": t, "seq": seq, "role": role }))
+        }
+        "journey.detach" => {
+            let j = params.get("journey_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("journey_id"))?;
+            let t = params.get("txn_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("txn_id"))?;
+            Ok(serde_json::json!({ "detached": journey::detach(conn, j, t)? }))
+        }
+        "journey.close" => {
+            let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
+            let on = params.get("on").and_then(|v| v.as_str()).ok_or_else(|| bad("on"))?;
+            journey::close(conn, id, on)?;
+            Ok(serde_json::json!({ "id": id, "closed_on": on }))
+        }
+        "journey.for_txn" => {
+            let t = params.get("txn_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("txn_id"))?;
+            Ok(serde_json::Value::Array(journey::for_txn(conn, t)?))
         }
 
         other => Err(Error::unknown_method(other)),
