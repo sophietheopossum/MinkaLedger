@@ -44,6 +44,43 @@ pub struct Override {
     pub description: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct InterestRule {
+    pub id: i64,
+    pub account_id: i64,
+    pub counter_account_id: i64,
+    pub shape: String,
+    /// 'negative' = debt (cards, loans); 'positive' = savings.
+    pub accrues_on: String,
+    /// 'daily' compounds on the running balance; 'per_period' charges once at capitalisation.
+    pub accrual_freq: String,
+    pub capitalise_rrule: String,
+    pub capitalise_dtstart: NaiveDate,
+    pub periodic_rate_e15: i64,
+    /// Cards with a grace period charge nothing while the balance is clear.
+    pub grace_period: bool,
+    pub scenario_id: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PaymentRule {
+    pub id: i64,
+    /// The account being paid down.
+    pub account_id: i64,
+    /// Where the money comes from.
+    pub from_account_id: i64,
+    pub amount_kind: String,
+    pub fixed_minor: Option<Minor>,
+    pub pct_e15: Option<i64>,
+    pub floor_minor: Option<Minor>,
+    pub cap_minor: Option<Minor>,
+    pub level_payment_minor: Option<Minor>,
+    pub rrule: String,
+    pub dtstart: NaiveDate,
+    pub until_on: Option<NaiveDate>,
+    pub scenario_id: Option<i64>,
+}
+
 /// Everything the projection needs, loaded by one read transaction and then detached from the
 /// database entirely.
 #[derive(Debug, Default)]
@@ -57,6 +94,8 @@ pub struct Snapshot {
     /// (series_id, occurrence_on) already filled by a real transaction.
     pub claimed: HashSet<(i64, NaiveDate)>,
     pub holidays: Vec<NaiveDate>,
+    pub interest_rules: Vec<InterestRule>,
+    pub payment_rules: Vec<PaymentRule>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -173,32 +212,187 @@ pub fn project<R: Recurrence>(
         (&a.value_on, a.series_id, a.account_id).cmp(&(&b.value_on, b.series_id, b.account_id))
     });
 
-    // Accumulate forward. Only days that move are emitted.
+    // ---- the day fold ----
+    //
+    // Interest cannot be expanded in advance like a series: its amount depends on the balance on
+    // the day, and that balance is what we are computing. So the walk is genuinely sequential --
+    // each day's interest changes every later day's balance.
+    //
+    // Order WITHIN a day: movements first, then accrual on the closing balance, then
+    // capitalisation, then any payment. Accruing on the closing balance is the conventional
+    // treatment and it means a payment landing today reduces today's interest, which is what a
+    // cardholder expects when they pay early.
+    let active_rule = |sid: &Option<i64>| match sid {
+        Some(id) => active.contains(id),
+        None => true,
+    };
+    let irules: Vec<&InterestRule> =
+        snap.interest_rules.iter().filter(|r| active_rule(&r.scenario_id)).collect();
+    let prules: Vec<&PaymentRule> =
+        snap.payment_rules.iter().filter(|r| active_rule(&r.scenario_id)).collect();
+
+    // Pre-expand the DATES interest events land on. Only the dates -- the amounts are unknowable
+    // until the walk reaches them.
+    let mut capitalise_on: HashMap<i64, HashSet<NaiveDate>> = HashMap::new();
+    for r in &irules {
+        let days = recur.expand(&r.capitalise_rrule, r.capitalise_dtstart, None, as_of, horizon)?;
+        capitalise_on.insert(r.id, days.into_iter().collect());
+    }
+    let mut pay_on: HashMap<i64, HashSet<NaiveDate>> = HashMap::new();
+    for r in &prules {
+        let days = recur.expand(&r.rrule, r.dtstart, r.until_on, as_of, horizon)?;
+        pay_on.insert(r.id, days.into_iter().collect());
+    }
+
     let mut running: BTreeMap<i64, Minor> = snap.opening.clone();
     let mut balances: Vec<BalancePoint> = Vec::new();
-    let mut i = 0;
-    while i < occurrences.len() {
-        let day = occurrences[i].value_on.clone();
-        let mut touched: Vec<i64> = Vec::new();
-        while i < occurrences.len() && occurrences[i].value_on == day {
-            let o = &occurrences[i];
-            *running.entry(o.account_id).or_insert(0) += o.amount_minor;
-            if !touched.contains(&o.account_id) {
-                touched.push(o.account_id);
-            }
-            i += 1;
-        }
-        touched.sort_unstable();
-        for account_id in touched {
-            balances.push(BalancePoint {
-                account_id,
-                account: snap.account_name.get(&account_id).cloned().unwrap_or_default(),
-                currency: snap.account_currency.get(&account_id).cloned().unwrap_or_default(),
-                on: day.clone(),
-                balance_minor: running[&account_id],
-            });
-        }
+    // Interest accrued but not yet posted, per rule.
+    let mut accrued: HashMap<i64, Minor> = HashMap::new();
+    // The balance frozen at the last capitalisation -- what a minimum payment is a percentage OF.
+    let mut statement: HashMap<i64, Minor> = HashMap::new();
+    let mut by_day: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, o) in occurrences.iter().enumerate() {
+        by_day.entry(o.value_on.clone()).or_default().push(idx);
     }
+
+    let mut extra: Vec<Occurrence> = Vec::new();
+    let mut day = as_of;
+    let need_walk = !irules.is_empty() || !prules.is_empty();
+    while day <= horizon {
+        let key = day.to_string();
+        let mut touched: Vec<i64> = Vec::new();
+
+        if let Some(idxs) = by_day.get(&key) {
+            for &idx in idxs {
+                let o = &occurrences[idx];
+                *running.entry(o.account_id).or_insert(0) += o.amount_minor;
+                if !touched.contains(&o.account_id) {
+                    touched.push(o.account_id);
+                }
+            }
+        }
+
+        if need_walk {
+            for r in &irules {
+                let bal = *running.get(&r.account_id).unwrap_or(&0);
+                // A rule only bites on the side of zero it is written for: a card charges on debt,
+                // a savings account pays on credit. Wrong-side balances accrue nothing.
+                let engaged = match r.accrues_on.as_str() {
+                    "negative" => bal < 0,
+                    _ => bal > 0,
+                };
+                // Grace: a card that owes nothing charges nothing.
+                let graced = r.grace_period && !engaged;
+                if r.accrual_freq == "daily" && engaged && !graced {
+                    let today = crate::interest::accrue(bal, r.periodic_rate_e15).unwrap_or(0);
+                    *accrued.entry(r.id).or_insert(0) += today;
+                }
+
+                if capitalise_on.get(&r.id).is_some_and(|d| d.contains(&day)) {
+                    // per_period charges once, on the balance standing at capitalisation.
+                    if r.accrual_freq == "per_period" && engaged && !graced {
+                        let amount =
+                            crate::interest::accrue(bal, r.periodic_rate_e15).unwrap_or(0);
+                        *accrued.entry(r.id).or_insert(0) += amount;
+                    }
+                    let amount = accrued.remove(&r.id).unwrap_or(0);
+                    if amount != 0 {
+                        // Interest posts in the account's OWN currency; this engine never converts.
+                        let cur = snap.account_currency.get(&r.account_id).cloned().unwrap_or_default();
+                        for (acct, amt) in
+                            [(r.account_id, amount), (r.counter_account_id, -amount)]
+                        {
+                            *running.entry(acct).or_insert(0) += amt;
+                            if !touched.contains(&acct) {
+                                touched.push(acct);
+                            }
+                            extra.push(Occurrence {
+                                series_id: -r.id, // negative marks a generated interest leg
+                                occurrence_on: key.clone(),
+                                value_on: key.clone(),
+                                description: format!("Interest ({})", r.shape),
+                                account_id: acct,
+                                account: snap.account_name.get(&acct).cloned().unwrap_or_default(),
+                                currency: cur.clone(),
+                                amount_minor: amt,
+                            });
+                        }
+                    }
+                    // Keyed by ACCOUNT, not by rule id: the statement balance is a property of
+                    // the card, and the interest rule and the payment rule that reads it are in
+                    // different id spaces entirely.
+                    statement.insert(r.account_id, *running.get(&r.account_id).unwrap_or(&0));
+                }
+            }
+
+            for r in &prules {
+                if !pay_on.get(&r.id).is_some_and(|d| d.contains(&day)) {
+                    continue;
+                }
+                let bal = *running.get(&r.account_id).unwrap_or(&0);
+                // Debt is held negative; payment sizing works in positive magnitudes.
+                let owed = (-bal).max(0);
+                let stmt = statement
+                    .get(&r.account_id)
+                    .map(|s| (-s).max(0))
+                    .unwrap_or(owed);
+                let ctx = crate::interest::PaymentContext {
+                    balance_minor: owed,
+                    statement_minor: stmt,
+                    interest_minor: 0,
+                    fees_minor: 0,
+                };
+                let amount = crate::interest::payment_amount(
+                    &r.amount_kind, ctx, r.fixed_minor, r.pct_e15, r.floor_minor, r.cap_minor,
+                    r.level_payment_minor,
+                )
+                .unwrap_or(0);
+                if amount != 0 {
+                    let cur =
+                        snap.account_currency.get(&r.account_id).cloned().unwrap_or_default();
+                    for (acct, amt) in
+                        [(r.account_id, amount), (r.from_account_id, -amount)]
+                    {
+                        *running.entry(acct).or_insert(0) += amt;
+                        if !touched.contains(&acct) {
+                            touched.push(acct);
+                        }
+                        extra.push(Occurrence {
+                            series_id: -r.id,
+                            occurrence_on: key.clone(),
+                            value_on: key.clone(),
+                            description: "Payment".to_string(),
+                            account_id: acct,
+                            account: snap.account_name.get(&acct).cloned().unwrap_or_default(),
+                            currency: cur.clone(),
+                            amount_minor: amt,
+                        });
+                    }
+                }
+            }
+        }
+
+        if !touched.is_empty() {
+            touched.sort_unstable();
+            for account_id in touched {
+                balances.push(BalancePoint {
+                    account_id,
+                    account: snap.account_name.get(&account_id).cloned().unwrap_or_default(),
+                    currency: snap.account_currency.get(&account_id).cloned().unwrap_or_default(),
+                    on: key.clone(),
+                    balance_minor: running[&account_id],
+                });
+            }
+        }
+        day = match day.succ_opt() {
+            Some(d) => d,
+            None => break,
+        };
+    }
+    occurrences.extend(extra);
+    occurrences.sort_by(|a, b| {
+        (&a.value_on, a.series_id, a.account_id).cmp(&(&b.value_on, b.series_id, b.account_id))
+    });
 
     Ok(Projection {
         occurrences,
@@ -407,6 +601,136 @@ mod tests {
         assert_eq!(days.len(), 6, "3 rent days + 3 salary days, not 92 calendar days");
     }
 
+    /// A credit card: a liability account with an interest rule and a minimum-payment rule.
+    fn card_book(pay_kind: &str, pay_amount: Option<Minor>, pct: Option<i64>) -> Snapshot {
+        let mut s = Snapshot::default();
+        for (id, name) in [(1, "Current"), (5, "Card"), (6, "Interest paid")] {
+            s.account_name.insert(id, name.into());
+            s.account_currency.insert(id, "GBP".into());
+        }
+        s.opening.insert(1, 500_000);  // £5,000 in the current account
+        s.opening.insert(5, -200_000); // £2,000 owed on the card
+        // 24.9% AER, accrued daily, capitalised on the 1st.
+        let rate = crate::interest::derive_periodic_rate(249_000_000_000_000, "effective", 365).unwrap();
+        s.interest_rules.push(InterestRule {
+            id: 1, account_id: 5, counter_account_id: 6,
+            shape: "revolving".into(), accrues_on: "negative".into(), accrual_freq: "daily".into(),
+            capitalise_rrule: "FREQ=MONTHLY;BYMONTHDAY=1".into(),
+            capitalise_dtstart: d("2026-01-01"), periodic_rate_e15: rate,
+            grace_period: true, scenario_id: None,
+        });
+        s.payment_rules.push(PaymentRule {
+            id: 1, account_id: 5, from_account_id: 1,
+            amount_kind: pay_kind.into(), fixed_minor: pay_amount, pct_e15: pct,
+            floor_minor: Some(500), cap_minor: None, level_payment_minor: None,
+            rrule: "FREQ=MONTHLY;BYMONTHDAY=15".into(), dtstart: d("2026-01-15"),
+            until_on: None, scenario_id: None,
+        });
+        s
+    }
+
+    #[test]
+    fn a_card_paying_only_the_minimum_barely_moves() {
+        // 1% of the statement, floored at £5 -- the classic trap. Over a year the balance should
+        // fall only slightly, because most of each payment is interest.
+        let s = card_book("pct_of_statement", None, Some(10_000_000_000_000));
+        let p = run(&s, "2026-01-01", "2026-12-31", &[]);
+        let end = closing(&p, 5);
+        assert!(end < 0, "still in debt after a year of minimums: {end}");
+        assert!(end > -200_000 - 60_000 && end < -150_000,
+                "minimum payments barely dent £2,000 at 24.9%: got {end}");
+        // and interest legs were actually generated
+        assert!(p.occurrences.iter().any(|o| o.description.starts_with("Interest")));
+    }
+
+    #[test]
+    fn paying_more_clears_the_card_and_composes_as_a_scenario() {
+        // The requirement-9 question: "what if I pay £250 a month instead?"
+        let mut s = card_book("pct_of_statement", None, Some(10_000_000_000_000));
+        s.payment_rules.push(PaymentRule {
+            id: 2, account_id: 5, from_account_id: 1,
+            amount_kind: "fixed".into(), fixed_minor: Some(25_000), pct_e15: None,
+            floor_minor: None, cap_minor: None, level_payment_minor: None,
+            rrule: "FREQ=MONTHLY;BYMONTHDAY=15".into(), dtstart: d("2026-01-15"),
+            until_on: None, scenario_id: Some(1),
+        });
+        let minimum = run(&s, "2026-01-01", "2026-12-31", &[]);
+        let harder = run(&s, "2026-01-01", "2026-12-31", &[1]);
+        assert!(closing(&harder, 5) > closing(&minimum, 5),
+                "paying more must leave less debt");
+        // Cleared, and very slightly IN CREDIT. That is not a rounding artefact: a payment sized
+        // from the statement pays what the statement said, and by the time it lands the balance has
+        // fallen below that. A standing order overshooting a nearly-cleared card is exactly what
+        // happens in life, so the projection shows it rather than clamping it away.
+        let end = closing(&harder, 5);
+        assert!((0..1_000).contains(&end), "cleared, possibly a few pounds in credit: got {end}");
+        assert!(closing(&minimum, 5) < -150_000, "the minimum-only path is still deep in debt");
+    }
+
+    #[test]
+    fn a_cleared_card_with_a_grace_period_charges_nothing() {
+        let mut s = card_book("fixed", Some(0), None);
+        s.opening.insert(5, 0); // nothing owed
+        let p = run(&s, "2026-01-01", "2026-06-30", &[]);
+        assert!(!p.occurrences.iter().any(|o| o.description.starts_with("Interest")),
+                "a clear card in its grace period accrues nothing");
+    }
+
+    #[test]
+    fn an_amortising_loan_runs_down_to_zero() {
+        let mut s = Snapshot::default();
+        for (id, name) in [(1, "Current"), (7, "Loan"), (8, "Loan interest")] {
+            s.account_name.insert(id, name.into());
+            s.account_currency.insert(id, "GBP".into());
+        }
+        s.opening.insert(1, 5_000_000);
+        s.opening.insert(7, -1_000_000); // £10,000 borrowed
+        let rate = crate::interest::derive_periodic_rate(60_000_000_000_000, "nominal", 12).unwrap();
+        let level = crate::interest::derive_level_payment(1_000_000, rate, 60).unwrap();
+        s.interest_rules.push(InterestRule {
+            id: 2, account_id: 7, counter_account_id: 8,
+            shape: "amortising".into(), accrues_on: "negative".into(),
+            accrual_freq: "per_period".into(),
+            capitalise_rrule: "FREQ=MONTHLY;BYMONTHDAY=1".into(),
+            capitalise_dtstart: d("2026-01-01"), periodic_rate_e15: rate,
+            grace_period: false, scenario_id: None,
+        });
+        s.payment_rules.push(PaymentRule {
+            id: 3, account_id: 7, from_account_id: 1,
+            amount_kind: "amortising_level".into(), fixed_minor: None, pct_e15: None,
+            floor_minor: None, cap_minor: None, level_payment_minor: Some(level),
+            rrule: "FREQ=MONTHLY;BYMONTHDAY=2".into(), dtstart: d("2026-01-02"),
+            until_on: None, scenario_id: None,
+        });
+        // 60 monthly payments from Jan 2026
+        let p = run(&s, "2026-01-01", "2030-12-31", &[]);
+        let end = closing(&p, 7);
+        assert_eq!(end, 0, "the loan must run down to exactly zero, got {end}");
+    }
+
+    #[test]
+    fn savings_interest_compounds_in_your_favour() {
+        let mut s = Snapshot::default();
+        for (id, name) in [(9, "Savings"), (10, "Interest earned")] {
+            s.account_name.insert(id, name.into());
+            s.account_currency.insert(id, "GBP".into());
+        }
+        s.opening.insert(9, 500_000); // £5,000
+        let rate = crate::interest::derive_periodic_rate(45_000_000_000_000, "effective", 12).unwrap();
+        s.interest_rules.push(InterestRule {
+            id: 3, account_id: 9, counter_account_id: 10,
+            shape: "savings".into(), accrues_on: "positive".into(),
+            accrual_freq: "per_period".into(),
+            capitalise_rrule: "FREQ=MONTHLY;BYMONTHDAY=1".into(),
+            capitalise_dtstart: d("2026-01-01"), periodic_rate_e15: rate,
+            grace_period: false, scenario_id: None,
+        });
+        let p = run(&s, "2026-01-01", "2026-12-31", &[]);
+        let end = closing(&p, 9);
+        // 12 monthly credits at 4.5% AER on £5,000 -- about £225 earned
+        assert!((522_000..=523_000).contains(&end), "a year at 4.5% AER: got {end}");
+    }
+
     #[test]
     fn an_empty_horizon_projects_nothing_but_does_not_fail() {
         let p = run(&snap(), "2026-08-02", "2026-08-03", &[]);
@@ -527,6 +851,69 @@ pub mod load {
         for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, date(r.get::<_, String>(1)?))))? {
             let (sid, on) = row?;
             snap.claimed.insert((sid, on));
+        }
+
+        // Interest rules, each with the rate period in force at `as_of`. A rule with no rate
+        // period is skipped rather than defaulted: a silent 0% would read as "no interest" and be
+        // indistinguishable from a correct projection.
+        let mut st = conn.prepare(
+            "SELECT r.id, r.account_id, r.counter_account_id, r.shape, r.accrues_on,
+                    r.accrual_freq, r.capitalise_rrule, r.capitalise_dtstart, r.grace_period,
+                    r.scenario_id,
+                    (SELECT p.periodic_rate_e15 FROM interest_rate_period p
+                      WHERE p.rule_id = r.id AND p.effective_from <= ?1
+                        AND (p.effective_to IS NULL OR p.effective_to > ?1)
+                      ORDER BY p.effective_from DESC LIMIT 1)
+               FROM interest_rule r",
+        )?;
+        for row in st.query_map([as_of.to_string()], |r| {
+            Ok((
+                InterestRule {
+                    id: r.get(0)?,
+                    account_id: r.get(1)?,
+                    counter_account_id: r.get(2)?,
+                    shape: r.get(3)?,
+                    accrues_on: r.get(4)?,
+                    accrual_freq: r.get(5)?,
+                    capitalise_rrule: r.get(6)?,
+                    capitalise_dtstart: date(r.get(7)?),
+                    periodic_rate_e15: 0,
+                    grace_period: r.get::<_, i64>(8)? == 1,
+                    scenario_id: r.get(9)?,
+                },
+                r.get::<_, Option<i64>>(10)?,
+            ))
+        })? {
+            let (mut rule, rate) = row?;
+            if let Some(rate) = rate {
+                rule.periodic_rate_e15 = rate;
+                snap.interest_rules.push(rule);
+            }
+        }
+
+        let mut st = conn.prepare(
+            "SELECT id, account_id, from_account_id, amount_kind, fixed_minor, pct_e15,
+                    floor_minor, cap_minor, level_payment_minor, rrule, dtstart, until_on,
+                    scenario_id FROM payment_rule",
+        )?;
+        for row in st.query_map([], |r| {
+            Ok(PaymentRule {
+                id: r.get(0)?,
+                account_id: r.get(1)?,
+                from_account_id: r.get(2)?,
+                amount_kind: r.get(3)?,
+                fixed_minor: r.get(4)?,
+                pct_e15: r.get(5)?,
+                floor_minor: r.get(6)?,
+                cap_minor: r.get(7)?,
+                level_payment_minor: r.get(8)?,
+                rrule: r.get(9)?,
+                dtstart: date(r.get(10)?),
+                until_on: r.get::<_, Option<String>>(11)?.map(date),
+                scenario_id: r.get(12)?,
+            })
+        })? {
+            snap.payment_rules.push(row?);
         }
 
         let mut st = conn.prepare("SELECT on_date FROM holiday")?;

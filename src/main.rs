@@ -14,6 +14,7 @@ mod recur;
 mod entry;
 mod forecast;
 mod fx;
+mod interest;
 mod journey;
 mod money;
 
@@ -500,6 +501,82 @@ fn dispatch(
             let tm = params.get("to_minor").and_then(|v| v.as_i64()).ok_or_else(|| bad("to_minor"))?;
             let id = fx::build_conversion(conn, on, desc, fa, fm, ta, tm)?;
             Ok(serde_json::json!({ "id": id }))
+        }
+
+        // ---- interest (req 9) ----
+        "interest.create_rule" => {
+            let g = |k: &str| params.get(k).and_then(|v| v.as_i64());
+            let gs = |k: &str| params.get(k).and_then(|v| v.as_str());
+            let account = g("account_id").ok_or_else(|| bad("account_id"))?;
+            let counter = g("counter_account_id").ok_or_else(|| bad("counter_account_id"))?;
+            let shape = gs("shape").ok_or_else(|| bad("shape"))?;
+            let accrues = gs("accrues_on").unwrap_or(if shape == "savings" { "positive" } else { "negative" });
+            let freq = gs("accrual_freq").unwrap_or("daily");
+            let cap_rrule = gs("capitalise_rrule").unwrap_or("FREQ=MONTHLY;BYMONTHDAY=1");
+            let cap_start = gs("capitalise_dtstart").ok_or_else(|| bad("capitalise_dtstart"))?;
+            let grace = params.get("grace_period").and_then(|v| v.as_bool()).unwrap_or(false);
+            let scenario = g("scenario_id");
+
+            // The rate: quoted annually, converted ONCE here and stored as an integer.
+            let quoted = gs("quoted_rate").ok_or_else(|| bad("quoted_rate, e.g. \"24.9\" for 24.9%"))?;
+            let basis = gs("rate_basis").unwrap_or("effective");
+            let ppy = g("periods_per_year").unwrap_or(if freq == "daily" { 365 } else { 12 });
+            let pct: f64 = quoted.parse().map_err(|_| bad("quoted_rate must be a number"))?;
+            let quoted_e15 = (pct / 100.0 * interest::RATE_SCALE as f64).round() as i64;
+            let periodic = interest::derive_periodic_rate(quoted_e15, basis, ppy)
+                .map_err(|e| Error { code: "bad_rate", message: e.to_string() })?;
+
+            let tx = conn.transaction().map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            tx.execute(
+                "INSERT INTO interest_rule(account_id, counter_account_id, shape, accrues_on,
+                    accrual_freq, capitalise_rrule, capitalise_dtstart, grace_period, scenario_id)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                rusqlite::params![account, counter, shape, accrues, freq, cap_rrule, cap_start,
+                                  grace as i64, scenario],
+            ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            let rid = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO interest_rate_period(rule_id, effective_from, quoted_rate_e15,
+                    rate_basis, periods_per_year, periodic_rate_e15)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![rid, cap_start, quoted_e15, basis, ppy, periodic],
+            ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            tx.commit().map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::json!({ "id": rid, "periodic_rate_e15": periodic,
+                                   "periods_per_year": ppy, "basis": basis }))
+        }
+
+        "payment.create_rule" => {
+            let g = |k: &str| params.get(k).and_then(|v| v.as_i64());
+            let gs = |k: &str| params.get(k).and_then(|v| v.as_str());
+            let account = g("account_id").ok_or_else(|| bad("account_id"))?;
+            let from = g("from_account_id").ok_or_else(|| bad("from_account_id"))?;
+            let kind = gs("amount_kind").ok_or_else(|| bad("amount_kind"))?;
+            let rrule = gs("rrule").ok_or_else(|| bad("rrule"))?;
+            let dtstart = gs("dtstart").ok_or_else(|| bad("dtstart"))?;
+            // A percentage arrives as "1.5" meaning 1.5%, and is stored scaled by 1e15.
+            let pct = params.get("pct").and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|p| (p / 100.0 * interest::RATE_SCALE as f64).round() as i64);
+            conn.execute(
+                "INSERT INTO payment_rule(account_id, from_account_id, amount_kind, fixed_minor,
+                    pct_e15, floor_minor, cap_minor, level_payment_minor, rrule, dtstart, until_on,
+                    interest_rule_id, due_offset_days, term_periods, scenario_id)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                rusqlite::params![account, from, kind, g("fixed_minor"), pct, g("floor_minor"),
+                    g("cap_minor"), g("level_payment_minor"), rrule, dtstart, gs("until_on"),
+                    g("interest_rule_id"), g("due_offset_days"), g("term_periods"), g("scenario_id")],
+            ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::json!({ "id": conn.last_insert_rowid(), "pct_e15": pct }))
+        }
+
+        "interest.level_payment" => {
+            let principal = params.get("principal_minor").and_then(|v| v.as_i64()).ok_or_else(|| bad("principal_minor"))?;
+            let rate = params.get("periodic_rate_e15").and_then(|v| v.as_i64()).ok_or_else(|| bad("periodic_rate_e15"))?;
+            let term = params.get("term_periods").and_then(|v| v.as_i64()).ok_or_else(|| bad("term_periods"))?;
+            let pmt = interest::derive_level_payment(principal, rate, term)
+                .map_err(|e| Error { code: "bad_rate", message: e.to_string() })?;
+            Ok(serde_json::json!({ "level_payment_minor": pmt }))
         }
 
         other => Err(Error::unknown_method(other)),
