@@ -14,6 +14,7 @@ mod recur;
 mod entry;
 mod forecast;
 mod fx;
+mod importer;
 mod interest;
 mod journey;
 mod money;
@@ -138,6 +139,21 @@ impl From<fx::FxError> for Error {
             F::SameCurrency(_) => "same_currency",
             F::BadRate(_) => "bad_rate",
             F::Sql(_) => "sql",
+        };
+        Error { code, message: e.to_string() }
+    }
+}
+
+impl From<importer::ImportError> for Error {
+    fn from(e: importer::ImportError) -> Self {
+        use importer::ImportError as I;
+        let code = match e {
+            I::NoProfile(_) => "no_profile",
+            I::NoBatch(_) => "no_batch",
+            I::BadMapping(_) => "bad_mapping",
+            I::AlreadyCommitted(_) => "already_committed",
+            I::Csv(_) => "csv",
+            I::Sql(_) => "sql",
         };
         Error { code, message: e.to_string() }
     }
@@ -577,6 +593,92 @@ fn dispatch(
             let pmt = interest::derive_level_payment(principal, rate, term)
                 .map_err(|e| Error { code: "bad_rate", message: e.to_string() })?;
             Ok(serde_json::json!({ "level_payment_minor": pmt }))
+        }
+
+        // ---- CSV import ----
+        "import.create_profile" => {
+            let name = params.get("name").and_then(|v| v.as_str()).ok_or_else(|| bad("name"))?;
+            let fmt = params.get("date_format").and_then(|v| v.as_str()).unwrap_or("%d/%m/%Y");
+            let mapping = params.get("mapping").ok_or_else(|| bad("mapping"))?;
+            let account = params.get("account_id").and_then(|v| v.as_i64());
+            let cur = params.get("currency").and_then(|v| v.as_str()).unwrap_or("GBP");
+            let delim = params.get("delimiter").and_then(|v| v.as_str()).unwrap_or(",");
+            conn.execute(
+                "INSERT INTO import_profile(name, date_format, mapping_json, account_id,
+                    default_currency, delimiter) VALUES(?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![name, fmt, mapping.to_string(), account, cur, delim],
+            ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::json!({ "id": conn.last_insert_rowid() }))
+        }
+
+        "import.stage" => {
+            let profile = params.get("profile_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("profile_id"))?;
+            // Either inline text or a path -- the frontend will use a path, tests use text.
+            let text = match params.get("csv").and_then(|v| v.as_str()) {
+                Some(t) => t.to_string(),
+                None => {
+                    let path = params.get("path").and_then(|v| v.as_str())
+                        .ok_or_else(|| bad("csv or path"))?;
+                    std::fs::read_to_string(path)
+                        .map_err(|e| Error { code: "io", message: format!("{path}: {e}") })?
+                }
+            };
+            let name = params.get("source_name").and_then(|v| v.as_str()).unwrap_or("upload.csv");
+            let rep = importer::stage(conn, profile, name, &text)?;
+            Ok(serde_json::json!({
+                "batch_id": rep.batch_id, "rows": rep.rows, "new": rep.new_rows,
+                "duplicates": rep.duplicates, "errors": rep.errors,
+            }))
+        }
+
+        "import.categorise" => {
+            let b = params.get("batch_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("batch_id"))?;
+            Ok(serde_json::json!({ "matched": importer::categorise(conn, b)? }))
+        }
+        "import.rows" => {
+            let b = params.get("batch_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("batch_id"))?;
+            Ok(serde_json::Value::Array(importer::rows(conn, b)?))
+        }
+        "import.set_row" => {
+            let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
+            let accepted = params.get("accepted").and_then(|v| v.as_bool());
+            let far = params.get("far_account_id").and_then(|v| v.as_i64());
+            if let Some(a) = accepted {
+                conn.execute("UPDATE import_row SET accepted=?2 WHERE id=?1",
+                             rusqlite::params![id, a as i64])
+                    .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            }
+            if let Some(f) = far {
+                conn.execute("UPDATE import_row SET far_account_id=?2 WHERE id=?1",
+                             rusqlite::params![id, f])
+                    .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            }
+            Ok(serde_json::json!({ "id": id }))
+        }
+        "import.commit" => {
+            let b = params.get("batch_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("batch_id"))?;
+            Ok(serde_json::json!({ "created": importer::commit(conn, b)? }))
+        }
+        "import.revert" => {
+            let b = params.get("batch_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("batch_id"))?;
+            Ok(serde_json::json!({ "removed": importer::revert(conn, b)? }))
+        }
+        "import.create_rule" => {
+            let g = |k: &str| params.get(k).and_then(|v| v.as_i64());
+            let gs = |k: &str| params.get(k).and_then(|v| v.as_str());
+            conn.execute(
+                "INSERT INTO import_rule(name, priority, field, op, pattern, sign, set_far_account_id)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![
+                    gs("name").ok_or_else(|| bad("name"))?,
+                    g("priority").unwrap_or(100),
+                    gs("field").unwrap_or("description"),
+                    gs("op").unwrap_or("contains"),
+                    gs("pattern").ok_or_else(|| bad("pattern"))?,
+                    g("sign").unwrap_or(0),
+                    g("set_far_account_id")],
+            ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::json!({ "id": conn.last_insert_rowid() }))
         }
 
         other => Err(Error::unknown_method(other)),

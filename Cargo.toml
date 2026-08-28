@@ -12,6 +12,7 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 rrule = "0.14"
 ureq = "3"
+csv = "1.4.0"
 
 [dev-dependencies]
 
