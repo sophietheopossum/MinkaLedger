@@ -22,6 +22,8 @@ ShellRoot {
         property var allAccounts: []    // every account incl. hidden, with reference counts
         property bool editAccounts: false
         property bool showDanger: false
+        property bool showCurrencies: false
+        property var currencies: []
         property var projection: ({ balances: [], occurrences: [] })
         property string asOf: Qt.formatDate(new Date(), "yyyy-MM-dd")
         property string horizon: Qt.formatDate(
@@ -59,6 +61,7 @@ ShellRoot {
             });
             Ledger.request("scenario.list", {}, (r, e) => { if (!e) win.scenarios = r || []; });
             Ledger.request("account.list", {}, (r, e) => { if (!e) win.allAccounts = r || []; });
+            Ledger.request("currency.list", {}, (r, e) => { if (!e) win.currencies = r || []; });
             Ledger.request("forecast.project",
                            { as_of: win.asOf, horizon: win.horizon, scenarios: win.activeScenarios },
                            (r, e) => { if (!e) win.projection = r; });
@@ -227,6 +230,32 @@ ShellRoot {
                                         }
                                     }
                                 }
+                                // An account's currency is fixed by a composite foreign key the
+                                // moment it has a posting, so it has to be chosen here rather
+                                // than corrected later. It used to default silently to GBP.
+                                Flow {
+                                    width: parent.width
+                                    spacing: 6
+                                    Repeater {
+                                        model: win.currencies
+                                        PushButton {
+                                            implicitHeight: 24
+                                            label: modelData.code
+                                            primary: newAccount.currency === modelData.code
+                                            onClicked: newAccount.currency = modelData.code
+                                        }
+                                    }
+                                    PushButton {
+                                        implicitHeight: 24
+                                        label: "+ currency…"
+                                        onClicked: {
+                                            win.showEntry = false; win.showSeries = false;
+                                            win.showImport = false; win.showBrief = false;
+                                            win.showScenarios = false; win.showDanger = false;
+                                            win.showCurrencies = true;
+                                        }
+                                    }
+                                }
                                 Row {
                                     spacing: 6
                                     PushButton {
@@ -235,7 +264,8 @@ ShellRoot {
                                         enabled: accName.text.length > 0
                                         onClicked: {
                                             Ledger.write("account.create",
-                                                { name: accName.text, kind: newAccount.kind },
+                                                { name: accName.text, kind: newAccount.kind,
+                                                  currency: newAccount.currency },
                                                 (r, e) => {
                                                     if (!e) { accName.clear(); newAccount.visible = false; }
                                                 });
@@ -245,6 +275,7 @@ ShellRoot {
                                 }
                             }
                             property string kind: "expense"
+                            property string currency: "GBP"
                         }
 
                         AccountAdmin {
@@ -377,6 +408,14 @@ ShellRoot {
                 accounts: win.accounts
                 defaultDate: win.asOf
                 onSaved: win.showEntry = false
+            }
+
+            CurrencyPanel {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 260
+                visible: win.showCurrencies
+                onDone: win.showCurrencies = false
+                onChanged: win.refresh()
             }
 
             DangerZone {
