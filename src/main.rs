@@ -9,6 +9,7 @@
 //! Single-threaded, one connection held for process life. A panic in a handler is caught and
 //! returned as an error: a malformed request must not take the session down.
 
+mod analysis;
 mod db;
 mod recur;
 use crate::recur::Recurrence; // series.preview calls expand() directly
@@ -164,6 +165,16 @@ impl From<importer::ImportError> for Error {
 impl From<export::ExportError> for Error {
     fn from(e: export::ExportError) -> Self {
         let code = match e { export::ExportError::Io(_) => "io", _ => "sql" };
+        Error { code, message: e.to_string() }
+    }
+}
+
+impl From<analysis::AnalysisError> for Error {
+    fn from(e: analysis::AnalysisError) -> Self {
+        let code = match e {
+            analysis::AnalysisError::Bad(_) => "bad_query",
+            analysis::AnalysisError::Sql(_) => "sql",
+        };
         Error { code, message: e.to_string() }
     }
 }
@@ -821,6 +832,57 @@ fn dispatch(
             export::snapshot_db(conn, path)?;
             Ok(serde_json::json!({ "written": path }))
         }
+
+        // ---- analysis: the surface a model reasons over (req 7) ----
+        //
+        // Deliberately NOT export.bundle with more fields. The bundle hands over lines and asks the
+        // reader to do the arithmetic; these hand over the arithmetic. That is the difference
+        // between a book being readable and an analysis being right.
+        "analysis.brief" => {
+            let today = chrono::Local::now().date_naive();
+            let date = |k: &str, default: chrono::NaiveDate| -> Result<chrono::NaiveDate, Error> {
+                match params.get(k).and_then(|v| v.as_str()) {
+                    None => Ok(default),
+                    Some(s) => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                        .map_err(|_| bad(&format!("{k} must be YYYY-MM-DD"))),
+                }
+            };
+            let as_of = date("as_of", today)?;
+            let months = params.get("months").and_then(|v| v.as_u64()).unwrap_or(6).clamp(1, 120) as u32;
+            let default_horizon = as_of
+                .checked_add_months(chrono::Months::new(6))
+                .unwrap_or(as_of);
+            let opt = analysis::BriefOptions {
+                as_of,
+                months,
+                horizon: date("horizon", default_horizon)?,
+                largest_n: params.get("largest").and_then(|v| v.as_u64()).unwrap_or(10).clamp(0, 100) as usize,
+            };
+            let doc = analysis::brief(conn, &opt)?;
+            // Writing it out is the common case: the brief is what gets handed to a model, and a
+            // path saves the operator a copy-paste of several hundred lines.
+            match params.get("path").and_then(|v| v.as_str()) {
+                Some(path) => {
+                    std::fs::write(path, serde_json::to_string_pretty(&doc).unwrap_or_default())
+                        .map_err(|e| Error { code: "io", message: format!("{path}: {e}") })?;
+                    Ok(serde_json::json!({ "written": path }))
+                }
+                None => Ok(doc),
+            }
+        }
+
+        "analysis.query" => {
+            let sql = params.get("sql").and_then(|v| v.as_str()).ok_or_else(|| bad("sql"))?;
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+            // A second, read-only connection to the same file. `conn` is the writer and must never
+            // be handed a statement from outside.
+            let path = conn.path().ok_or_else(|| Error::internal("book has no path"))?.to_string();
+            Ok(analysis::query(&path, sql, limit)?)
+        }
+
+        "analysis.schema" => Ok(analysis::schema(conn)?),
+
+        "analysis.tools" => Ok(analysis::tools()),
 
         other => Err(Error::unknown_method(other)),
     }

@@ -6,7 +6,7 @@ description = "Forecast-first personal ledger: double-entry core, RFC 5545 recur
 license = "MIT"
 
 [dependencies]
-rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

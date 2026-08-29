@@ -168,3 +168,86 @@ fn a_multi_currency_conversion_keeps_the_book_consistent() {
     let eur = bals.iter().find(|b| b["name"] == "Euro pot").unwrap();
     assert_eq!(eur["balance_minor"], 46664);
 }
+
+/// The analysis surface is the one an agent drives without a human watching, so the end-to-end
+/// path matters more here than anywhere: a read-only guarantee that only holds in a unit test is
+/// not a guarantee.
+#[test]
+fn the_brief_computes_what_a_reader_would_otherwise_get_wrong() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Salary","kind":"income","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"Gym","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":4,"method":"txn.create","params":{"occurred_on":"2026-07-01","description":"Salary",
+             "postings":[{"account_id":1,"amount_minor":250000},{"account_id":2,"amount_minor":-250000}]}}"#,
+        // 30.00 every four weeks: the annualisation trap, end to end.
+        r#"{"id":5,"method":"series.create","params":{"description":"Gym","rrule":"FREQ=WEEKLY;INTERVAL=4;BYDAY=MO",
+             "dtstart":"2026-01-05","postings":[{"account_id":1,"amount_minor":-3000,"role":"primary"},
+                                                {"account_id":3,"amount_minor":3000,"role":"balancing"}]}}"#,
+        r#"{"id":6,"method":"analysis.brief","params":{"as_of":"2026-08-29","months":6}}"#,
+    ]);
+    for r in &out {
+        assert!(err_of(r).is_none(), "{r}");
+    }
+    let b = &out[5]["result"];
+    assert_eq!(b["history_window"]["to"], "2026-07-31", "August is in progress and must be excluded");
+
+    let gym = &b["commitments"]["series"][0];
+    assert_eq!(gym["occurrences_next_12m"], 13);
+    assert_eq!(gym["monthly_equivalent_decimal"], "-32.50", "x12 would say -30.00 and be 8% under");
+
+    // The month a salary landed reports it as a positive magnitude, not the ledger's negative.
+    let july = b["months"].as_array().unwrap().iter().find(|m| m["month"] == "2026-07").unwrap();
+    assert_eq!(july["totals"][0]["received_decimal"], "2500.00");
+
+    let sal = b["typical"]["accounts"].as_array().unwrap().iter()
+        .find(|a| a["account"] == "Salary").unwrap();
+    assert_eq!(sal["direction"], "money in", "a -2500.00 median must not read as a loss");
+}
+
+#[test]
+fn query_is_read_only_against_the_real_book_file() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Shop","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"txn.create","params":{"occurred_on":"2026-07-01","description":"Tea",
+             "postings":[{"account_id":1,"amount_minor":-250},{"account_id":2,"amount_minor":250}]}}"#,
+        r#"{"id":4,"method":"analysis.query","params":{"sql":"SELECT account, amount_decimal FROM v_ledger_line WHERE account_kind='expense'"}}"#,
+        r#"{"id":5,"method":"analysis.query","params":{"sql":"DELETE FROM txn"}}"#,
+        r#"{"id":6,"method":"analysis.query","params":{"sql":"UPDATE account SET name='x'"}}"#,
+        // The writer connection must still work afterwards: a refused query must not wedge it.
+        r#"{"id":7,"method":"txn.create","params":{"occurred_on":"2026-07-02","description":"Coffee",
+             "postings":[{"account_id":1,"amount_minor":-300},{"account_id":2,"amount_minor":300}]}}"#,
+        r#"{"id":8,"method":"analysis.query","params":{"sql":"SELECT COUNT(*) FROM txn"}}"#,
+        r#"{"id":9,"method":"db.check"}"#,
+    ]);
+    assert_eq!(out[3]["result"]["rows"][0][1], "2.50");
+    assert_eq!(out[4]["error"]["code"], "bad_query");
+    assert!(out[4]["error"]["message"].as_str().unwrap().contains("readonly"), "{}", out[4]);
+    assert_eq!(out[5]["error"]["code"], "bad_query");
+    assert!(err_of(&out[6]).is_none(), "the writer survived a refused query: {}", out[6]);
+    assert_eq!(out[7]["result"]["rows"][0][0], 2, "both transactions are there, none deleted");
+    assert_eq!(out[8]["result"]["ok"], true);
+}
+
+#[test]
+fn an_agent_can_discover_the_surface_without_being_told_about_it() {
+    let out = run(&[
+        r#"{"id":1,"method":"analysis.tools"}"#,
+        r#"{"id":2,"method":"analysis.schema"}"#,
+    ]);
+    let names: Vec<&str> = out[0]["result"]["tools"].as_array().unwrap().iter()
+        .map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"analysis.brief") && names.contains(&"analysis.query"), "{names:?}");
+
+    let objects = out[1]["result"]["objects"].as_array().unwrap();
+    assert!(objects.iter().any(|o| o["name"] == "v_ledger_line"));
+    // Every method the tool list advertises must actually dispatch.
+    let follow: Vec<String> = names.iter()
+        .map(|n| format!(r#"{{"id":1,"method":"{n}","params":{{"as_of":"2026-08-29","horizon":"2027-01-01","sql":"SELECT 1"}}}}"#))
+        .collect();
+    let refs: Vec<&str> = follow.iter().map(String::as_str).collect();
+    for (name, reply) in names.iter().zip(run(&refs)) {
+        assert_ne!(reply["error"]["code"], "unknown_method", "{name} is advertised but absent");
+    }
+}
