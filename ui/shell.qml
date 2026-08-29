@@ -29,6 +29,7 @@ ShellRoot {
         property var editing: null          // the occurrence open in the editor
         property bool showEntry: false      // the record-a-payment form
         property bool showSeries: false     // the new-recurring-payment form
+        property bool showImport: false     // the CSV import screen
 
         function refresh() {
             Ledger.request("account.balances", {}, (r, e) => {
@@ -91,7 +92,13 @@ ShellRoot {
                 }
                 PushButton {
                     label: win.showSeries ? "Close" : "+ recurring"
-                    onClicked: { win.showSeries = !win.showSeries; if (win.showSeries) win.showEntry = false; }
+                    onClicked: { win.showSeries = !win.showSeries;
+                                 if (win.showSeries) { win.showEntry = false; win.showImport = false; } }
+                }
+                PushButton {
+                    label: win.showImport ? "Close" : "import"
+                    onClicked: { win.showImport = !win.showImport;
+                                 if (win.showImport) { win.showEntry = false; win.showSeries = false; } }
                 }
                 Text {
                     text: Ledger.running ? "core up" : "core down"
@@ -318,6 +325,14 @@ ShellRoot {
                 defaultDate: win.asOf
                 onSaved: win.showSeries = false
                 onCancelled: win.showSeries = false
+            }
+
+            ImportPanel {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 430
+                visible: win.showImport
+                accounts: win.accounts
+                onChanged: win.refresh()
             }
 
             OccurrenceEditor {
