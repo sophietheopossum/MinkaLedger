@@ -463,3 +463,64 @@ fn emptying_the_book_needs_the_exact_token_and_leaves_a_restorable_copy() {
                "the backup still has both accounts: {reply}");
     let _ = std::fs::remove_file(backup);
 }
+
+/// minor_digits is the divisor for every amount in a currency, so a wrong one is a silent 100x
+/// error. These guard the ways a bad value could get in.
+#[test]
+fn a_currency_can_be_added_but_never_with_an_unusable_scale() {
+    let out = run(&[
+        r#"{"id":1,"method":"currency.create","params":{"code":"chf","minor_digits":2,"name":"Swiss Franc"}}"#,
+        r#"{"id":2,"method":"currency.create","params":{"code":"KWD","minor_digits":3,"name":"Kuwaiti Dinar"}}"#,
+        r#"{"id":3,"method":"currency.create","params":{"code":"EURO","minor_digits":2}}"#,
+        r#"{"id":4,"method":"currency.create","params":{"code":"E1H","minor_digits":2}}"#,
+        r#"{"id":5,"method":"currency.create","params":{"code":"ETH","minor_digits":18}}"#,
+        r#"{"id":6,"method":"currency.create","params":{"code":"XXX","minor_digits":-1}}"#,
+        r#"{"id":7,"method":"currency.create","params":{"code":"GBP","minor_digits":2,"name":"dup"}}"#,
+        r#"{"id":8,"method":"currency.list"}"#,
+    ]);
+    // Lower case is accepted and normalised: the schema wants three characters, not three
+    // uppercase ones, and rejecting "chf" would be pedantry rather than safety.
+    assert_eq!(out[0]["result"]["code"], "CHF");
+    assert_eq!(out[1]["result"]["minor_digits"], 3);
+    assert_eq!(out[2]["error"]["code"], "bad_params", "four letters");
+    assert_eq!(out[3]["error"]["code"], "bad_params", "digits in the code");
+    // The cap is not arbitrary: i64 minor units overflow at 9.22 units when the scale is 18.
+    let eth = out[4]["error"]["message"].as_str().unwrap();
+    assert!(eth.contains("0..=8") && eth.contains("overflow"), "{eth}");
+    assert_eq!(out[5]["error"]["code"], "bad_params", "negative scale");
+    assert_eq!(out[6]["error"]["code"], "already_exists");
+
+    let list = out[7]["result"].as_array().unwrap();
+    let gbp = list.iter().find(|c| c["code"] == "GBP").unwrap();
+    assert_eq!(gbp["is_display"], true, "the UI needs this to hide a remove control that would fail");
+    assert_eq!(gbp["name"], "Pound Sterling", "a refused duplicate must not have overwritten it");
+}
+
+#[test]
+fn a_currency_in_use_cannot_be_removed_and_an_account_keeps_the_one_it_was_given() {
+    let out = run(&[
+        r#"{"id":1,"method":"currency.create","params":{"code":"CHF","minor_digits":2,"name":"Swiss Franc"}}"#,
+        r#"{"id":2,"method":"currency.create","params":{"code":"KWD","minor_digits":3,"name":"Kuwaiti Dinar"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"Swiss pot","kind":"asset","currency":"CHF"}}"#,
+        r#"{"id":4,"method":"currency.delete","params":{"code":"CHF"}}"#,
+        r#"{"id":5,"method":"currency.delete","params":{"code":"KWD"}}"#,
+        r#"{"id":6,"method":"currency.delete","params":{"code":"GBP"}}"#,
+        r#"{"id":7,"method":"currency.delete","params":{"code":"ZZZ"}}"#,
+        r#"{"id":8,"method":"account.list"}"#,
+        r#"{"id":9,"method":"currency.list"}"#,
+    ]);
+    assert_eq!(out[3]["error"]["code"], "in_use", "an account holds CHF");
+    assert_eq!(out[4]["result"]["deleted"], "KWD", "nothing uses KWD");
+    assert!(out[5]["error"]["message"].as_str().unwrap().contains("display currency"));
+    assert_eq!(out[6]["error"]["code"], "not_found");
+
+    // The account was created in the currency it was ASKED for, not the GBP default -- which is
+    // the bug that made this whole feature necessary.
+    let acct = out[7]["result"].as_array().unwrap().iter()
+        .find(|a| a["name"] == "Swiss pot").unwrap();
+    assert_eq!(acct["currency"], "CHF");
+
+    let codes: Vec<&str> = out[8]["result"].as_array().unwrap().iter()
+        .map(|c| c["code"].as_str().unwrap()).collect();
+    assert!(codes.contains(&"CHF") && !codes.contains(&"KWD"), "{codes:?}");
+}

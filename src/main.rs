@@ -228,6 +228,116 @@ fn dispatch(
         "db.check" => Ok(db::integrity(conn)?),
 
         // ---- accounts ----
+        // ---- currencies ----
+        //
+        // minor_digits is the field that matters and the one nobody thinks about: it is the
+        // divisor for every amount in that currency, so a wrong value is a silent 100x error
+        // rather than a visible failure. It is therefore never inferred from anything -- the
+        // caller states it, and the frontend offers the ISO value rather than a free-text box.
+        "currency.list" => {
+            let mut stmt = conn
+                .prepare(
+                    // is_display travels with the row so the UI can omit a remove control that
+                    // could only ever be refused, rather than offering one and explaining after.
+                    "SELECT c.code, c.minor_digits, c.name,
+                            (SELECT COUNT(*) FROM account WHERE currency = c.code),
+                            (SELECT COUNT(*) FROM posting WHERE currency = c.code),
+                            c.code = (SELECT value FROM book_meta WHERE key = 'display_currency')
+                       FROM currency c ORDER BY c.code",
+                )
+                .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            let rows: Vec<serde_json::Value> = stmt
+                .query_map([], |r| {
+                    Ok(serde_json::json!({
+                        "code": r.get::<_, String>(0)?,
+                        "minor_digits": r.get::<_, i64>(1)?,
+                        "name": r.get::<_, String>(2)?,
+                        "accounts": r.get::<_, i64>(3)?,
+                        "postings": r.get::<_, i64>(4)?,
+                        "is_display": r.get::<_, i64>(5)? == 1,
+                    }))
+                })
+                .and_then(|m| m.collect())
+                .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::Value::Array(rows))
+        }
+
+        "currency.create" => {
+            let code = params
+                .get("code")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| bad("code"))?
+                .trim()
+                .to_uppercase();
+            // The schema requires exactly three characters; checking here as well turns a raw
+            // CHECK failure into something the operator can act on.
+            if code.len() != 3 || !code.chars().all(|c| c.is_ascii_alphabetic()) {
+                return Err(bad("code must be three letters, e.g. CHF"));
+            }
+            let digits = params
+                .get("minor_digits")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| bad("minor_digits"))?;
+            if !(0..=money::MAX_MINOR_DIGITS as i64).contains(&digits) {
+                return Err(bad(&format!(
+                    "minor_digits must be 0..={} -- an 18dp currency overflows i64 at 9.22 units",
+                    money::MAX_MINOR_DIGITS
+                )));
+            }
+            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or(&code);
+            conn.execute(
+                "INSERT INTO currency(code, minor_digits, name) VALUES(?1,?2,?3)",
+                rusqlite::params![code, digits, name],
+            )
+            .map_err(|e| Error {
+                code: if e.to_string().contains("UNIQUE") { "already_exists" } else { "sql" },
+                message: if e.to_string().contains("UNIQUE") {
+                    format!("{code} already exists")
+                } else {
+                    e.to_string()
+                },
+            })?;
+            Ok(serde_json::json!({ "code": code, "minor_digits": digits, "name": name }))
+        }
+
+        // A currency in use cannot go: every posting's amount is meaningless without its scale.
+        "currency.delete" => {
+            let code = params.get("code").and_then(|v| v.as_str()).ok_or_else(|| bad("code"))?;
+            let count = |sql: &str| -> Result<i64, Error> {
+                conn.query_row(sql, [code], |r| r.get(0))
+                    .map_err(|e| Error { code: "sql", message: e.to_string() })
+            };
+            let uses = count("SELECT COUNT(*) FROM account WHERE currency = ?1")?
+                + count("SELECT COUNT(*) FROM posting WHERE currency = ?1")?
+                + count("SELECT COUNT(*) FROM series_posting WHERE currency = ?1")?
+                + count("SELECT COUNT(*) FROM fx_rate WHERE base_code = ?1 OR quote_code = ?1")?
+                + count("SELECT COUNT(*) FROM import_profile WHERE default_currency = ?1")?;
+            if uses > 0 {
+                return Err(Error {
+                    code: "in_use",
+                    message: format!("{code} is used by {uses} record(s) and cannot be removed"),
+                });
+            }
+            let display: String = conn
+                .query_row("SELECT value FROM book_meta WHERE key = 'display_currency'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap_or_default();
+            if display == code {
+                return Err(Error {
+                    code: "in_use",
+                    message: format!("{code} is the book's display currency"),
+                });
+            }
+            let n = conn
+                .execute("DELETE FROM currency WHERE code = ?1", [code])
+                .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            if n == 0 {
+                return Err(Error { code: "not_found", message: format!("no such currency: {code}") });
+            }
+            Ok(serde_json::json!({ "deleted": code }))
+        }
+
         "account.create" => {
             let name = params.get("name").and_then(|v| v.as_str()).ok_or_else(|| bad("name"))?;
             let kind = params.get("kind").and_then(|v| v.as_str()).ok_or_else(|| bad("kind"))?;
