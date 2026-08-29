@@ -28,6 +28,7 @@ ShellRoot {
         property var activeScenarios: []
         property var editing: null          // the occurrence open in the editor
         property bool showEntry: false      // the record-a-payment form
+        property bool showSeries: false     // the new-recurring-payment form
 
         function refresh() {
             Ledger.request("account.balances", {}, (r, e) => {
@@ -86,7 +87,11 @@ ShellRoot {
                 PushButton {
                     label: win.showEntry ? "Close" : "+ payment"
                     primary: !win.showEntry
-                    onClicked: win.showEntry = !win.showEntry
+                    onClicked: { win.showEntry = !win.showEntry; if (win.showEntry) win.showSeries = false; }
+                }
+                PushButton {
+                    label: win.showSeries ? "Close" : "+ recurring"
+                    onClicked: { win.showSeries = !win.showSeries; if (win.showSeries) win.showEntry = false; }
                 }
                 Text {
                     text: Ledger.running ? "core up" : "core down"
@@ -303,6 +308,16 @@ ShellRoot {
                 accounts: win.accounts
                 defaultDate: win.asOf
                 onSaved: win.showEntry = false
+            }
+
+            SeriesForm {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 430
+                visible: win.showSeries
+                accounts: win.accounts
+                defaultDate: win.asOf
+                onSaved: win.showSeries = false
+                onCancelled: win.showSeries = false
             }
 
             OccurrenceEditor {
