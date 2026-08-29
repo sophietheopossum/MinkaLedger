@@ -17,6 +17,10 @@ Rectangle {
 
     property var accounts: []
     property string defaultDate: ""
+    // When set, the series is created INSIDE a scenario rather than as baseline: it then only
+    // affects the forecast while that scenario is switched on. -1 is baseline.
+    property int scenarioId: -1
+    property string scenarioName: ""
 
     signal saved
     signal cancelled
@@ -115,7 +119,7 @@ Rectangle {
     function save() {
         if (!root.complete)
             return;
-        Ledger.write("series.create", {
+        const params = {
             description: descField.text,
             rrule: root.rrule,
             dtstart: startField.text,
@@ -124,7 +128,10 @@ Rectangle {
                 { account_id: root.fromAccount, amount_minor: -root.amountMinor, role: "primary" },
                 { account_id: root.toAccount, amount_minor: root.amountMinor, role: "balancing" }
             ]
-        }, (r, e) => {
+        };
+        if (root.scenarioId >= 0)
+            params.scenario_id = root.scenarioId;
+        Ledger.write("series.create", params, (r, e) => {
             if (e)
                 status.text = e.message;
             else {
@@ -140,8 +147,10 @@ Rectangle {
         spacing: 8
 
         Text {
-            text: "NEW RECURRING PAYMENT"
-            color: Theme.textMuted
+            text: root.scenarioId < 0
+                  ? "NEW RECURRING PAYMENT"
+                  : "HYPOTHETICAL PAYMENT — only in “" + root.scenarioName + "”"
+            color: root.scenarioId < 0 ? Theme.textMuted : Theme.purple
             font.family: Theme.fontFamily
             font.pixelSize: Theme.fontSize - 2
         }

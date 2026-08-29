@@ -31,6 +31,20 @@ ShellRoot {
         property bool showSeries: false     // the new-recurring-payment form
         property bool showImport: false     // the CSV import screen
         property bool showBrief: false      // the computed brief, for reading and for handing over
+        property bool showScenarios: false  // the what-if panel
+        property int seriesScenario: -1     // >=0 makes the recurring form build a hypothetical
+        property string seriesScenarioName: ""
+
+        // Switching a scenario on or off is just a change to the argument the projection is given;
+        // nothing is written. Shared by the chips above the chart and the scenario panel, so the
+        // two cannot drift.
+        function toggleScenario(id) {
+            const next = win.activeScenarios.slice();
+            const at = next.indexOf(id);
+            if (at >= 0) next.splice(at, 1); else next.push(id);
+            win.activeScenarios = next;
+            win.refresh();
+        }
 
         function refresh() {
             Ledger.request("account.balances", {}, (r, e) => {
@@ -94,7 +108,11 @@ ShellRoot {
                 PushButton {
                     label: win.showSeries ? "Close" : "+ recurring"
                     onClicked: { win.showSeries = !win.showSeries;
-                                 if (win.showSeries) { win.showEntry = false; win.showImport = false; } }
+                                 // Always baseline: a scenario left over from a what-if would
+                                 // silently make a real commitment hypothetical.
+                                 win.seriesScenario = -1;
+                                 if (win.showSeries) { win.showEntry = false; win.showImport = false;
+                                                       win.showScenarios = false; } }
                 }
                 PushButton {
                     label: win.showImport ? "Close" : "import"
@@ -103,10 +121,16 @@ ShellRoot {
                                                        win.showBrief = false; } }
                 }
                 PushButton {
+                    label: win.showScenarios ? "Close" : "what if"
+                    onClicked: { win.showScenarios = !win.showScenarios;
+                                 if (win.showScenarios) { win.showEntry = false; win.showSeries = false;
+                                                          win.showImport = false; win.showBrief = false; } }
+                }
+                PushButton {
                     label: win.showBrief ? "Close" : "brief"
                     onClicked: { win.showBrief = !win.showBrief;
                                  if (win.showBrief) { win.showEntry = false; win.showSeries = false;
-                                                      win.showImport = false; } }
+                                                      win.showImport = false; win.showScenarios = false; } }
                 }
                 Text {
                     text: Ledger.running ? "core up" : "core down"
@@ -301,13 +325,7 @@ ShellRoot {
                                     }
                                     MouseArea {
                                         anchors.fill: parent
-                                        onClicked: {
-                                            const next = win.activeScenarios.slice();
-                                            const at = next.indexOf(modelData.id);
-                                            if (at >= 0) next.splice(at, 1); else next.push(modelData.id);
-                                            win.activeScenarios = next;
-                                            win.refresh();
-                                        }
+                                        onClicked: win.toggleScenario(modelData.id)
                                     }
                                 }
                             }
@@ -325,14 +343,33 @@ ShellRoot {
                 onSaved: win.showEntry = false
             }
 
+            ScenarioPanel {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 430
+                visible: win.showScenarios
+                active: win.activeScenarios
+                onToggled: id => win.toggleScenario(id)
+                onChanged: win.refresh()
+                // Adding a hypothetical payment reuses the ordinary recurring form rather than a
+                // second copy of it -- the only difference is which scenario the row lands in.
+                onAddPaymentRequested: (id, name) => {
+                    win.seriesScenario = id;
+                    win.seriesScenarioName = name;
+                    win.showScenarios = false;
+                    win.showSeries = true;
+                }
+            }
+
             SeriesForm {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 430
                 visible: win.showSeries
                 accounts: win.accounts
                 defaultDate: win.asOf
-                onSaved: win.showSeries = false
-                onCancelled: win.showSeries = false
+                scenarioId: win.seriesScenario
+                scenarioName: win.seriesScenarioName
+                onSaved: { win.showSeries = false; win.seriesScenario = -1; }
+                onCancelled: { win.showSeries = false; win.seriesScenario = -1; }
             }
 
             AnalysisPanel {
