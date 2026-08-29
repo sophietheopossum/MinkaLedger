@@ -1,5 +1,6 @@
 pragma ComponentBehavior: Bound
 import QtQuick
+import QtQuick.Window
 import "../services"
 
 // Pick one account. A dropdown, hand-rolled in the MinkaConf idiom.
@@ -15,6 +16,34 @@ Rectangle {
     property int selected: -1
 
     signal picked(int accountId)
+
+    // Opening the list reparents it to the WINDOW SURFACE and positions it in that surface's
+    // coordinates.
+    //
+    // It used to do `parent: root.parent`, which was wrong in a way that only showed up in use:
+    // every picker sits inside a Row, and a Row is a POSITIONER -- it lays out each visible child
+    // left to right and ignores their x. The popup became a third element in that Row and was
+    // pushed off the right-hand edge of the form. Leaving it as a plain child of this item would
+    // fix the position but put its geometry outside this item's bounds, which is not somewhere
+    // input can be relied on to reach.
+    function openList() {
+        const surface = root.Window.contentItem;
+        if (!surface)
+            return;
+        popup.parent = surface;
+        const below = root.mapToItem(surface, 0, root.height + 2);
+        popup.x = below.x;
+        // Flip above the field when there is no room beneath -- the import panel's picker sits
+        // near the bottom of the window, where dropping down would run off the edge.
+        popup.y = below.y + popup.height <= surface.height
+                  ? below.y
+                  : root.mapToItem(surface, 0, 0).y - popup.height - 2;
+        popup.visible = true;
+    }
+
+    // A popup reparented to the window outlives the form that owns it, so it has to be dismissed
+    // when that form goes away -- otherwise it hangs over whatever replaces it.
+    onVisibleChanged: if (!root.visible) popup.visible = false
 
     implicitHeight: 46
     radius: 6
@@ -67,16 +96,18 @@ Rectangle {
     MouseArea {
         anchors.fill: parent
         cursorShape: Qt.PointingHandCursor
-        onClicked: popup.visible = !popup.visible
+        onClicked: {
+            if (popup.visible)
+                popup.visible = false;
+            else
+                root.openList();
+        }
     }
 
-    // Drawn as a sibling overlay so it is not clipped by the row it sits in.
+    // Position and parent are set by openList(); only the size is bound here.
     Rectangle {
         id: popup
         visible: false
-        parent: root.parent
-        x: root.x
-        y: root.y + root.height + 2
         width: root.width
         height: Math.min(list.contentHeight + 8, 220)
         z: 100
