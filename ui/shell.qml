@@ -18,7 +18,9 @@ ShellRoot {
         color: Theme.ground
 
         // The window asks for what it needs whenever the book changes, rather than mirroring state.
-        property var accounts: []
+        property var accounts: []       // open accounts, for the pickers and the chart
+        property var allAccounts: []    // every account incl. hidden, with reference counts
+        property bool editAccounts: false
         property var projection: ({ balances: [], occurrences: [] })
         property string asOf: Qt.formatDate(new Date(), "yyyy-MM-dd")
         property string horizon: Qt.formatDate(
@@ -55,6 +57,7 @@ ShellRoot {
                 }
             });
             Ledger.request("scenario.list", {}, (r, e) => { if (!e) win.scenarios = r || []; });
+            Ledger.request("account.list", {}, (r, e) => { if (!e) win.allAccounts = r || []; });
             Ledger.request("forecast.project",
                            { as_of: win.asOf, horizon: win.horizon, scenarios: win.activeScenarios },
                            (r, e) => { if (!e) win.projection = r; });
@@ -169,7 +172,14 @@ ShellRoot {
                             Item { Layout.fillWidth: true }
                             PushButton {
                                 label: "+ account"
-                                onClicked: newAccount.visible = !newAccount.visible
+                                onClicked: { newAccount.visible = !newAccount.visible;
+                                             if (newAccount.visible) win.editAccounts = false; }
+                            }
+                            PushButton {
+                                label: win.editAccounts ? "done" : "edit"
+                                primary: win.editAccounts
+                                onClicked: { win.editAccounts = !win.editAccounts;
+                                             if (win.editAccounts) newAccount.visible = false; }
                             }
                         }
 
@@ -226,9 +236,18 @@ ShellRoot {
                             property string kind: "expense"
                         }
 
+                        AccountAdmin {
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            visible: win.editAccounts
+                            accounts: win.allAccounts
+                            onChanged: win.refresh()
+                        }
+
                         ListView {
                             Layout.fillWidth: true
                             Layout.fillHeight: true
+                            visible: !win.editAccounts
                             clip: true
                             model: win.accounts
                             delegate: Rectangle {
