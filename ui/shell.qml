@@ -30,6 +30,7 @@ ShellRoot {
         property bool showEntry: false      // the record-a-payment form
         property bool showSeries: false     // the new-recurring-payment form
         property bool showImport: false     // the CSV import screen
+        property bool showBrief: false      // the computed brief, for reading and for handing over
 
         function refresh() {
             Ledger.request("account.balances", {}, (r, e) => {
@@ -98,7 +99,14 @@ ShellRoot {
                 PushButton {
                     label: win.showImport ? "Close" : "import"
                     onClicked: { win.showImport = !win.showImport;
-                                 if (win.showImport) { win.showEntry = false; win.showSeries = false; } }
+                                 if (win.showImport) { win.showEntry = false; win.showSeries = false;
+                                                       win.showBrief = false; } }
+                }
+                PushButton {
+                    label: win.showBrief ? "Close" : "brief"
+                    onClicked: { win.showBrief = !win.showBrief;
+                                 if (win.showBrief) { win.showEntry = false; win.showSeries = false;
+                                                      win.showImport = false; } }
                 }
                 Text {
                     text: Ledger.running ? "core up" : "core down"
@@ -327,6 +335,13 @@ ShellRoot {
                 onCancelled: win.showSeries = false
             }
 
+            AnalysisPanel {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 430
+                visible: win.showBrief
+                asOf: win.asOf
+            }
+
             ImportPanel {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 430
@@ -370,10 +385,14 @@ ShellRoot {
                         // One line per occurrence on the focused account, in date order.
                         model: (win.projection.occurrences || []).filter(
                             o => o.account_id === win.focusAccount)
-                        delegate: RowLayout {
+                        // An Item, not a RowLayout, because the MouseArea has to cover the whole
+                        // row and a layout MANAGES its children's geometry -- anchoring inside one
+                        // is undefined behaviour Qt warns about, and this is the row you click to
+                        // alter an occurrence, so an unreliable hit area is not cosmetic.
+                        delegate: Item {
                             id: occRow
                             width: ListView.view.width
-                            spacing: 10
+                            implicitHeight: occRowLayout.implicitHeight
                             // Only a real series occurrence can be overridden. Generated interest
                             // and payment legs carry a negative series_id and are not editable:
                             // they are consequences of a rule, not instances of one.
@@ -383,6 +402,10 @@ ShellRoot {
                                 cursorShape: occRow.editable ? Qt.PointingHandCursor : Qt.ArrowCursor
                                 onClicked: if (occRow.editable) win.editing = modelData
                             }
+                            RowLayout {
+                            id: occRowLayout
+                            anchors.fill: parent
+                            spacing: 10
                             Text {
                                 text: modelData.value_on
                                 color: Theme.textFaint
@@ -404,6 +427,7 @@ ShellRoot {
                                 color: modelData.amount_minor < 0 ? Theme.red : Theme.okGreen
                                 font.family: Theme.monoFamily
                                 font.pixelSize: Theme.fontSize - 1
+                            }
                             }
                         }
                     }
