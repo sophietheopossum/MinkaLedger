@@ -11,6 +11,7 @@
 
 mod db;
 mod recur;
+use crate::recur::Recurrence; // series.preview calls expand() directly
 mod entry;
 mod export;
 mod forecast;
@@ -290,6 +291,38 @@ fn dispatch(
             let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
             entry::delete(conn, id)?;
             Ok(serde_json::json!({ "deleted": id }))
+        }
+
+        // Expand a rule WITHOUT saving anything, so a form can show what it will actually do.
+        // Typing an RRULE blind and finding out next month is a poor way to learn RFC 5545.
+        "series.preview" => {
+            let rrule = params.get("rrule").and_then(|v| v.as_str()).ok_or_else(|| bad("rrule"))?;
+            let dtstart = params.get("dtstart").and_then(|v| v.as_str()).ok_or_else(|| bad("dtstart"))?;
+            let start = chrono::NaiveDate::parse_from_str(dtstart, "%Y-%m-%d")
+                .map_err(|_| bad("dtstart must be YYYY-MM-DD"))?;
+            let count = params.get("count").and_then(|v| v.as_i64()).unwrap_or(6).clamp(1, 50);
+            let until = params.get("until_on").and_then(|v| v.as_str())
+                .and_then(|u| chrono::NaiveDate::parse_from_str(u, "%Y-%m-%d").ok());
+            let weekend = params.get("weekend_rule").and_then(|v| v.as_str()).unwrap_or("none");
+            // A generous horizon so even an annual rule yields `count` dates.
+            let horizon = start + chrono::Duration::days(366 * 12);
+            let holidays: Vec<chrono::NaiveDate> = Vec::new();
+            let dates = recur::RRuleCrate
+                .expand(rrule, start, until, start, horizon)
+                .map_err(|e| Error { code: "bad_rule", message: e.to_string() })?;
+            let out: Vec<serde_json::Value> = dates
+                .into_iter()
+                .take(count as usize)
+                .map(|d| {
+                    let adjusted = recur::business_adjust(d, weekend, &holidays);
+                    serde_json::json!({
+                        "occurrence_on": d.to_string(),
+                        "value_on": adjusted.to_string(),
+                        "moved": adjusted != d,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "dates": out }))
         }
 
         // ---- recurring series (req 1) ----
