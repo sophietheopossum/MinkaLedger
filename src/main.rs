@@ -637,6 +637,62 @@ fn dispatch(
         }
 
         // ---- CSV import ----
+        // Read a file's HEADERS without staging anything, so the mapping step can offer the real
+        // column names instead of asking the operator to type them from memory.
+        "import.peek" => {
+            let path = params.get("path").and_then(|v| v.as_str()).ok_or_else(|| bad("path"))?;
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| Error { code: "io", message: format!("{path}: {e}") })?;
+            let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(text.as_bytes());
+            let headers: Vec<String> = rdr
+                .headers()
+                .map_err(|e| Error { code: "csv", message: e.to_string() })?
+                .iter().map(|h| h.trim().to_string()).collect();
+            // A few sample rows make a wrong mapping obvious before it is applied to 400 lines.
+            let sample: Vec<Vec<String>> = rdr.records().take(3)
+                .filter_map(|r| r.ok())
+                .map(|r| r.iter().map(|c| c.to_string()).collect())
+                .collect();
+            Ok(serde_json::json!({ "headers": headers, "sample": sample,
+                                   "total_lines": text.lines().count().saturating_sub(1) }))
+        }
+
+        "import.profiles" => {
+            let mut st = conn.prepare(
+                "SELECT id, name, date_format, mapping_json, account_id, default_currency
+                   FROM import_profile ORDER BY name",
+            ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            let rows: Vec<serde_json::Value> = st.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?,
+                    "date_format": r.get::<_, String>(2)?,
+                    "mapping": serde_json::from_str::<serde_json::Value>(
+                        &r.get::<_, String>(3)?).unwrap_or(serde_json::Value::Null),
+                    "account_id": r.get::<_, Option<i64>>(4)?,
+                    "currency": r.get::<_, String>(5)?,
+                }))
+            }).and_then(|m| m.collect()).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::Value::Array(rows))
+        }
+
+        "import.batches" => {
+            let mut st = conn.prepare(
+                "SELECT b.id, p.name, b.source_name, b.imported_at, b.row_count, b.state,
+                        b.first_row_on, b.last_row_on
+                   FROM import_batch b JOIN import_profile p ON p.id = b.profile_id
+                  ORDER BY b.id DESC LIMIT 20",
+            ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            let rows: Vec<serde_json::Value> = st.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?, "profile": r.get::<_, String>(1)?,
+                    "source": r.get::<_, String>(2)?, "imported_at": r.get::<_, String>(3)?,
+                    "rows": r.get::<_, i64>(4)?, "state": r.get::<_, String>(5)?,
+                    "from": r.get::<_, Option<String>>(6)?, "to": r.get::<_, Option<String>>(7)?,
+                }))
+            }).and_then(|m| m.collect()).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::Value::Array(rows))
+        }
+
         "import.create_profile" => {
             let name = params.get("name").and_then(|v| v.as_str()).ok_or_else(|| bad("name"))?;
             let fmt = params.get("date_format").and_then(|v| v.as_str()).unwrap_or("%d/%m/%Y");
