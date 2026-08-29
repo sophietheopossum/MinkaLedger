@@ -21,6 +21,7 @@ ShellRoot {
         property var accounts: []       // open accounts, for the pickers and the chart
         property var allAccounts: []    // every account incl. hidden, with reference counts
         property bool editAccounts: false
+        property bool showDanger: false
         property var projection: ({ balances: [], occurrences: [] })
         property string asOf: Qt.formatDate(new Date(), "yyyy-MM-dd")
         property string horizon: Qt.formatDate(
@@ -252,6 +253,12 @@ ShellRoot {
                             visible: win.editAccounts
                             accounts: win.allAccounts
                             onChanged: win.refresh()
+                            onEmptyBookRequested: {
+                                win.showEntry = false; win.showSeries = false;
+                                win.showImport = false; win.showBrief = false;
+                                win.showScenarios = false;
+                                win.showDanger = true;
+                            }
                         }
 
                         ListView {
@@ -370,6 +377,14 @@ ShellRoot {
                 accounts: win.accounts
                 defaultDate: win.asOf
                 onSaved: win.showEntry = false
+            }
+
+            DangerZone {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 220
+                visible: win.showDanger
+                onDone: win.showDanger = false
+                onChanged: win.refresh()
             }
 
             ScenarioPanel {

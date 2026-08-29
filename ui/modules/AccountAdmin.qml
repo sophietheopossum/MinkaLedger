@@ -16,6 +16,7 @@ Rectangle {
 
     property var accounts: []
     signal changed
+    signal emptyBookRequested
 
     color: "transparent"
 
@@ -124,6 +125,25 @@ Rectangle {
                         }
                     }
                 }
+            }
+        }
+
+        // The way to empty the book lives here rather than on the toolbar: reaching it takes a
+        // deliberate trip into edit mode, and it only OPENS a screen -- nothing is destroyed by
+        // pressing it.
+        Text {
+            width: parent.width
+            horizontalAlignment: Text.AlignRight
+            text: "empty this book…"
+            color: dangerHover.containsMouse ? Theme.red : Theme.textFaint
+            font.family: Theme.fontFamily
+            font.pixelSize: Theme.fontSize - 4
+            MouseArea {
+                id: dangerHover
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.emptyBookRequested()
             }
         }
 
