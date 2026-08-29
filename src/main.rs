@@ -953,6 +953,79 @@ fn dispatch(
             }
         }
 
+        // Emptying the book — the most destructive thing this program can do, so it is built to
+        // be hard to do by accident and impossible to do irreversibly.
+        //
+        // THREE GUARDS, and the third is the one that matters. The caller must pass the exact
+        // token, so a stray or replayed RPC cannot trigger it. The reply reports what it removed,
+        // so a mistake is at least visible. And it takes a VACUUM INTO snapshot FIRST, refusing to
+        // proceed if that fails — which turns "destroy my finances" into "set them aside", and is
+        // worth more than any amount of confirmation UI.
+        //
+        // currency and book_meta survive: they are reference data and schema version, not her
+        // finances, and re-seeding them is exactly the kind of thing that goes wrong later. Every
+        // other table is emptied, enumerated from sqlite_master rather than listed here, so a
+        // table added in a future migration cannot be silently left full.
+        "book.reset" => {
+            const TOKEN: &str = "DELETE";
+            let confirm = params.get("confirm").and_then(|v| v.as_str()).unwrap_or("");
+            if confirm != TOKEN {
+                return Err(Error {
+                    code: "not_confirmed",
+                    message: format!("book.reset requires confirm = {TOKEN:?}"),
+                });
+            }
+
+            let path = conn.path().ok_or_else(|| Error::internal("book has no path"))?.to_string();
+            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let backup = match params.get("backup").and_then(|v| v.as_str()) {
+                Some(b) => b.to_string(),
+                None => {
+                    let dir = std::path::Path::new(&path)
+                        .parent()
+                        .map(|d| d.to_string_lossy().to_string())
+                        .unwrap_or_else(|| ".".into());
+                    format!("{dir}/book-before-reset-{stamp}.db")
+                }
+            };
+            // Refuse rather than proceed unbacked: an unrecoverable wipe is the one outcome this
+            // method exists to prevent.
+            export::snapshot_db(conn, &backup)?;
+
+            let tables: Vec<String> = {
+                let mut st = conn
+                    .prepare(
+                        "SELECT name FROM sqlite_master
+                          WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                            AND name NOT IN ('currency', 'book_meta')",
+                    )
+                    .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+                st.query_map([], |r| r.get(0))
+                    .and_then(|m| m.collect())
+                    .map_err(|e| Error { code: "sql", message: e.to_string() })?
+            };
+
+            let mut cleared = serde_json::Map::new();
+            // Foreign keys off for the sweep: the tables reference each other, so no single order
+            // is safe, and the whole graph is going anyway.
+            conn.pragma_update(None, "foreign_keys", "OFF")
+                .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            let tx = conn.transaction().map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            for t in &tables {
+                let n = tx
+                    .execute(&format!("DELETE FROM \"{t}\""), [])
+                    .map_err(|e| Error { code: "sql", message: format!("{t}: {e}") })?;
+                if n > 0 {
+                    cleared.insert(t.clone(), serde_json::json!(n));
+                }
+            }
+            tx.commit().map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            conn.pragma_update(None, "foreign_keys", "ON")
+                .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+
+            Ok(serde_json::json!({ "backup": backup, "cleared": cleared }))
+        }
+
         "export.snapshot" => {
             let path = params.get("path").and_then(|v| v.as_str()).ok_or_else(|| bad("path"))?;
             export::snapshot_db(conn, path)?;

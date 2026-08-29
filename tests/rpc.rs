@@ -397,3 +397,69 @@ fn a_system_account_is_never_removable() {
     ]);
     assert_eq!(del[3]["error"]["code"], "system_account", "{}", del[3]);
 }
+
+/// Emptying the book is the one action that could destroy everything, so its guards are tested
+/// rather than assumed -- including that the backup is a real book and not an empty file.
+#[test]
+fn emptying_the_book_needs_the_exact_token_and_leaves_a_restorable_copy() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Rent","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"txn.create","params":{"occurred_on":"2026-08-01","description":"Rent",
+             "postings":[{"account_id":1,"amount_minor":-90000},{"account_id":2,"amount_minor":90000}]}}"#,
+        r#"{"id":4,"method":"scenario.create","params":{"name":"Whatif"}}"#,
+        r#"{"id":5,"method":"book.reset","params":{}}"#,
+        r#"{"id":6,"method":"book.reset","params":{"confirm":"delete"}}"#,
+        r#"{"id":7,"method":"book.reset","params":{"confirm":"DELETE "}}"#,
+        r#"{"id":8,"method":"book.reset","params":{"confirm":"DELETE"}}"#,
+        r#"{"id":9,"method":"account.list"}"#,
+        r#"{"id":10,"method":"analysis.query","params":{"sql":"SELECT (SELECT COUNT(*) FROM txn),(SELECT COUNT(*) FROM posting),(SELECT COUNT(*) FROM currency),(SELECT COUNT(*) FROM book_meta)"}}"#,
+        r#"{"id":11,"method":"db.check"}"#,
+        // The book must still be usable, not just empty.
+        r#"{"id":12,"method":"account.create","params":{"name":"Fresh","kind":"asset","currency":"GBP"}}"#,
+    ]);
+
+    // Anything but the exact token is refused -- including a trailing space, which is what a
+    // paste or an autocomplete would leave behind.
+    for i in [4usize, 5, 6] {
+        assert_eq!(out[i]["error"]["code"], "not_confirmed", "{}", out[i]);
+    }
+
+    let done = &out[7]["result"];
+    let backup = done["backup"].as_str().expect("a backup path must be reported");
+    assert!(backup.contains("book-before-reset-"), "got {backup}");
+    let cleared = done["cleared"].as_object().unwrap();
+    assert_eq!(cleared["account"], 2);
+    assert_eq!(cleared["txn"], 1);
+    assert_eq!(cleared["posting"], 2);
+    assert_eq!(cleared["scenario"], 1);
+
+    assert!(out[8]["result"].as_array().unwrap().is_empty(), "no accounts survive");
+    let row = &out[9]["result"]["rows"][0];
+    assert_eq!(row[0], 0, "no transactions");
+    assert_eq!(row[1], 0, "no postings");
+    // Reference data and schema version are NOT her finances and must survive, or the book comes
+    // back unusable and a re-seed becomes a migration problem.
+    assert_eq!(row[2], 4, "the seeded currencies survive");
+    assert!(row[3].as_i64().unwrap() >= 1, "book_meta survives");
+
+    assert_eq!(out[10]["result"]["ok"], true);
+    assert_eq!(out[11]["result"]["id"], 1, "the emptied book is immediately usable");
+
+    // The backup is a real book with the data in it, not a zero-byte placeholder.
+    let restored = std::process::Command::new(env!("CARGO_BIN_EXE_minka-ledger"))
+        .arg("--db").arg(backup)
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn().expect("open the backup");
+    {
+        let mut si = restored.stdin.as_ref().unwrap();
+        writeln!(si, r#"{{"id":1,"method":"account.list"}}"#).unwrap();
+    }
+    let done2 = restored.wait_with_output().unwrap();
+    let reply: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&done2.stdout).lines().next().unwrap()).unwrap();
+    assert_eq!(reply["result"].as_array().unwrap().len(), 2,
+               "the backup still has both accounts: {reply}");
+    let _ = std::fs::remove_file(backup);
+}
