@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=MinkaLedger
+GenericName=Personal Ledger
+Comment=Forecast-first personal finance: recurring payments, projections and what-if scenarios
+Exec=env QT_QPA_PLATFORM=wayland qs -p /usr/share/minka/MinkaLedger
+Icon=office-spreadsheet
+Terminal=false
+Categories=Office;Finance;Qt;
+Keywords=finance;money;budget;ledger;forecast;accounts;recurring;payments;interest;minka;
