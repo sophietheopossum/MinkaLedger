@@ -524,3 +524,31 @@ fn a_currency_in_use_cannot_be_removed_and_an_account_keeps_the_one_it_was_given
         .map(|c| c["code"].as_str().unwrap()).collect();
     assert!(codes.contains(&"CHF") && !codes.contains(&"KWD"), "{codes:?}");
 }
+
+/// The UI now parses and formats each amount at its own currency's scale, having previously
+/// assumed 2 everywhere. This pins the core behaviour it relies on: the SAME text means different
+/// integers in different currencies, and getting that wrong is a silent 100x error.
+#[test]
+fn the_same_text_parses_to_different_integers_per_currency_scale() {
+    let out = run(&[
+        r#"{"id":1,"method":"money.parse","params":{"text":"1000","minor_digits":0}}"#,
+        r#"{"id":2,"method":"money.parse","params":{"text":"1000","minor_digits":2}}"#,
+        r#"{"id":3,"method":"money.parse","params":{"text":"1000","minor_digits":3}}"#,
+        r#"{"id":4,"method":"money.parse","params":{"text":"12.345","minor_digits":3}}"#,
+        // Excess precision is refused rather than rounded away -- a JPY account cannot take 0.5.
+        r#"{"id":5,"method":"money.parse","params":{"text":"0.5","minor_digits":0}}"#,
+        r#"{"id":6,"method":"money.format","params":{"minor":1000,"minor_digits":0}}"#,
+        r#"{"id":7,"method":"money.format","params":{"minor":1000,"minor_digits":2}}"#,
+        r#"{"id":8,"method":"money.format","params":{"minor":1000,"minor_digits":3}}"#,
+    ]);
+    assert_eq!(out[0]["result"]["minor"], 1000, "JPY 1000 is 1000 yen");
+    assert_eq!(out[1]["result"]["minor"], 100_000, "GBP 1000 is 100000 pence");
+    assert_eq!(out[2]["result"]["minor"], 1_000_000, "KWD 1000 is 1000000 fils");
+    assert_eq!(out[3]["result"]["minor"], 12_345);
+    assert!(err_of(&out[4]).is_some(), "0.5 has no meaning in a 0dp currency");
+
+    // And back the other way, which is what the Money singleton mirrors locally.
+    assert_eq!(out[5]["result"]["formatted"], "1000");
+    assert_eq!(out[6]["result"]["formatted"], "10.00");
+    assert_eq!(out[7]["result"]["formatted"], "1.000");
+}
