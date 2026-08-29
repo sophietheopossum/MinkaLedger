@@ -189,14 +189,20 @@ ShellRoot {
                             id: newAccount
                             visible: false
                             Layout.fillWidth: true
-                            implicitHeight: 108
+                            // Content-driven, not a magic number: at 108 the box was 26px shorter
+                            // than the 46 + 6 + 30 + 6 + 30 it holds plus margins, so the Create
+                            // and Cancel buttons hung out of the bottom of it.
+                            implicitHeight: accountForm.implicitHeight + 16
                             color: Theme.surfaceRaised
                             border.color: Theme.line
                             border.width: 1
                             radius: 6
 
                             Column {
-                                anchors.fill: parent
+                                id: accountForm
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.top: parent.top
                                 anchors.margins: 8
                                 spacing: 6
                                 Field {
@@ -205,7 +211,11 @@ ShellRoot {
                                     label: "name"
                                     placeholder: "Current, Rent, Salary…"
                                 }
-                                Row {
+                                // A Flow, not a Row: the four kinds need about 300px of buttons
+                                // and this sidebar is 260px wide, so a Row ran them off the edge.
+                                // Wrapping is the only thing that fits without abbreviating them.
+                                Flow {
+                                    width: parent.width
                                     spacing: 6
                                     Repeater {
                                         model: ["asset", "liability", "income", "expense"]
