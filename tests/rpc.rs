@@ -328,3 +328,72 @@ fn deleting_a_scenario_takes_its_changes_and_restores_the_baseline() {
     assert_eq!(out[8]["error"]["code"], "not_found", "deleting a missing scenario is an error, not a silent no-op");
     assert_eq!(out[9]["result"]["ok"], true);
 }
+
+/// Removing an account is the one destructive thing the GUI offers, and the wrong answer is
+/// unrecoverable: a posting is half of a transaction, so deleting an account with history would
+/// unbalance the book permanently. The core must therefore refuse, and say why.
+#[test]
+fn an_account_with_history_cannot_be_deleted_only_hidden() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Rent","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"Typo","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":4,"method":"txn.create","params":{"occurred_on":"2026-08-01","description":"Rent",
+             "postings":[{"account_id":1,"amount_minor":-90000},{"account_id":2,"amount_minor":90000}]}}"#,
+        r#"{"id":5,"method":"account.delete","params":{"id":2}}"#,
+        r#"{"id":6,"method":"account.delete","params":{"id":3}}"#,
+        r#"{"id":7,"method":"account.delete","params":{"id":404}}"#,
+        r#"{"id":8,"method":"account.close","params":{"id":2,"closed":true}}"#,
+        r#"{"id":9,"method":"account.list"}"#,
+        r#"{"id":10,"method":"account.balances"}"#,
+        r#"{"id":11,"method":"db.check"}"#,
+    ]);
+
+    // Refused, and the message names what is in the way rather than quoting a constraint.
+    assert_eq!(out[4]["error"]["code"], "in_use");
+    let msg = out[4]["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("1 transaction"), "must say what blocks it: {msg}");
+    assert!(msg.contains("close it instead"), "must say what to do instead: {msg}");
+
+    // An account nothing refers to is a typo, and loses nothing.
+    assert_eq!(out[5]["result"]["deleted"], 3);
+    assert_eq!(out[6]["error"]["code"], "not_found");
+
+    // Hidden, not gone: account.list still has it (that is the only way back), while
+    // account.balances -- what the pickers use -- does not.
+    let listed = out[8]["result"].as_array().unwrap();
+    let rent = listed.iter().find(|a| a["name"] == "Rent").unwrap();
+    assert_eq!(rent["closed"], true);
+    assert_eq!(rent["postings"], 1, "the counts are what the UI uses to offer hide vs delete");
+    assert!(!listed.iter().any(|a| a["name"] == "Typo"), "the deleted one is really gone");
+
+    let open = out[9]["result"].as_array().unwrap();
+    assert!(!open.iter().any(|a| a["name"] == "Rent"), "a hidden account leaves the pickers");
+
+    assert_eq!(out[10]["result"]["ok"], true, "the book still balances after all of that");
+}
+
+#[test]
+fn a_system_account_is_never_removable() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Euro pot","kind":"asset","currency":"EUR"}}"#,
+        // A conversion happens: this is what creates the system trading account.
+        r#"{"id":3,"method":"txn.convert","params":{"occurred_on":"2026-08-01","description":"holiday money",
+             "from_account":1,"from_minor":40000,"to_account":2,"to_minor":46664}}"#,
+        r#"{"id":4,"method":"account.list"}"#,
+    ]);
+    let sys: Vec<_> = out[3]["result"].as_array().unwrap().iter()
+        .filter(|a| a["system"] == true).collect();
+    assert!(!sys.is_empty(), "a conversion should have created a system account");
+
+    let id = sys[0]["id"].as_i64().unwrap();
+    let del = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Euro pot","kind":"asset","currency":"EUR"}}"#,
+        r#"{"id":3,"method":"txn.convert","params":{"occurred_on":"2026-08-01","description":"holiday money",
+             "from_account":1,"from_minor":40000,"to_account":2,"to_minor":46664}}"#,
+        &format!(r#"{{"id":4,"method":"account.delete","params":{{"id":{id}}}}}"#),
+    ]);
+    assert_eq!(del[3]["error"]["code"], "system_account", "{}", del[3]);
+}

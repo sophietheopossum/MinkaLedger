@@ -244,8 +244,23 @@ fn dispatch(
         "account.list" => {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, name, kind, currency, parent_id, system, closed
-                       FROM account ORDER BY kind, name",
+                    // The counts decide close-vs-delete, and they are what the operator is
+                    // shown when delete is refused. Gathered here so the UI never has to guess
+                    // and never has to ask twice.
+                    "SELECT a.id, a.name, a.kind, a.currency, a.parent_id, a.system, a.closed,
+                            (SELECT COUNT(*) FROM posting        WHERE account_id = a.id),
+                            (SELECT COUNT(*) FROM series_posting WHERE account_id = a.id),
+                            (SELECT COUNT(*) FROM interest_rule
+                              WHERE account_id = a.id OR counter_account_id = a.id)
+                          + (SELECT COUNT(*) FROM payment_rule
+                              WHERE account_id = a.id OR from_account_id = a.id),
+                            (SELECT COUNT(*) FROM import_profile WHERE account_id = a.id)
+                          + (SELECT COUNT(*) FROM import_row
+                              WHERE account_id = a.id OR far_account_id = a.id)
+                          + (SELECT COUNT(*) FROM import_rule WHERE set_far_account_id = a.id)
+                          + (SELECT COUNT(*) FROM txn_import_key WHERE account_id = a.id),
+                            (SELECT COUNT(*) FROM account WHERE parent_id = a.id)
+                       FROM account a ORDER BY a.kind, a.name",
                 )
                 .map_err(|e| Error { code: "sql", message: e.to_string() })?;
             let rows: Vec<serde_json::Value> = stmt
@@ -258,6 +273,11 @@ fn dispatch(
                         "parent_id": r.get::<_, Option<i64>>(4)?,
                         "system": r.get::<_, i64>(5)? == 1,
                         "closed": r.get::<_, i64>(6)? == 1,
+                        "postings": r.get::<_, i64>(7)?,
+                        "series": r.get::<_, i64>(8)?,
+                        "rules": r.get::<_, i64>(9)?,
+                        "imports": r.get::<_, i64>(10)?,
+                        "children": r.get::<_, i64>(11)?,
                     }))
                 })
                 .and_then(|m| m.collect())
@@ -271,6 +291,75 @@ fn dispatch(
             conn.execute("UPDATE account SET closed = ?2 WHERE id = ?1", rusqlite::params![id, closed as i64])
                 .map_err(|e| Error { code: "sql", message: e.to_string() })?;
             Ok(serde_json::json!({ "id": id, "closed": closed }))
+        }
+
+        // Removing an account has TWO answers and the difference is not cosmetic.
+        //
+        // An account with history must be CLOSED, never deleted: its postings are half of every
+        // transaction it took part in, and destroying them would unbalance the book permanently --
+        // the one thing this ledger exists to make impossible. account.close already does that, and
+        // is reversible.
+        //
+        // An account with no references at all is a different thing: a typo, or a category created
+        // and never used. Deleting that loses nothing, so it is allowed.
+        //
+        // The counts are gathered before the attempt so the refusal can say WHAT is in the way
+        // rather than "FOREIGN KEY constraint failed". The DELETE still runs inside a transaction
+        // with foreign_keys ON, so anything this list has forgotten is caught by the database
+        // rather than silently corrupting the book.
+        "account.delete" => {
+            let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
+            let (name, system): (String, i64) = conn
+                .query_row("SELECT name, system FROM account WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .map_err(|_| Error {
+                    code: "not_found",
+                    message: format!("no such account: {id}"),
+                })?;
+            if system == 1 {
+                return Err(Error {
+                    code: "system_account",
+                    message: format!("{name} is a system account and cannot be removed"),
+                });
+            }
+
+            let count = |sql: &str| -> Result<i64, Error> {
+                conn.query_row(sql, [id], |r| r.get(0))
+                    .map_err(|e| Error { code: "sql", message: e.to_string() })
+            };
+            let uses = [
+                ("transaction", count("SELECT COUNT(*) FROM posting WHERE account_id = ?1")?),
+                ("recurring payment",
+                 count("SELECT COUNT(*) FROM series_posting WHERE account_id = ?1")?),
+                ("interest or payment rule",
+                 count("SELECT COUNT(*) FROM interest_rule WHERE account_id = ?1 OR counter_account_id = ?1")?
+                 + count("SELECT COUNT(*) FROM payment_rule WHERE account_id = ?1 OR from_account_id = ?1")?),
+                ("import record",
+                 count("SELECT COUNT(*) FROM import_profile WHERE account_id = ?1")?
+                 + count("SELECT COUNT(*) FROM import_row WHERE account_id = ?1 OR far_account_id = ?1")?
+                 + count("SELECT COUNT(*) FROM import_rule WHERE set_far_account_id = ?1")?
+                 + count("SELECT COUNT(*) FROM txn_import_key WHERE account_id = ?1")?),
+                ("child account", count("SELECT COUNT(*) FROM account WHERE parent_id = ?1")?),
+            ];
+            let blocking: Vec<String> = uses
+                .iter()
+                .filter(|(_, n)| *n > 0)
+                .map(|(what, n)| format!("{n} {what}{}", if *n == 1 { "" } else { "s" }))
+                .collect();
+            if !blocking.is_empty() {
+                return Err(Error {
+                    code: "in_use",
+                    message: format!(
+                        "{name} has {} — close it instead, which hides it and keeps the history",
+                        blocking.join(" and ")
+                    ),
+                });
+            }
+
+            conn.execute("DELETE FROM account WHERE id = ?1", [id])
+                .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::json!({ "deleted": id, "name": name }))
         }
 
         "account.balances" => {
