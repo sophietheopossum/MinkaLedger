@@ -28,19 +28,31 @@ Singleton {
     // Bumped whenever something is written, so views can re-query without polling.
     property int revision: 0
 
+    // Requests made before the child process has finished starting. The window asks for its data
+    // in Component.onCompleted, which fires BEFORE Process.running flips true -- dropping those
+    // would leave a permanently empty window that had merely asked too early.
+    property var _pendingStart: []
+
     function request(method, params, onResult) {
         if (!proc.running) {
-            root.lastError = "ledger core is not running";
-            if (onResult)
-                onResult(null, { code: "no_core", message: root.lastError });
+            _pendingStart.push({ method, params, onResult });
             return;
         }
         rpc.request(method, params, (result, error) => {
             if (error)
                 root.lastError = error.message || String(error.code);
+            else
+                root.lastError = ""; // a good response means whatever went wrong is over
             if (onResult)
                 onResult(result, error);
         });
+    }
+
+    function _flushPendingStart() {
+        const queued = _pendingStart;
+        _pendingStart = [];
+        for (const q of queued)
+            root.request(q.method, q.params, q.onResult);
     }
 
     // A write: same as request, but nudges `revision` so open views refresh.
@@ -80,8 +92,12 @@ Singleton {
         }
         onRunningChanged: {
             rpc.reset();
-            if (!running)
+            if (running) {
+                root.lastError = "";
+                root._flushPendingStart();
+            } else {
                 root.lastError = "ledger core exited";
+            }
         }
     }
 }
