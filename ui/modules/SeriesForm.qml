@@ -40,6 +40,13 @@ Rectangle {
     property string weekendRule: "none"
     property var previewDates: []
 
+    function currencyOf(id) {
+        const a = (root.accounts || []).find(x => x.account_id === id);
+        return a ? a.currency : "";
+    }
+    // The series is denominated in the account the money leaves.
+    readonly property string fromCurrency: root.currencyOf(root.fromAccount)
+
     // Each preset knows how to render itself as an RRULE. Kept as one function so the mapping from
     // "what a person means" to "what RFC 5545 says" lives in a single readable place.
     readonly property string rrule: {
@@ -76,7 +83,8 @@ Rectangle {
             root.amountOk = false;
             return;
         }
-        Ledger.request("money.parse", { text: text, minor_digits: 2 }, (r, e) => {
+        Ledger.request("money.parse",
+                       { text: text, minor_digits: Money.digits(root.fromCurrency) }, (r, e) => {
             if (e) {
                 root.amountOk = false;
                 amountField.invalid = true;
@@ -168,7 +176,8 @@ Rectangle {
             Field {
                 id: amountField
                 width: (r1.width - 8) * 0.4
-                label: "amount"
+                label: root.fromCurrency.length > 0
+                       ? "amount (" + root.fromCurrency + ")" : "amount"
                 numeric: true
                 placeholder: "0.00"
                 onEdited: value => root.validateAmount(value)

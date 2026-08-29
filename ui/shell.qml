@@ -316,7 +316,7 @@ ShellRoot {
                                         font.pixelSize: Theme.fontSize - 1
                                     }
                                     Text {
-                                        text: (modelData.balance_minor / 100).toFixed(2)
+                                        text: Money.format(modelData.balance_minor, modelData.currency)
                                         color: modelData.balance_minor < 0 ? Theme.red : Theme.text
                                         font.family: Theme.monoFamily
                                         font.pixelSize: Theme.fontSize - 1
@@ -403,7 +403,8 @@ ShellRoot {
 
             EntryForm {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 270
+                // No explicit height: the form reports its own, and it changes when the
+                // cross-currency row appears.
                 visible: win.showEntry
                 accounts: win.accounts
                 defaultDate: win.asOf
@@ -543,7 +544,7 @@ ShellRoot {
                                 font.pixelSize: Theme.fontSize - 1
                             }
                             Text {
-                                text: (modelData.amount_minor / 100).toFixed(2)
+                                text: Money.format(modelData.amount_minor, modelData.currency)
                                 color: modelData.amount_minor < 0 ? Theme.red : Theme.okGreen
                                 font.family: Theme.monoFamily
                                 font.pixelSize: Theme.fontSize - 1

@@ -227,7 +227,8 @@ Rectangle {
                                 Text {
                                     visible: chg.modelData.amount_minor !== null
                                     text: chg.modelData.amount_minor === null
-                                          ? "" : (chg.modelData.amount_minor / 100).toFixed(2)
+                                          ? "" : Money.format(chg.modelData.amount_minor,
+                                                                    chg.modelData.currency)
                                     color: Theme.textFaint
                                     font.family: Theme.monoFamily
                                     font.pixelSize: Theme.fontSize - 3
@@ -325,7 +326,8 @@ Rectangle {
                         Text {
                             anchors.verticalCenter: parent.verticalCenter
                             text: pick.modelData.amount_minor === null
-                                  ? "" : (pick.modelData.amount_minor / 100).toFixed(2)
+                                  ? "" : Money.format(pick.modelData.amount_minor,
+                                                            pick.modelData.currency)
                             color: Theme.textFaint
                             font.family: Theme.monoFamily
                             font.pixelSize: Theme.fontSize - 3

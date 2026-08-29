@@ -33,14 +33,18 @@ Rectangle {
         if (!occurrence)
             return;
         moveField.text = occurrence.value_on;
-        amountField.text = (Math.abs(occurrence.amount_minor) / 100).toFixed(2);
+        amountField.text = Money.format(Math.abs(occurrence.amount_minor),
+                                        occurrence.currency);
         root.newAmountMinor = Math.abs(occurrence.amount_minor);
         root.amountOk = true;
         status.text = "";
     }
 
     function validateAmount(text) {
-        Ledger.request("money.parse", { text: text, minor_digits: 2 }, (r, e) => {
+        // The occurrence carries its own currency, so the scale is never assumed.
+        Ledger.request("money.parse",
+                       { text: text,
+                         minor_digits: Money.digits(root.occurrence.currency) }, (r, e) => {
             if (e) {
                 root.amountOk = false;
                 amountField.invalid = true;

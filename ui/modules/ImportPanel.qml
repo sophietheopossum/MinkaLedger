@@ -294,7 +294,8 @@ Rectangle {
                             horizontalAlignment: Text.AlignRight
                             anchors.verticalCenter: parent.verticalCenter
                             text: row.modelData.amount_minor === null ? ""
-                                  : (row.modelData.amount_minor / 100).toFixed(2)
+                                  : Money.format(row.modelData.amount_minor,
+                                                       row.modelData.currency)
                             color: (row.modelData.amount_minor || 0) < 0 ? Theme.red : Theme.okGreen
                             font.family: Theme.monoFamily
                             font.pixelSize: Theme.fontSize - 2
