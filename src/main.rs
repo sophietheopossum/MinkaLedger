@@ -374,7 +374,16 @@ fn dispatch(
         "series.list" => {
             let mut stmt = conn.prepare(
                 "SELECT s.id, s.description, s.rrule, s.dtstart, s.until_on, s.weekend_rule, s.scenario_id,
-                        (SELECT COUNT(*) FROM series_posting sp WHERE sp.series_id = s.id)
+                        (SELECT COUNT(*) FROM series_posting sp WHERE sp.series_id = s.id),
+                        s.supersedes_id,
+                        -- The name of what it supersedes, not just the id: a scenario row reads as
+                        -- \"cancels Netflix\" or it reads as \"supersedes_id: 7\", and only one of
+                        -- those is something an operator can check.
+                        (SELECT o.description FROM series o WHERE o.id = s.supersedes_id),
+                        -- The primary leg is the money the series moves; the balancing leg is the
+                        -- same figure seen from the other side.
+                        (SELECT sp.amount_minor FROM series_posting sp
+                          WHERE sp.series_id = s.id AND sp.role = 'primary')
                    FROM series s ORDER BY s.id",
             ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
             let rows: Vec<serde_json::Value> = stmt.query_map([], |r| {
@@ -387,6 +396,9 @@ fn dispatch(
                     "weekend_rule": r.get::<_, String>(5)?,
                     "scenario_id": r.get::<_, Option<i64>>(6)?,
                     "postings": r.get::<_, i64>(7)?,
+                    "supersedes_id": r.get::<_, Option<i64>>(8)?,
+                    "supersedes": r.get::<_, Option<String>>(9)?,
+                    "amount_minor": r.get::<_, Option<i64>>(10)?,
                 }))
             }).and_then(|m| m.collect()).map_err(|e| Error { code: "sql", message: e.to_string() })?;
             Ok(serde_json::Value::Array(rows))
@@ -430,13 +442,38 @@ fn dispatch(
             Ok(serde_json::json!({ "id": conn.last_insert_rowid() }))
         }
 
+        // Deleting a scenario takes its series with it, by ON DELETE CASCADE on
+        // series.scenario_id -- which is what makes a scenario safe to try. Baseline series are
+        // untouched by construction: a scenario can only ever ADD rows or SUPERSEDE a baseline
+        // one, and superseding is a property of the scenario row, so removing it restores the
+        // baseline with nothing to undo.
+        "scenario.delete" => {
+            let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
+            let n = conn
+                .execute("DELETE FROM scenario WHERE id = ?1", [id])
+                .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            if n == 0 {
+                return Err(Error { code: "not_found", message: format!("no such scenario: {id}") });
+            }
+            Ok(serde_json::json!({ "deleted": id }))
+        }
+
         "scenario.list" => {
-            let mut stmt = conn.prepare("SELECT id, name, note FROM scenario ORDER BY id")
+            let mut stmt = conn.prepare(
+                "SELECT s.id, s.name, s.note,
+                        (SELECT COUNT(*) FROM series WHERE scenario_id = s.id),
+                        (SELECT COUNT(*) FROM series WHERE scenario_id = s.id
+                                                       AND supersedes_id IS NOT NULL)
+                   FROM scenario s ORDER BY s.id")
                 .map_err(|e| Error { code: "sql", message: e.to_string() })?;
             let rows: Vec<serde_json::Value> = stmt.query_map([], |r| {
                 Ok(serde_json::json!({
                     "id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?,
                     "note": r.get::<_, Option<String>>(2)?,
+                    // A scenario with no series changes nothing when activated. Saying so is the
+                    // difference between "off" and "on but empty", which look identical otherwise.
+                    "series_count": r.get::<_, i64>(3)?,
+                    "supersedes_count": r.get::<_, i64>(4)?,
                 }))
             }).and_then(|m| m.collect()).map_err(|e| Error { code: "sql", message: e.to_string() })?;
             Ok(serde_json::Value::Array(rows))

@@ -251,3 +251,80 @@ fn an_agent_can_discover_the_surface_without_being_told_about_it() {
         assert_ne!(reply["error"]["code"], "unknown_method", "{name} is advertised but absent");
     }
 }
+
+/// Scenarios are the feature most likely to be got wrong in a way nobody notices: a "what if"
+/// that quietly alters the real book would be worse than no feature at all. So this drives the
+/// whole shape end to end -- add, cancel, activate, delete -- and checks history each time.
+#[test]
+fn a_scenario_changes_the_forecast_and_never_the_book() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Netflix","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"series.create","params":{"description":"Netflix","rrule":"FREQ=MONTHLY;BYMONTHDAY=5",
+             "dtstart":"2026-01-05","postings":[{"account_id":1,"amount_minor":-1099,"role":"primary"},
+                                                {"account_id":2,"amount_minor":1099,"role":"balancing"}]}}"#,
+        r#"{"id":4,"method":"scenario.create","params":{"name":"Cancel Netflix"}}"#,
+        // The cancel row: scenario-scoped, supersedes the baseline, and moves no money itself.
+        r#"{"id":5,"method":"series.create","params":{"description":"cancelled: Netflix",
+             "rrule":"FREQ=MONTHLY;BYMONTHDAY=5","dtstart":"2026-09-01",
+             "scenario_id":1,"supersedes_id":1,"postings":[]}}"#,
+        r#"{"id":6,"method":"forecast.project","params":{"as_of":"2026-08-29","horizon":"2026-12-31","scenarios":[]}}"#,
+        r#"{"id":7,"method":"forecast.project","params":{"as_of":"2026-08-29","horizon":"2026-12-31","scenarios":[1]}}"#,
+        r#"{"id":8,"method":"scenario.list"}"#,
+        r#"{"id":9,"method":"series.list"}"#,
+        r#"{"id":10,"method":"txn.list","params":{}}"#,
+    ]);
+    for r in &out {
+        assert!(err_of(r).is_none(), "{r}");
+    }
+    let baseline = out[5]["result"]["occurrences"].as_array().unwrap().len();
+    let whatif = out[6]["result"]["occurrences"].as_array().unwrap().len();
+    assert!(baseline > 0, "baseline should project Netflix");
+    assert_eq!(whatif, 0, "the scenario cancels it, so nothing is projected");
+
+    let sc = &out[7]["result"][0];
+    assert_eq!(sc["series_count"], 1);
+    assert_eq!(sc["supersedes_count"], 1, "a cancellation must be visible as one");
+
+    // The cancel row names what it cancels, so the UI never has to show a bare id.
+    let cancel = out[8]["result"].as_array().unwrap().iter()
+        .find(|s| s["scenario_id"] == 1).unwrap();
+    assert_eq!(cancel["supersedes"], "Netflix");
+    assert_eq!(cancel["postings"], 0, "a cancellation moves no money");
+    assert!(cancel["amount_minor"].is_null());
+
+    // Nothing about any of this touched history.
+    assert!(out[9]["result"].as_array().unwrap().is_empty(), "a scenario must write no transactions");
+}
+
+#[test]
+fn deleting_a_scenario_takes_its_changes_and_restores_the_baseline() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Netflix","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"series.create","params":{"description":"Netflix","rrule":"FREQ=MONTHLY;BYMONTHDAY=5",
+             "dtstart":"2026-01-05","postings":[{"account_id":1,"amount_minor":-1099,"role":"primary"},
+                                                {"account_id":2,"amount_minor":1099,"role":"balancing"}]}}"#,
+        r#"{"id":4,"method":"scenario.create","params":{"name":"Cancel Netflix"}}"#,
+        r#"{"id":5,"method":"series.create","params":{"description":"cancelled: Netflix",
+             "rrule":"FREQ=MONTHLY;BYMONTHDAY=5","dtstart":"2026-09-01",
+             "scenario_id":1,"supersedes_id":1,"postings":[]}}"#,
+        r#"{"id":6,"method":"scenario.delete","params":{"id":1}}"#,
+        r#"{"id":7,"method":"series.list"}"#,
+        r#"{"id":8,"method":"forecast.project","params":{"as_of":"2026-08-29","horizon":"2026-12-31","scenarios":[]}}"#,
+        r#"{"id":9,"method":"scenario.delete","params":{"id":99}}"#,
+        r#"{"id":10,"method":"db.check"}"#,
+    ]);
+    assert_eq!(out[5]["result"]["deleted"], 1);
+
+    // CASCADE removed the scenario's series; the baseline one is untouched.
+    let series = out[6]["result"].as_array().unwrap();
+    assert_eq!(series.len(), 1, "only the baseline series should remain: {series:?}");
+    assert_eq!(series[0]["description"], "Netflix");
+    assert!(series[0]["scenario_id"].is_null());
+
+    assert!(!out[7]["result"]["occurrences"].as_array().unwrap().is_empty(),
+            "with the scenario gone the baseline projects again");
+    assert_eq!(out[8]["error"]["code"], "not_found", "deleting a missing scenario is an error, not a silent no-op");
+    assert_eq!(out[9]["result"]["ok"], true);
+}
