@@ -18,6 +18,9 @@ Singleton {
     readonly property color red: Proustite.red
     readonly property color redDim: Proustite.redDim
     readonly property color purple: Proustite.purple
+    readonly property color purpleDim: Proustite.purpleDim
+    readonly property color okGreen: Proustite.okGreen
+    readonly property color warnAmber: Proustite.warnAmber
 
     readonly property string fontFamily: Proustite.fontFamily
     readonly property string monoFamily: Proustite.monoFamily

@@ -26,6 +26,8 @@ ShellRoot {
         property int focusAccount: -1
         property var scenarios: []
         property var activeScenarios: []
+        property var editing: null          // the occurrence open in the editor
+        property bool showEntry: false      // the record-a-payment form
 
         function refresh() {
             Ledger.request("account.balances", {}, (r, e) => {
@@ -81,6 +83,11 @@ ShellRoot {
                     font.family: Theme.monoFamily
                     font.pixelSize: Theme.fontSize - 1
                 }
+                PushButton {
+                    label: win.showEntry ? "Close" : "+ payment"
+                    primary: !win.showEntry
+                    onClicked: win.showEntry = !win.showEntry
+                }
                 Text {
                     text: Ledger.running ? "core up" : "core down"
                     color: Ledger.running ? Theme.textFaint : Theme.red
@@ -107,11 +114,72 @@ ShellRoot {
                         anchors.margins: 10
                         spacing: 6
 
-                        Text {
-                            text: "ACCOUNTS"
-                            color: Theme.textMuted
-                            font.family: Theme.fontFamily
-                            font.pixelSize: Theme.fontSize - 2
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Text {
+                                text: "ACCOUNTS"
+                                color: Theme.textMuted
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 2
+                            }
+                            Item { Layout.fillWidth: true }
+                            PushButton {
+                                label: "+ account"
+                                onClicked: newAccount.visible = !newAccount.visible
+                            }
+                        }
+
+                        // Creating an account is rare but a fresh book is unusable without it, so
+                        // it lives here rather than behind a menu.
+                        Rectangle {
+                            id: newAccount
+                            visible: false
+                            Layout.fillWidth: true
+                            implicitHeight: 108
+                            color: Theme.surfaceRaised
+                            border.color: Theme.line
+                            border.width: 1
+                            radius: 6
+
+                            Column {
+                                anchors.fill: parent
+                                anchors.margins: 8
+                                spacing: 6
+                                Field {
+                                    id: accName
+                                    width: parent.width
+                                    label: "name"
+                                    placeholder: "Current, Rent, Salary…"
+                                }
+                                Row {
+                                    spacing: 6
+                                    Repeater {
+                                        model: ["asset", "liability", "income", "expense"]
+                                        PushButton {
+                                            label: modelData
+                                            primary: newAccount.kind === modelData
+                                            onClicked: newAccount.kind = modelData
+                                        }
+                                    }
+                                }
+                                Row {
+                                    spacing: 6
+                                    PushButton {
+                                        label: "Create"
+                                        primary: true
+                                        enabled: accName.text.length > 0
+                                        onClicked: {
+                                            Ledger.write("account.create",
+                                                { name: accName.text, kind: newAccount.kind },
+                                                (r, e) => {
+                                                    if (!e) { accName.clear(); newAccount.visible = false; }
+                                                });
+                                        }
+                                    }
+                                    PushButton { label: "Cancel"; onClicked: newAccount.visible = false }
+                                }
+                            }
+                            property string kind: "expense"
                         }
 
                         ListView {
@@ -228,6 +296,23 @@ ShellRoot {
                 }
             }
 
+            EntryForm {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 270
+                visible: win.showEntry
+                accounts: win.accounts
+                defaultDate: win.asOf
+                onSaved: win.showEntry = false
+            }
+
+            OccurrenceEditor {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 190
+                occurrence: win.editing
+                onChanged: win.editing = null
+                onDismissed: win.editing = null
+            }
+
             // ---- what is coming ----
             Rectangle {
                 Layout.fillWidth: true
@@ -256,8 +341,18 @@ ShellRoot {
                         model: (win.projection.occurrences || []).filter(
                             o => o.account_id === win.focusAccount)
                         delegate: RowLayout {
+                            id: occRow
                             width: ListView.view.width
                             spacing: 10
+                            // Only a real series occurrence can be overridden. Generated interest
+                            // and payment legs carry a negative series_id and are not editable:
+                            // they are consequences of a rule, not instances of one.
+                            readonly property bool editable: modelData.series_id > 0
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: occRow.editable ? Qt.PointingHandCursor : Qt.ArrowCursor
+                                onClicked: if (occRow.editable) win.editing = modelData
+                            }
                             Text {
                                 text: modelData.value_on
                                 color: Theme.textFaint
