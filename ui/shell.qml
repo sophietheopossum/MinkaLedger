@@ -33,6 +33,7 @@ ShellRoot {
         property bool editAccounts: false
         property bool showDanger: false
         property bool showCurrencies: false
+        property bool showJourneys: false
         property var currencies: []
         property var projection: ({ balances: [], occurrences: [] })
         property string asOf: Qt.formatDate(new Date(), "yyyy-MM-dd")
@@ -136,6 +137,14 @@ ShellRoot {
                     onClicked: { win.showImport = !win.showImport;
                                  if (win.showImport) { win.showEntry = false; win.showSeries = false;
                                                        win.showBrief = false; } }
+                }
+                PushButton {
+                    label: win.showJourneys ? "Close" : "chains"
+                    onClicked: { win.showJourneys = !win.showJourneys;
+                                 if (win.showJourneys) { win.showEntry = false; win.showSeries = false;
+                                                         win.showImport = false; win.showBrief = false;
+                                                         win.showScenarios = false; win.showDanger = false;
+                                                         win.showCurrencies = false; } }
                 }
                 PushButton {
                     label: win.showScenarios ? "Close" : "what if"
@@ -419,6 +428,15 @@ ShellRoot {
                 accounts: win.accounts
                 defaultDate: win.asOf
                 onSaved: win.showEntry = false
+            }
+
+            JourneyPanel {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 320
+                visible: win.showJourneys
+                today: win.asOf
+                onDone: win.showJourneys = false
+                onChanged: win.refresh()
             }
 
             CurrencyPanel {

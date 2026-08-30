@@ -552,3 +552,89 @@ fn the_same_text_parses_to_different_integers_per_currency_scale() {
     assert_eq!(out[6]["result"]["formatted"], "10.00");
     assert_eq!(out[7]["result"]["formatted"], "1.000");
 }
+
+/// A payment chain across three transactions and two days -- the shape the GUI renders.
+///
+/// The residual is the reason journeys exist, and its semantics are easy to get wrong: it is NOT
+/// empty when a transfer completes. Source, destination and fee all remain; only the accounts the
+/// money passed straight THROUGH fall to zero and drop out. The UI keys completion off the
+/// `arrival` role for exactly this reason, so both facts are pinned here.
+#[test]
+fn a_payment_chain_shows_where_the_money_stopped() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Starling","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Wise","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"Revolut","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":4,"method":"account.create","params":{"name":"Bank fees","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":5,"method":"txn.create","params":{"occurred_on":"2026-08-25","description":"Starling to Wise",
+             "postings":[{"account_id":1,"amount_minor":-50000},{"account_id":2,"amount_minor":50000}]}}"#,
+        r#"{"id":6,"method":"txn.create","params":{"occurred_on":"2026-08-25","description":"Wise fee",
+             "postings":[{"account_id":2,"amount_minor":-320},{"account_id":4,"amount_minor":320}]}}"#,
+        r#"{"id":7,"method":"journey.create","params":{"label":"Starling to Revolut","opened_on":"2026-08-25"}}"#,
+        r#"{"id":8,"method":"journey.attach","params":{"journey_id":1,"txn_id":1,"seq":0,"role":"source"}}"#,
+        r#"{"id":9,"method":"journey.attach","params":{"journey_id":1,"txn_id":2,"seq":1,"role":"fee"}}"#,
+        r#"{"id":10,"method":"journey.get","params":{"id":1}}"#,
+        // two days later it lands
+        r#"{"id":11,"method":"txn.create","params":{"occurred_on":"2026-08-27","description":"Wise to Revolut",
+             "postings":[{"account_id":2,"amount_minor":-49680},{"account_id":3,"amount_minor":49680}]}}"#,
+        r#"{"id":12,"method":"journey.attach","params":{"journey_id":1,"txn_id":3,"seq":2,"role":"arrival"}}"#,
+        r#"{"id":13,"method":"journey.get","params":{"id":1}}"#,
+        r#"{"id":14,"method":"journey.list"}"#,
+        r#"{"id":15,"method":"db.check"}"#,
+    ]);
+    for r in &out {
+        assert!(err_of(r).is_none(), "{r}");
+    }
+
+    // MID-FLIGHT: the money is sitting in Wise, and that is the question a chain answers.
+    let mid = &out[9]["result"];
+    let wise = mid["residual"].as_array().unwrap().iter()
+        .find(|x| x["account"] == "Wise").expect("Wise holds the money mid-flight");
+    assert_eq!(wise["amount_minor"], 49_680, "500.00 in, 3.20 fee out");
+
+    // ARRIVED: Wise nets to zero and DROPS OUT; the endpoints and the fee do not.
+    let done = &out[12]["result"];
+    let accounts: Vec<&str> = done["residual"].as_array().unwrap().iter()
+        .map(|x| x["account"].as_str().unwrap()).collect();
+    assert!(!accounts.contains(&"Wise"), "a passed-through account nets to zero: {accounts:?}");
+    assert!(accounts.contains(&"Starling") && accounts.contains(&"Revolut"),
+            "endpoints stay in the residual, so 'empty means done' is wrong: {accounts:?}");
+    assert!(!done["residual"].as_array().unwrap().is_empty(),
+            "the residual is NEVER empty for a real transfer -- the UI must not key completion on it");
+
+    // Ordered, and the arrival role is the completion signal the UI uses.
+    let legs = done["legs"].as_array().unwrap();
+    let roles: Vec<&str> = legs.iter().map(|l| l["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, vec!["source", "fee", "arrival"]);
+    let seqs: Vec<i64> = legs.iter().map(|l| l["seq"].as_i64().unwrap()).collect();
+    assert_eq!(seqs, vec![0, 1, 2], "seq drives the order the chain is drawn in");
+
+    assert_eq!(out[13]["result"][0]["legs"], 3);
+    assert_eq!(out[14]["result"]["ok"], true, "linking transactions writes no postings");
+}
+
+#[test]
+fn attaching_the_same_step_twice_is_refused_rather_than_reordering_the_chain() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"A","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"B","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"txn.create","params":{"occurred_on":"2026-08-25","description":"one",
+             "postings":[{"account_id":1,"amount_minor":-100},{"account_id":2,"amount_minor":100}]}}"#,
+        r#"{"id":4,"method":"txn.create","params":{"occurred_on":"2026-08-26","description":"two",
+             "postings":[{"account_id":1,"amount_minor":-200},{"account_id":2,"amount_minor":200}]}}"#,
+        r#"{"id":5,"method":"journey.create","params":{"label":"chain","opened_on":"2026-08-25"}}"#,
+        r#"{"id":6,"method":"journey.attach","params":{"journey_id":1,"txn_id":1,"seq":0,"role":"source"}}"#,
+        // same seq as an existing leg: UNIQUE(journey_id, seq) must reject it
+        r#"{"id":7,"method":"journey.attach","params":{"journey_id":1,"txn_id":2,"seq":0,"role":"leg"}}"#,
+        r#"{"id":8,"method":"journey.attach","params":{"journey_id":1,"txn_id":2,"seq":1,"role":"arrival"}}"#,
+        r#"{"id":9,"method":"journey.detach","params":{"journey_id":1,"txn_id":2}}"#,
+        r#"{"id":10,"method":"journey.get","params":{"id":1}}"#,
+        r#"{"id":11,"method":"txn.list","params":{}}"#,
+    ]);
+    assert!(err_of(&out[6]).is_some(), "a duplicate seq must not silently reorder the chain");
+    assert!(err_of(&out[7]).is_none(), "the next seq is fine");
+    assert_eq!(out[8]["result"]["detached"], true);
+    assert_eq!(out[9]["result"]["legs"].as_array().unwrap().len(), 1, "detach removed the leg");
+    // Detaching a step must never touch the transaction itself.
+    assert_eq!(out[10]["result"].as_array().unwrap().len(), 2, "both transactions survive");
+}
