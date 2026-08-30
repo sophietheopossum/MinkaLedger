@@ -13,6 +13,16 @@ ShellRoot {
     FloatingWindow {
         id: win
         title: "MinkaLedger"
+
+        // Closing the window ENDS the app. A Quickshell config is a shell rather than an
+        // application, so `qs` stays alive after its last window is destroyed -- which for a
+        // windowed app means an invisible process per launch, each still holding its resources.
+        // Alt+F4 and Super+Q both reach here: ShojiWM's closeFocusedWindow() sends
+        // xdg_toplevel.close, a request, and this is the handler for it.
+        //
+        // MinkaMon deliberately does the opposite (`onClosed: visible = false`) because it is a
+        // long-lived monitor whose satellites reopen. This is not that.
+        onClosed: Qt.quit()
         implicitWidth: 900
         implicitHeight: 620
         color: Theme.ground
