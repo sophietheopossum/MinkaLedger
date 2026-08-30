@@ -11,7 +11,10 @@ use rusqlite::Connection;
 
 /// Every migration in order. Index + 1 is the version it brings the book to, so appending is the
 /// only supported edit -- never reorder, never rewrite a landed one.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_txn_link.sql"),
+];
 
 pub fn current_version() -> i64 {
     MIGRATIONS.len() as i64

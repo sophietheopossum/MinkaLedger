@@ -638,3 +638,96 @@ fn attaching_the_same_step_twice_is_refused_rather_than_reordering_the_chain() {
     // Detaching a step must never touch the transaction itself.
     assert_eq!(out[10]["result"].as_array().unwrap().len(), 2, "both transactions survive");
 }
+
+/// Free-form links: any payment to any other, followed from either end.
+///
+/// The property that matters is that direction is RECORDED but not OBEYED when traversing —
+/// starting at the last payment in a chain must still show the whole chain.
+#[test]
+fn payments_link_into_a_chain_followable_from_either_end() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Starling","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Wise","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"Revolut","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":4,"method":"txn.create","params":{"occurred_on":"2026-08-25","description":"Starling to Wise",
+             "postings":[{"account_id":1,"amount_minor":-50000},{"account_id":2,"amount_minor":50000}]}}"#,
+        r#"{"id":5,"method":"txn.create","params":{"occurred_on":"2026-08-26","description":"Wise fee",
+             "postings":[{"account_id":2,"amount_minor":-320},{"account_id":1,"amount_minor":320}]}}"#,
+        r#"{"id":6,"method":"txn.create","params":{"occurred_on":"2026-08-27","description":"Wise to Revolut",
+             "postings":[{"account_id":2,"amount_minor":-49680},{"account_id":3,"amount_minor":49680}]}}"#,
+        r#"{"id":7,"method":"link.create","params":{"from_txn":1,"to_txn":2,"note":"its fee"}}"#,
+        r#"{"id":8,"method":"link.create","params":{"from_txn":2,"to_txn":3}}"#,
+        // every way of asking for something the graph already says, or cannot say
+        r#"{"id":9,"method":"link.create","params":{"from_txn":2,"to_txn":1}}"#,
+        r#"{"id":10,"method":"link.create","params":{"from_txn":1,"to_txn":1}}"#,
+        r#"{"id":11,"method":"link.create","params":{"from_txn":1,"to_txn":404}}"#,
+        // follow from the LAST payment: direction must not limit reachability
+        r#"{"id":12,"method":"link.chain","params":{"txn_id":3}}"#,
+        r#"{"id":13,"method":"link.chain","params":{"txn_id":1}}"#,
+        r#"{"id":14,"method":"link.for_txn","params":{"txn_id":2}}"#,
+        r#"{"id":15,"method":"db.check"}"#,
+    ]);
+    assert!(err_of(&out[6]).is_none() && err_of(&out[7]).is_none());
+    assert_eq!(out[8]["error"]["code"], "already_linked", "the reverse edge is the same assertion");
+    assert_eq!(out[9]["error"]["code"], "self_link");
+    assert_eq!(out[10]["error"]["code"], "no_such_txn");
+
+    // From the far end, the whole chain, with hop counts measured from where you started.
+    let from_end = &out[11]["result"];
+    assert_eq!(from_end["nodes"].as_array().unwrap().len(), 3, "{from_end}");
+    assert_eq!(from_end["edges"].as_array().unwrap().len(), 2);
+    let d = |v: &serde_json::Value, id: i64| -> i64 {
+        v["nodes"].as_array().unwrap().iter()
+            .find(|n| n["id"] == id).unwrap()["depth"].as_i64().unwrap()
+    };
+    assert_eq!((d(from_end, 3), d(from_end, 2), d(from_end, 1)), (0, 1, 2));
+
+    // ...and from the other end the same set, with the depths mirrored.
+    let from_start = &out[12]["result"];
+    assert_eq!(from_start["nodes"].as_array().unwrap().len(), 3);
+    assert_eq!((d(from_start, 1), d(from_start, 2), d(from_start, 3)), (0, 1, 2));
+
+    // The middle payment reports both directions, and the note survives.
+    let linked = out[13]["result"]["linked"].as_array().unwrap();
+    assert_eq!(linked.len(), 2);
+    let inbound = linked.iter().find(|l| l["id"] == 1).unwrap();
+    assert_eq!(inbound["direction"], "in");
+    assert_eq!(inbound["note"], "its fee");
+    assert_eq!(linked.iter().find(|l| l["id"] == 3).unwrap()["direction"], "out");
+
+    assert_eq!(out[14]["result"]["ok"], true, "linking writes no postings");
+}
+
+#[test]
+fn deleting_a_payment_takes_its_links_and_browse_finds_what_you_search_for() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Shop","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"txn.create","params":{"occurred_on":"2026-08-25","description":"TESCO run",
+             "payee":"Tesco","postings":[{"account_id":1,"amount_minor":-1000},{"account_id":2,"amount_minor":1000}]}}"#,
+        r#"{"id":4,"method":"txn.create","params":{"occurred_on":"2026-08-26","description":"refund",
+             "postings":[{"account_id":1,"amount_minor":500},{"account_id":2,"amount_minor":-500}]}}"#,
+        r#"{"id":5,"method":"link.create","params":{"from_txn":1,"to_txn":2}}"#,
+        r#"{"id":6,"method":"txn.browse","params":{"search":"tesco"}}"#,
+        r#"{"id":7,"method":"txn.browse","params":{"search":"TESCO"}}"#,
+        r#"{"id":8,"method":"txn.browse","params":{"account_id":2}}"#,
+        r#"{"id":9,"method":"txn.delete","params":{"id":2}}"#,
+        r#"{"id":10,"method":"link.chain","params":{"txn_id":1}}"#,
+        r#"{"id":11,"method":"db.check"}"#,
+    ]);
+    // Search covers the payee too, and is case-insensitive both ways round.
+    assert_eq!(out[5]["result"]["total"], 1, "matched on payee");
+    assert_eq!(out[6]["result"]["total"], 1, "upper case finds the lower-case description");
+    assert_eq!(out[7]["result"]["total"], 2, "both touch the Shop account");
+
+    let row = &out[5]["result"]["rows"][0];
+    assert_eq!(row["links"], 1, "the browser shows what is already threaded");
+    assert_eq!(row["postings"].as_array().unwrap().len(), 2, "a row carries its legs");
+
+    // A link is a statement ABOUT two payments and cannot outlive either.
+    assert!(err_of(&out[8]).is_none(), "{}", out[8]);
+    let left = &out[9]["result"];
+    assert_eq!(left["nodes"].as_array().unwrap().len(), 1, "only the survivor remains");
+    assert!(left["edges"].as_array().unwrap().is_empty(), "the dangling edge went with it");
+    assert_eq!(out[10]["result"]["ok"], true);
+}

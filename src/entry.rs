@@ -215,6 +215,126 @@ pub fn list(
     Ok(rows)
 }
 
+/// One transaction, with enough of its postings to be recognisable in a list or a graph
+/// node. Shared by the payment browser and the link graph so a payment looks the same in
+/// both, and carries its link count so a browser can show what is already threaded.
+pub fn summarise(conn: &Connection, ids: &[i64]) -> Result<Vec<serde_json::Value>, EntryError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let mut st = conn.prepare(&format!(
+        "SELECT t.id, t.occurred_on, t.description, t.payee, t.source,
+                (SELECT COUNT(*) FROM txn_link l
+                  WHERE l.from_txn_id = t.id OR l.to_txn_id = t.id)
+           FROM txn t WHERE t.id IN ({list}) ORDER BY t.occurred_on, t.id"
+    ))?;
+    let mut rows: Vec<serde_json::Value> = st
+        .query_map([], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, i64>(0)?,
+                "occurred_on": r.get::<_, String>(1)?,
+                "description": r.get::<_, String>(2)?,
+                "payee": r.get::<_, Option<String>>(3)?,
+                "source": r.get::<_, String>(4)?,
+                "links": r.get::<_, i64>(5)?,
+            }))
+        })?
+        .collect::<Result<_, _>>()?;
+
+    // Postings come as a second pass rather than a join: joining would fan each transaction out
+    // into one row per posting and the caller would have to regroup them.
+    let mut st = conn.prepare(&format!(
+        "SELECT p.txn_id, a.name, a.kind, p.currency, p.amount_minor
+           FROM posting p JOIN account a ON a.id = p.account_id
+          WHERE p.txn_id IN ({list})
+          ORDER BY p.txn_id, p.amount_minor"
+    ))?;
+    let mut by_txn: std::collections::HashMap<i64, Vec<serde_json::Value>> = Default::default();
+    for row in st.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            serde_json::json!({
+                "account": r.get::<_, String>(1)?,
+                "kind": r.get::<_, String>(2)?,
+                "currency": r.get::<_, String>(3)?,
+                "amount_minor": r.get::<_, Minor>(4)?,
+            }),
+        ))
+    })? {
+        let (t, p) = row?;
+        by_txn.entry(t).or_default().push(p);
+    }
+    for r in &mut rows {
+        let id = r["id"].as_i64().unwrap_or(0);
+        r["postings"] = serde_json::json!(by_txn.remove(&id).unwrap_or_default());
+    }
+    Ok(rows)
+}
+
+/// The payment browser's query: search text, a date window, one account, with paging.
+///
+/// Separate from `list` rather than replacing it: `list` is the cheap "what happened" used by the
+/// importer and the tests, while this fans out into postings and link counts for every row and is
+/// only worth that when something is actually going to display them.
+///
+/// Search matches description OR payee, case-insensitively. The account filter is a subquery on
+/// posting rather than a join, so a transaction touching the account twice still yields one row.
+pub fn browse(
+    conn: &Connection,
+    search: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    account_id: Option<i64>,
+    limit: i64,
+    offset: i64,
+) -> Result<serde_json::Value, EntryError> {
+    let pattern = search.map(|s| format!("%{}%", s.trim().to_lowercase()));
+    let mut stmt = conn.prepare(
+        "SELECT t.id FROM txn t
+          WHERE (?1 IS NULL OR lower(t.description) LIKE ?1
+                            OR lower(COALESCE(t.payee, '')) LIKE ?1)
+            AND (?2 IS NULL OR t.occurred_on >= ?2)
+            AND (?3 IS NULL OR t.occurred_on <= ?3)
+            AND (?4 IS NULL OR EXISTS (SELECT 1 FROM posting p
+                                        WHERE p.txn_id = t.id AND p.account_id = ?4))
+          ORDER BY t.occurred_on DESC, t.id DESC
+          LIMIT ?5 OFFSET ?6",
+    )?;
+    let ids: Vec<i64> = stmt
+        .query_map(
+            rusqlite::params![pattern, from, to, account_id, limit, offset],
+            |r| r.get(0),
+        )?
+        .collect::<Result<_, _>>()?;
+
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM txn t
+          WHERE (?1 IS NULL OR lower(t.description) LIKE ?1
+                            OR lower(COALESCE(t.payee, '')) LIKE ?1)
+            AND (?2 IS NULL OR t.occurred_on >= ?2)
+            AND (?3 IS NULL OR t.occurred_on <= ?3)
+            AND (?4 IS NULL OR EXISTS (SELECT 1 FROM posting p
+                                        WHERE p.txn_id = t.id AND p.account_id = ?4))",
+        rusqlite::params![pattern, from, to, account_id],
+        |r| r.get(0),
+    )?;
+
+    // summarise orders by date ASCENDING; the browser wants newest first, which is the order the
+    // id query already established.
+    let mut rows = summarise(conn, &ids)?;
+    rows.sort_by_key(|r| {
+        ids.iter().position(|i| *i == r["id"].as_i64().unwrap_or(0)).unwrap_or(usize::MAX)
+    });
+
+    Ok(serde_json::json!({
+        "rows": rows,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    }))
+}
+
 /// Current balance per account, from real postings only. The forecast's starting point.
 pub fn balances(conn: &Connection, as_of: Option<&str>) -> Result<Vec<serde_json::Value>, EntryError> {
     let mut stmt = conn.prepare(

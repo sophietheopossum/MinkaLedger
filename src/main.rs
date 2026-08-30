@@ -20,6 +20,7 @@ mod fx;
 mod importer;
 mod interest;
 mod journey;
+mod link;
 mod money;
 
 use std::io::{BufRead, Write};
@@ -174,6 +175,19 @@ impl From<analysis::AnalysisError> for Error {
         let code = match e {
             analysis::AnalysisError::Bad(_) => "bad_query",
             analysis::AnalysisError::Sql(_) => "sql",
+        };
+        Error { code, message: e.to_string() }
+    }
+}
+
+impl From<link::LinkError> for Error {
+    fn from(e: link::LinkError) -> Self {
+        use link::LinkError as L;
+        let code = match e {
+            L::NoSuchTxn(_) => "no_such_txn",
+            L::SelfLink => "self_link",
+            L::Exists(_, _) => "already_linked",
+            L::Sql(_) | L::Unexpected(_) => "sql",
         };
         Error { code, message: e.to_string() }
     }
@@ -1192,6 +1206,55 @@ fn dispatch(
         "analysis.schema" => Ok(analysis::schema(conn)?),
 
         "analysis.tools" => Ok(analysis::tools()),
+
+        // The payment browser. Distinct from txn.list, which stays cheap for the importer.
+        "txn.browse" => {
+            let g = |k: &str| params.get(k).and_then(|v| v.as_str());
+            Ok(entry::browse(
+                conn,
+                g("search").filter(|s| !s.trim().is_empty()),
+                g("from"),
+                g("to"),
+                params.get("account_id").and_then(|v| v.as_i64()),
+                params.get("limit").and_then(|v| v.as_i64()).unwrap_or(50).clamp(1, 500),
+                params.get("offset").and_then(|v| v.as_i64()).unwrap_or(0).max(0),
+            )?)
+        }
+
+        // ---- free-form links between payments (req 10, graph form) ----
+        //
+        // Distinct from journeys on purpose: a journey is an ordered container you plan, this is
+        // an assertion between two payments made after the fact. Neither replaces the other.
+        "link.create" => {
+            let from = params.get("from_txn").and_then(|v| v.as_i64()).ok_or_else(|| bad("from_txn"))?;
+            let to = params.get("to_txn").and_then(|v| v.as_i64()).ok_or_else(|| bad("to_txn"))?;
+            let note = params.get("note").and_then(|v| v.as_str());
+            let on = params
+                .get("on")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
+            link::create(conn, from, to, note, &on)?;
+            Ok(serde_json::json!({ "from": from, "to": to }))
+        }
+
+        "link.delete" => {
+            let a = params.get("from_txn").and_then(|v| v.as_i64()).ok_or_else(|| bad("from_txn"))?;
+            let b = params.get("to_txn").and_then(|v| v.as_i64()).ok_or_else(|| bad("to_txn"))?;
+            Ok(serde_json::json!({ "removed": link::remove(conn, a, b)? }))
+        }
+
+        "link.for_txn" => {
+            let id = params.get("txn_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("txn_id"))?;
+            Ok(link::for_txn(conn, id)?)
+        }
+
+        // The whole connected component -- "follow the thread" -- from wherever you start.
+        "link.chain" => {
+            let id = params.get("txn_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("txn_id"))?;
+            let max = params.get("max_nodes").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
+            Ok(link::chain(conn, id, max.clamp(1, 2000))?)
+        }
 
         other => Err(Error::unknown_method(other)),
     }
