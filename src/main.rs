@@ -378,7 +378,10 @@ fn dispatch(
             let opening = params
                 .get("opening_minor")
                 .and_then(|v| v.as_i64())
-                .filter(|v| *v != 0);
+                .filter(|v| *v != 0)
+                // Same reason as account.set_opening: an equity account IS the counterweight, so
+                // giving it one would post both legs to itself.
+                .filter(|_| kind != "equity");
             if let Some(amount) = opening {
                 let on = params
                     .get("opening_on")
@@ -539,6 +542,137 @@ fn dispatch(
             conn.execute("DELETE FROM account WHERE id = ?1", [id])
                 .map_err(|e| Error { code: "sql", message: e.to_string() })?;
             Ok(serde_json::json!({ "deleted": id, "name": name }))
+        }
+
+        // Read and adjust an account's opening balance after the fact.
+        //
+        // The opening transaction is found STRUCTURALLY -- the one touching this account and an
+        // equity account -- not by its description. A description is a label someone may edit;
+        // "posted against equity" is what actually makes it an opening balance.
+        //
+        // It is UPDATED IN PLACE rather than deleted and rewritten, so its id survives. A rewrite
+        // would silently drop any link the payment browser has made to it, since txn_link cascades
+        // with the transaction.
+        "account.opening" => {
+            let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
+            let found: Option<(i64, String, i64)> = conn
+                .query_row(
+                    "SELECT t.id, t.occurred_on, p.amount_minor
+                       FROM txn t
+                       JOIN posting p ON p.txn_id = t.id AND p.account_id = ?1
+                      WHERE EXISTS (SELECT 1 FROM posting q JOIN account a ON a.id = q.account_id
+                                     WHERE q.txn_id = t.id AND a.kind = 'equity')
+                      ORDER BY t.occurred_on, t.id LIMIT 1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            Ok(match found {
+                Some((txn, on, amount)) => serde_json::json!({
+                    "txn_id": txn, "occurred_on": on, "amount_minor": amount,
+                }),
+                None => serde_json::json!(null),
+            })
+        }
+
+        "account.set_opening" => {
+            let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
+            let amount = params.get("amount_minor").and_then(|v| v.as_i64()).unwrap_or(0);
+            let (name, cur, kind, system): (String, String, String, i64) = conn
+                .query_row(
+                    "SELECT name, currency, kind, system FROM account WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .map_err(|_| Error { code: "not_found", message: format!("no such account: {id}") })?;
+            // An opening balance ON the equity account is meaningless, and worse than meaningless
+            // in practice: both legs would target the same account, the second UPDATE would
+            // overwrite the first, and the transaction would be left unbalanced. Same for the
+            // system conversion accounts, which are the book's own machinery.
+            if kind == "equity" || system == 1 {
+                return Err(Error {
+                    code: "bad_params",
+                    message: format!("{name} is the counterweight for opening balances, not an account that has one"),
+                });
+            }
+            let on = params
+                .get("occurred_on")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
+
+            let existing: Option<i64> = conn
+                .query_row(
+                    "SELECT t.id FROM txn t
+                       JOIN posting p ON p.txn_id = t.id AND p.account_id = ?1
+                      WHERE EXISTS (SELECT 1 FROM posting q JOIN account a ON a.id = q.account_id
+                                     WHERE q.txn_id = t.id AND a.kind = 'equity')
+                      ORDER BY t.occurred_on, t.id LIMIT 1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .ok();
+
+            // Zero means "no opening balance", so the transaction goes rather than lingering as a
+            // pair of zero postings nothing can see.
+            if amount == 0 {
+                if let Some(txn) = existing {
+                    entry::delete(conn, txn)?;
+                    return Ok(serde_json::json!({ "removed": txn }));
+                }
+                return Ok(serde_json::json!(null));
+            }
+
+            let eq_name = format!("Opening balances ({cur})");
+            let eq_id: i64 = match conn.query_row(
+                "SELECT id FROM account WHERE name = ?1", [&eq_name], |r| r.get(0)
+            ) {
+                Ok(e) => e,
+                Err(_) => {
+                    conn.execute(
+                        "INSERT INTO account(name, kind, currency) VALUES(?1,'equity',?2)",
+                        rusqlite::params![eq_name, cur],
+                    )
+                    .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+                    conn.last_insert_rowid()
+                }
+            };
+
+            match existing {
+                Some(txn) => {
+                    let tx = conn.transaction()
+                        .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+                    tx.execute("UPDATE txn SET occurred_on = ?2 WHERE id = ?1",
+                               rusqlite::params![txn, on])
+                        .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+                    tx.execute(
+                        "UPDATE posting SET amount_minor = ?3 WHERE txn_id = ?1 AND account_id = ?2",
+                        rusqlite::params![txn, id, amount],
+                    ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+                    // The equity leg absorbs the change, keeping the pair summed to zero.
+                    tx.execute(
+                        "UPDATE posting SET amount_minor = ?3 WHERE txn_id = ?1 AND account_id = ?2",
+                        rusqlite::params![txn, eq_id, -amount],
+                    ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+                    tx.commit().map_err(|e| Error { code: "sql", message: e.to_string() })?;
+                    Ok(serde_json::json!({ "txn_id": txn, "occurred_on": on,
+                                           "amount_minor": amount, "updated": true }))
+                }
+                None => {
+                    let txn = entry::create(conn, &entry::NewTxn {
+                        occurred_on: on.clone(),
+                        description: format!("Opening balance: {name}"),
+                        payee: None,
+                        note: None,
+                        postings: vec![
+                            entry::NewPosting { account_id: id, amount_minor: amount },
+                            entry::NewPosting { account_id: eq_id, amount_minor: -amount },
+                        ],
+                    })?;
+                    Ok(serde_json::json!({ "txn_id": txn, "occurred_on": on,
+                                           "amount_minor": amount, "updated": false }))
+                }
+            }
         }
 
         "account.balances" => {

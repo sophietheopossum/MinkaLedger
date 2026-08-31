@@ -837,3 +837,72 @@ fn an_account_can_start_with_a_balance_and_the_book_still_balances() {
 
     assert_eq!(out[7]["result"]["ok"], true, "the whole point: it still balances");
 }
+
+/// An opening balance is a figure you refine as real history arrives, so it has to be editable
+/// after the fact -- amount and date both.
+#[test]
+fn an_opening_balance_can_be_changed_added_and_removed_afterwards() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP",
+             "opening_minor":125000,"opening_on":"2026-08-01"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Savings","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"account.list"}"#,
+        r#"{"id":4,"method":"account.opening","params":{"id":1}}"#,
+        // move both the amount and the date
+        r#"{"id":5,"method":"account.set_opening","params":{"id":1,"amount_minor":98750,"occurred_on":"2026-01-01"}}"#,
+        r#"{"id":6,"method":"account.opening","params":{"id":1}}"#,
+        r#"{"id":7,"method":"db.check"}"#,
+    ]);
+    for r in &out {
+        assert!(err_of(r).is_none(), "{r}");
+    }
+    let opening = &out[3]["result"];
+    assert_eq!(opening["amount_minor"], 125_000);
+    assert_eq!(opening["occurred_on"], "2026-08-01");
+    let original_txn = opening["txn_id"].as_i64().unwrap();
+
+    let moved = &out[5]["result"];
+    assert_eq!(moved["amount_minor"], 98_750);
+    assert_eq!(moved["occurred_on"], "2026-01-01");
+    // Updated IN PLACE. A delete-and-rewrite would silently drop any link the payment browser has
+    // made to it, since txn_link cascades with the transaction.
+    assert_eq!(moved["txn_id"].as_i64().unwrap(), original_txn, "the transaction id must survive");
+    assert_eq!(out[4]["result"]["updated"], true);
+    assert_eq!(out[6]["result"]["ok"], true);
+}
+
+#[test]
+fn the_equity_counterweight_cannot_itself_be_given_an_opening_balance() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP",
+             "opening_minor":125000,"opening_on":"2026-08-01"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Savings","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"account.list"}"#,
+    ]);
+    let equity = out[2]["result"].as_array().unwrap().iter()
+        .find(|a| a["kind"] == "equity").expect("the counterweight was created");
+    let eq_id = equity["id"].as_i64().unwrap();
+    let savings = out[2]["result"].as_array().unwrap().iter()
+        .find(|a| a["name"] == "Savings").unwrap()["id"].as_i64().unwrap();
+
+    let out2 = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP",
+             "opening_minor":125000,"opening_on":"2026-08-01"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Savings","kind":"asset","currency":"GBP"}}"#,
+        // Both legs would target the same account, the second UPDATE would overwrite the first,
+        // and the transaction would be left unbalanced. Caught by a test that did exactly that.
+        &format!(r#"{{"id":3,"method":"account.set_opening","params":{{"id":{eq_id},"amount_minor":5000}}}}"#),
+        &format!(r#"{{"id":4,"method":"account.set_opening","params":{{"id":{savings},"amount_minor":300000,"occurred_on":"2026-01-01"}}}}"#),
+        r#"{"id":5,"method":"account.balances"}"#,
+        r#"{"id":6,"method":"db.check"}"#,
+        // and removing one takes the transaction with it rather than leaving zero postings
+        &format!(r#"{{"id":7,"method":"account.set_opening","params":{{"id":{savings},"amount_minor":0}}}}"#),
+        r#"{"id":8,"method":"db.check"}"#,
+    ]);
+    assert_eq!(out2[2]["error"]["code"], "bad_params");
+    assert!(out2[2]["error"]["message"].as_str().unwrap().contains("counterweight"));
+    assert!(err_of(&out2[3]).is_none(), "a normal account is fine: {}", out2[3]);
+    assert_eq!(out2[5]["result"]["ok"], true, "the book still balances");
+    assert!(out2[6]["result"]["removed"].is_i64(), "zero removes the transaction");
+    assert_eq!(out2[7]["result"]["ok"], true);
+}

@@ -361,6 +361,7 @@ ShellRoot {
                             Layout.fillHeight: true
                             visible: win.editAccounts
                             accounts: win.allAccounts
+                            today: win.asOf
                             onChanged: win.refresh()
                             onEmptyBookRequested: {
                                 win.showEntry = false; win.showSeries = false;
