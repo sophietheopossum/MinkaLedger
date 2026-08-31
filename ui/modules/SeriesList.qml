@@ -112,7 +112,10 @@ Rectangle {
                     spacing: 8
 
                     Column {
-                        width: parent.width - 330
+                        // Reserves room for the WIDEST case: "change end" plus "clear". Sizing
+                        // for "set end" alone pushed clear off the right edge as soon as a series
+                        // had an end date.
+                        width: parent.width - 380
                         anchors.verticalCenter: parent.verticalCenter
                         spacing: 0
                         Text {
@@ -171,7 +174,10 @@ Rectangle {
                     PushButton {
                         anchors.verticalCenter: parent.verticalCenter
                         implicitHeight: 22
-                        label: root.editing === srow.modelData.id ? "save" : "set end"
+                        // "set end" only reads right the first time; once a series is bounded
+                        // the action is to move the date, and the button should say so.
+                        label: root.editing === srow.modelData.id ? "save"
+                             : srow.modelData.until_on ? "change end" : "set end"
                         primary: root.editing === srow.modelData.id
                         onClicked: {
                             if (root.editing === srow.modelData.id)
