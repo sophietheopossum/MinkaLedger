@@ -9,6 +9,7 @@
 //! matter which end you start from. That asymmetry is deliberate: direction is information worth
 //! keeping, but it must never determine what you can reach.
 
+use crate::money::Minor;
 use rusqlite::Connection;
 use std::collections::{HashSet, VecDeque};
 
@@ -193,10 +194,39 @@ pub fn chain(conn: &Connection, txn_id: i64, max_nodes: usize) -> Result<serde_j
         collected
     };
 
+    // Net movement per account across the whole thread. This is the question a chain exists to
+    // answer -- "where did this actually end up" -- and it is NOT a completion test: a finished
+    // transfer still shows its source, its destination and any fee. It is the accounts money
+    // passed straight THROUGH that fall to zero and drop out, which is the useful signal.
+    let residual: Vec<serde_json::Value> = if ids.is_empty() {
+        Vec::new()
+    } else {
+        let mut st = conn.prepare(&format!(
+            "SELECT a.name, a.kind, p.currency, SUM(p.amount_minor)
+               FROM posting p JOIN account a ON a.id = p.account_id
+              WHERE p.txn_id IN ({list})
+              GROUP BY a.id, p.currency
+             HAVING SUM(p.amount_minor) <> 0
+              ORDER BY SUM(p.amount_minor)"
+        ))?;
+        let collected: Vec<serde_json::Value> = st
+            .query_map([], |r| {
+                Ok(serde_json::json!({
+                    "account": r.get::<_, String>(0)?,
+                    "kind": r.get::<_, String>(1)?,
+                    "currency": r.get::<_, String>(2)?,
+                    "amount_minor": r.get::<_, Minor>(3)?,
+                }))
+            })?
+            .collect::<Result<_, _>>()?;
+        collected
+    };
+
     Ok(serde_json::json!({
         "root": txn_id,
         "nodes": nodes,
         "edges": edges,
+        "residual": residual,
         "truncated": truncated,
     }))
 }

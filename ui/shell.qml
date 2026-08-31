@@ -33,7 +33,6 @@ ShellRoot {
         property bool editAccounts: false
         property bool showDanger: false
         property bool showCurrencies: false
-        property bool showJourneys: false
         property bool showPayments: false
         property var currencies: []
         property var projection: ({ balances: [], occurrences: [] })
@@ -143,14 +142,6 @@ ShellRoot {
                     label: win.showPayments ? "Close" : "payments"
                     onClicked: { win.showPayments = !win.showPayments;
                                  if (win.showPayments) { win.showEntry = false; win.showSeries = false;
-                                                         win.showImport = false; win.showBrief = false;
-                                                         win.showScenarios = false; win.showDanger = false;
-                                                         win.showCurrencies = false; win.showJourneys = false; } }
-                }
-                PushButton {
-                    label: win.showJourneys ? "Close" : "chains"
-                    onClicked: { win.showJourneys = !win.showJourneys;
-                                 if (win.showJourneys) { win.showEntry = false; win.showSeries = false;
                                                          win.showImport = false; win.showBrief = false;
                                                          win.showScenarios = false; win.showDanger = false;
                                                          win.showCurrencies = false; } }
@@ -445,15 +436,6 @@ ShellRoot {
                 visible: win.showPayments
                 accounts: win.accounts
                 onDone: win.showPayments = false
-            }
-
-            JourneyPanel {
-                Layout.fillWidth: true
-                Layout.preferredHeight: 320
-                visible: win.showJourneys
-                today: win.asOf
-                onDone: win.showJourneys = false
-                onChanged: win.refresh()
             }
 
             CurrencyPanel {

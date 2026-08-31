@@ -696,6 +696,16 @@ fn payments_link_into_a_chain_followable_from_either_end() {
     assert_eq!(linked.iter().find(|l| l["id"] == 3).unwrap()["direction"], "out");
 
     assert_eq!(out[14]["result"]["ok"], true, "linking writes no postings");
+
+    // The residual is what the chain is FOR: where the money ended up. Wise handed on everything
+    // it received, so it nets to zero and is absent -- that absence is the signal, and it is why
+    // "residual is empty" can never mean "finished".
+    let net = from_end["residual"].as_array().unwrap();
+    let named: Vec<&str> = net.iter().map(|x| x["account"].as_str().unwrap()).collect();
+    assert!(!named.contains(&"Wise"), "a passed-through account nets to zero: {named:?}");
+    assert!(named.contains(&"Starling") && named.contains(&"Revolut"), "{named:?}");
+    let starling = net.iter().find(|x| x["account"] == "Starling").unwrap();
+    assert_eq!(starling["amount_minor"], -49_680, "500.00 out, 3.20 of fee refunded to it");
 }
 
 #[test]

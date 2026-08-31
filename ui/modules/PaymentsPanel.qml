@@ -344,6 +344,68 @@ Rectangle {
                         font.pixelSize: Theme.fontSize - 3
                     }
 
+                    // Where the thread's money actually ended up. The subtlety worth stating: an
+                    // account money passed straight THROUGH nets to zero and is absent, so this
+                    // is not a list of everything the chain touched -- it is what is left.
+                    Rectangle {
+                        visible: root.chain !== null && root.chain.residual !== undefined
+                                 && root.chain.residual.length > 0
+                        width: parent.width
+                        implicitHeight: netCol.implicitHeight + 10
+                        radius: 4
+                        color: Theme.surfaceRaised
+                        border.width: 1
+                        border.color: Theme.line
+                        Column {
+                            id: netCol
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            anchors.margins: 5
+                            spacing: 1
+                            Text {
+                                text: "WHERE IT ENDED UP"
+                                color: Theme.textMuted
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 4
+                            }
+                            Repeater {
+                                model: root.chain ? root.chain.residual : []
+                                Row {
+                                    id: net
+                                    required property var modelData
+                                    width: parent.width
+                                    spacing: 6
+                                    Text {
+                                        width: 78
+                                        horizontalAlignment: Text.AlignRight
+                                        text: Money.format(net.modelData.amount_minor,
+                                                           net.modelData.currency)
+                                        color: net.modelData.amount_minor < 0
+                                               ? Theme.red : Theme.okGreen
+                                        font.family: Theme.monoFamily
+                                        font.pixelSize: Theme.fontSize - 3
+                                    }
+                                    Text {
+                                        text: net.modelData.currency + "  " + net.modelData.account
+                                        color: Theme.text
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 3
+                                    }
+                                }
+                            }
+                            Text {
+                                width: parent.width
+                                wrapMode: Text.Wrap
+                                text: "an account the money passed straight through nets to zero "
+                                    + "and is not listed"
+                                color: Theme.textFaint
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 5
+                            }
+                        }
+                    }
+
                     // Ordered by date, not by hop count: the thread is a story about money moving
                     // and the reader wants it chronological. `depth` is kept as the marker of how
                     // far each payment sits from the one being followed.
