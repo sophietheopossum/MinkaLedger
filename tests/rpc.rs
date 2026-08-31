@@ -741,3 +741,55 @@ fn deleting_a_payment_takes_its_links_and_browse_finds_what_you_search_for() {
     assert!(left["edges"].as_array().unwrap().is_empty(), "the dangling edge went with it");
     assert_eq!(out[10]["result"]["ok"], true);
 }
+
+/// Most recurring payments do not recur forever, and an unbounded rule projects into every
+/// forecast you ever draw. until_on is INCLUSIVE (RFC 5545 3.3.10): the occurrence landing
+/// exactly on it still happens.
+#[test]
+fn a_recurring_payment_can_be_bounded_after_it_was_created() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Bank","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Gym","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"series.create","params":{"description":"Gym","rrule":"FREQ=MONTHLY;BYMONTHDAY=1",
+             "dtstart":"2026-01-01","postings":[{"account_id":1,"amount_minor":-3000,"role":"primary"},
+                                                {"account_id":2,"amount_minor":3000,"role":"balancing"}]}}"#,
+        r#"{"id":4,"method":"forecast.project","params":{"as_of":"2026-08-31","horizon":"2027-06-30"}}"#,
+        r#"{"id":5,"method":"series.end","params":{"id":1,"until_on":"2026-12-01"}}"#,
+        r#"{"id":6,"method":"forecast.project","params":{"as_of":"2026-08-31","horizon":"2027-06-30"}}"#,
+        r#"{"id":7,"method":"series.end","params":{"id":1,"until_on":"2025-01-01"}}"#,
+        r#"{"id":8,"method":"series.end","params":{"id":1,"until_on":"not-a-date"}}"#,
+        r#"{"id":9,"method":"series.end","params":{"id":404,"until_on":"2026-12-01"}}"#,
+        r#"{"id":10,"method":"series.end","params":{"id":1}}"#,
+        r#"{"id":11,"method":"forecast.project","params":{"as_of":"2026-08-31","horizon":"2027-06-30"}}"#,
+        r#"{"id":12,"method":"series.list"}"#,
+    ]);
+    let outgoing = |v: &serde_json::Value| -> Vec<String> {
+        v["result"]["occurrences"].as_array().unwrap().iter()
+            .filter(|o| o["amount_minor"].as_i64().unwrap() < 0)
+            .map(|o| o["value_on"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let before = outgoing(&out[3]);
+    assert_eq!(before.len(), 10, "unbounded, it runs to the horizon");
+
+    assert_eq!(out[4]["result"]["until_on"], "2026-12-01");
+    let after = outgoing(&out[5]);
+    assert_eq!(after.len(), 4);
+    assert_eq!(after.last().unwrap(), "2026-12-01",
+               "until_on is INCLUSIVE -- the occurrence on it still happens");
+
+    // Ending before it starts is refused in those words, not as a constraint name.
+    assert!(out[6]["error"]["message"].as_str().unwrap().contains("before it starts"));
+    assert_eq!(out[7]["error"]["code"], "bad_params");
+    assert_eq!(out[8]["error"]["code"], "not_found");
+
+    // ...and it can be unbounded again.
+    assert!(out[9]["result"]["until_on"].is_null());
+    assert_eq!(outgoing(&out[10]).len(), 10, "clearing restores the endless rule");
+
+    // The list carries what the UI needs to show and edit it.
+    let s = &out[11]["result"][0];
+    assert!(s["until_on"].is_null());
+    assert_eq!(s["currency"], "GBP", "the amount must not be assumed to be 2dp GBP");
+    assert_eq!(s["amount_minor"], -3000);
+}

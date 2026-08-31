@@ -35,6 +35,14 @@ ShellRoot {
         property bool showCurrencies: false
         property bool showPayments: false
         property var currencies: []
+        property int seriesCount: 0
+        // Every full-width panel is mutually exclusive, but UPCOMING sat under all of them and
+        // its 150px was the difference between the column fitting and the layout squeezing items
+        // into each other. It is also the least useful thing on screen while a panel is open.
+        readonly property bool panelOpen: win.showEntry || win.showSeries || win.showImport
+                                          || win.showBrief || win.showScenarios
+                                          || win.showCurrencies || win.showDanger
+                                          || win.showPayments
         property var projection: ({ balances: [], occurrences: [] })
         property string asOf: Qt.formatDate(new Date(), "yyyy-MM-dd")
         property string horizon: Qt.formatDate(
@@ -73,6 +81,9 @@ ShellRoot {
             Ledger.request("scenario.list", {}, (r, e) => { if (!e) win.scenarios = r || []; });
             Ledger.request("account.list", {}, (r, e) => { if (!e) win.allAccounts = r || []; });
             Ledger.request("currency.list", {}, (r, e) => { if (!e) win.currencies = r || []; });
+            Ledger.request("series.list", {}, (r, e) => {
+                if (!e) win.seriesCount = (r || []).filter(x => !x.scenario_id).length;
+            });
             Ledger.request("forecast.project",
                            { as_of: win.asOf, horizon: win.horizon, scenarios: win.activeScenarios },
                            (r, e) => { if (!e) win.projection = r; });
@@ -166,9 +177,14 @@ ShellRoot {
                 }
             }
 
+            // Accounts and the chart step aside while a panel is open. Every panel is really a
+            // full screen -- the recurring form alone is ~470px -- and competing for a 773px
+            // window is what made the layout squeeze items into each other. You are not reading
+            // the forecast while filling in a form.
             RowLayout {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+                visible: !win.panelOpen
                 spacing: 12
 
                 // ---- win.accounts ----
@@ -433,6 +449,7 @@ ShellRoot {
             PaymentsPanel {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 380
+                Layout.fillHeight: true
                 visible: win.showPayments
                 accounts: win.accounts
                 onDone: win.showPayments = false
@@ -471,9 +488,20 @@ ShellRoot {
                 }
             }
 
+            // The recurring-payments screen both LISTS and creates, like the accounts sidebar:
+            // one button, and an existing rule can be bounded without hunting for it.
+            SeriesList {
+                Layout.fillWidth: true
+                // Deliberately tight: the creation form below is ~390px, and on a 773px
+                // window every row here comes off its Create button. Scrolls past three.
+                Layout.preferredHeight: Math.min(150, 22 + 30 * win.seriesCount)
+                visible: win.showSeries && win.seriesCount > 0
+                today: win.asOf
+                onChanged: win.refresh()
+            }
+
             SeriesForm {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 430
                 visible: win.showSeries
                 accounts: win.accounts
                 defaultDate: win.asOf
@@ -506,10 +534,19 @@ ShellRoot {
                 onDismissed: win.editing = null
             }
 
+            // Soaks up whatever the visible panel does not want, so panels sit at the top
+            // rather than floating in the middle of the column.
+            Item {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                visible: win.panelOpen && !win.showPayments
+            }
+
             // ---- what is coming ----
             Rectangle {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 150
+                visible: !win.panelOpen
                 color: Theme.surface
                 border.color: Theme.line
                 border.width: 1

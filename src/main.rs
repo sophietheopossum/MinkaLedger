@@ -596,6 +596,10 @@ fn dispatch(
                         -- The primary leg is the money the series moves; the balancing leg is the
                         -- same figure seen from the other side.
                         (SELECT sp.amount_minor FROM series_posting sp
+                          WHERE sp.series_id = s.id AND sp.role = 'primary'),
+                        -- The currency travels with the amount: a series is denominated in its
+                        -- primary account's currency and a caller must not assume 2dp GBP.
+                        (SELECT sp.currency FROM series_posting sp
                           WHERE sp.series_id = s.id AND sp.role = 'primary')
                    FROM series s ORDER BY s.id",
             ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
@@ -612,9 +616,44 @@ fn dispatch(
                     "supersedes_id": r.get::<_, Option<i64>>(8)?,
                     "supersedes": r.get::<_, Option<String>>(9)?,
                     "amount_minor": r.get::<_, Option<i64>>(10)?,
+                    "currency": r.get::<_, Option<String>>(11)?,
                 }))
             }).and_then(|m| m.collect()).map_err(|e| Error { code: "sql", message: e.to_string() })?;
             Ok(serde_json::Value::Array(rows))
+        }
+
+        // Bound a series that is already running, or unbound it again.
+        //
+        // until_on is INCLUSIVE (RFC 5545 3.3.10): an occurrence falling exactly on it still
+        // happens. There is deliberately no "after N payments" here -- RFC COUNT counts generated
+        // occurrences BEFORE EXDATE removal, so skipping one instalment of "12 payments" silently
+        // yields 11. A frontend that wants to ask the question that way should expand the rule,
+        // take the Nth date, and send that.
+        "series.end" => {
+            let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
+            let until = params.get("until_on").and_then(|v| v.as_str());
+            let dtstart: String = conn
+                .query_row("SELECT dtstart FROM series WHERE id = ?1", [id], |r| r.get(0))
+                .map_err(|_| Error { code: "not_found", message: format!("no such series: {id}") })?;
+            if let Some(u) = until {
+                if chrono::NaiveDate::parse_from_str(u, "%Y-%m-%d").is_err() {
+                    return Err(bad("until_on must be YYYY-MM-DD"));
+                }
+                // The schema CHECK would catch this, but "ends before it starts" is worth saying
+                // in those words rather than as a constraint name.
+                if u < dtstart.as_str() {
+                    return Err(Error {
+                        code: "bad_params",
+                        message: format!("it would end on {u}, before it starts on {dtstart}"),
+                    });
+                }
+            }
+            conn.execute(
+                "UPDATE series SET until_on = ?2 WHERE id = ?1",
+                rusqlite::params![id, until],
+            )
+            .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::json!({ "id": id, "until_on": until }))
         }
 
         // req 4: alter or skip ONE occurrence

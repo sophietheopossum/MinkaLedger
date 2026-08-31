@@ -29,6 +29,9 @@ Rectangle {
     border.width: 1
     border.color: Theme.line
     radius: 8
+    // Content-driven for the same reason as EntryForm: the form GROWS when "ends" switches to a
+    // date or a count, and a fixed height clips its own Create button.
+    implicitHeight: form.implicitHeight + 24
 
     property int fromAccount: -1
     property int toAccount: -1
@@ -39,6 +42,11 @@ Rectangle {
     property string weekday: "MO"
     property string weekendRule: "none"
     property var previewDates: []
+    // "never" | "on" | "after". Most recurring payments do not recur forever, and a rule with no
+    // bound quietly projects one into every forecast you ever draw.
+    property string endMode: "never"
+    property int endCount: 12
+    property string computedUntil: ""
 
     function currencyOf(id) {
         const a = (root.accounts || []).find(x => x.account_id === id);
@@ -75,6 +83,9 @@ Rectangle {
         root.fromAccount = -1;
         root.toAccount = -1;
         root.previewDates = [];
+        root.endMode = "never";
+        root.computedUntil = "";
+        endField.clear();
         status.text = "";
     }
 
@@ -117,8 +128,43 @@ Rectangle {
         });
     }
 
-    onRruleChanged: root.refreshPreview()
+    onRruleChanged: { root.refreshPreview(); root.refreshEnd(); }
     onWeekendRuleChanged: root.refreshPreview()
+    onEndModeChanged: root.refreshEnd()
+    onEndCountChanged: root.refreshEnd()
+
+    // "after N payments" is answered by EXPANDING the rule and taking the Nth slot, then storing
+    // that as a date. RFC 5545 COUNT is banned in the schema because it counts occurrences BEFORE
+    // EXDATE removal -- so skipping one instalment of "12 payments" silently yields 11. Asking the
+    // question by count is natural; storing the answer as a count is not.
+    function refreshEnd() {
+        if (root.endMode !== "after" || root.rrule.length === 0
+            || startField.text.length !== 10) {
+            root.computedUntil = "";
+            return;
+        }
+        Ledger.request("series.preview", {
+            rrule: root.rrule, dtstart: startField.text,
+            count: root.endCount, weekend_rule: "none"
+        }, (r, e) => {
+            if (e || !r.dates || r.dates.length === 0) {
+                root.computedUntil = "";
+                return;
+            }
+            // The SLOT, not the weekend-adjusted value date: until_on bounds the expansion, which
+            // happens before any adjustment.
+            root.computedUntil = r.dates[r.dates.length - 1].occurrence_on;
+        });
+    }
+
+    // Empty means unbounded, which is what the core wants for "no end".
+    readonly property string endsOn: {
+        if (root.endMode === "on")
+            return endField.text.length === 10 ? endField.text : "";
+        if (root.endMode === "after")
+            return root.computedUntil;
+        return "";
+    }
 
     readonly property bool complete: root.amountOk && root.fromAccount >= 0 && root.toAccount >= 0
                                      && root.fromAccount !== root.toAccount
@@ -139,6 +185,8 @@ Rectangle {
         };
         if (root.scenarioId >= 0)
             params.scenario_id = root.scenarioId;
+        if (root.endsOn.length === 10)
+            params.until_on = root.endsOn;
         Ledger.write("series.create", params, (r, e) => {
             if (e)
                 status.text = e.message;
@@ -150,7 +198,10 @@ Rectangle {
     }
 
     Column {
-        anchors.fill: parent
+        id: form
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
         anchors.margins: 12
         spacing: 8
 
@@ -269,6 +320,61 @@ Rectangle {
                 label: "to"
                 accounts: root.accounts
                 onPicked: id => root.toAccount = id
+            }
+        }
+
+        // when it stops
+        Row {
+            spacing: 6
+            Text {
+                anchors.verticalCenter: parent.verticalCenter
+                text: "ends:"
+                color: Theme.textFaint
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 2
+            }
+            Repeater {
+                model: [
+                    { key: "never", text: "never" },
+                    { key: "on",    text: "on a date" },
+                    { key: "after", text: "after N payments" }
+                ]
+                PushButton {
+                    required property var modelData
+                    label: modelData.text
+                    primary: root.endMode === modelData.key
+                    onClicked: root.endMode = modelData.key
+                }
+            }
+            Field {
+                visible: root.endMode === "on"
+                id: endField
+                width: 130
+                label: "last payment"
+                numeric: true
+                placeholder: "YYYY-MM-DD"
+            }
+            Field {
+                visible: root.endMode === "after"
+                width: 70
+                label: "payments"
+                numeric: true
+                text: String(root.endCount)
+                onEdited: value => {
+                    const n = parseInt(value);
+                    if (n >= 1 && n <= 600)
+                        root.endCount = n;
+                }
+            }
+            Text {
+                visible: root.endMode === "after"
+                anchors.verticalCenter: parent.verticalCenter
+                text: root.computedUntil.length > 0
+                      ? "last one falls on " + root.computedUntil
+                      : "…"
+                color: root.computedUntil.length > 0 ? Theme.okGreen : Theme.textFaint
+                font.family: Theme.monoFamily
+                font.pixelSize: Theme.fontSize - 3
             }
         }
 
