@@ -362,7 +362,62 @@ fn dispatch(
                 rusqlite::params![name, kind, cur, parent],
             )
             .map_err(|e| Error { code: "sql", message: e.to_string() })?;
-            Ok(serde_json::json!({ "id": conn.last_insert_rowid() }))
+            let id = conn.last_insert_rowid();
+
+            // An optional opening balance.
+            //
+            // A balance cannot appear from nowhere -- every posting needs a counterpart or the
+            // book stops balancing -- so this writes the conventional pair against an EQUITY
+            // account, created on demand. That is what lets someone start a book mid-life without
+            // needing to know the word "equity": they state what is in the account, and the
+            // counterweight is bookkeeping the app owes them, not a decision.
+            //
+            // One equity account PER CURRENCY, because a transaction balances per currency and
+            // the composite FK ties a posting's currency to its account's. The name carries the
+            // code so that is visible rather than surprising.
+            let opening = params
+                .get("opening_minor")
+                .and_then(|v| v.as_i64())
+                .filter(|v| *v != 0);
+            if let Some(amount) = opening {
+                let on = params
+                    .get("opening_on")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
+                let eq_name = format!("Opening balances ({cur})");
+                let eq_id: i64 = match conn.query_row(
+                    "SELECT id FROM account WHERE name = ?1",
+                    [&eq_name],
+                    |r| r.get(0),
+                ) {
+                    Ok(existing) => existing,
+                    Err(_) => {
+                        conn.execute(
+                            "INSERT INTO account(name, kind, currency) VALUES(?1,'equity',?2)",
+                            rusqlite::params![eq_name, cur],
+                        )
+                        .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+                        conn.last_insert_rowid()
+                    }
+                };
+                // Through entry::create like everything else, so the balance guarantee is the
+                // same one every other transaction gets rather than a second write path.
+                entry::create(
+                    conn,
+                    &entry::NewTxn {
+                        occurred_on: on,
+                        description: format!("Opening balance: {name}"),
+                        payee: None,
+                        note: None,
+                        postings: vec![
+                            entry::NewPosting { account_id: id, amount_minor: amount },
+                            entry::NewPosting { account_id: eq_id, amount_minor: -amount },
+                        ],
+                    },
+                )?;
+            }
+            Ok(serde_json::json!({ "id": id, "opening_minor": opening }))
         }
 
         "account.list" => {

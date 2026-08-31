@@ -793,3 +793,47 @@ fn a_recurring_payment_can_be_bounded_after_it_was_created() {
     assert_eq!(s["currency"], "GBP", "the amount must not be assumed to be 2dp GBP");
     assert_eq!(s["amount_minor"], -3000);
 }
+
+/// A starting balance cannot appear from nowhere: every posting needs a counterpart or the book
+/// stops balancing. account.create writes the conventional equity pair so nobody has to know that.
+#[test]
+fn an_account_can_start_with_a_balance_and_the_book_still_balances() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP",
+             "opening_minor":125000,"opening_on":"2026-08-01"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Credit card","kind":"liability","currency":"GBP",
+             "opening_minor":-43000,"opening_on":"2026-08-01"}}"#,
+        // EUR is one of the four seeded currencies, so it needs no creating.
+        r#"{"id":3,"method":"account.create","params":{"name":"Euro pot","kind":"asset","currency":"EUR",
+             "opening_minor":50000,"opening_on":"2026-08-01"}}"#,
+        // no opening balance at all, and an explicit zero: neither should write anything
+        r#"{"id":4,"method":"account.create","params":{"name":"Groceries","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":5,"method":"account.create","params":{"name":"Books","kind":"expense","currency":"GBP","opening_minor":0}}"#,
+        r#"{"id":6,"method":"account.balances"}"#,
+        r#"{"id":7,"method":"txn.browse","params":{"limit":10}}"#,
+        r#"{"id":8,"method":"db.check"}"#,
+    ]);
+    for r in &out {
+        assert!(err_of(r).is_none(), "{r}");
+    }
+    let bal = |name: &str| -> i64 {
+        out[5]["result"].as_array().unwrap().iter()
+            .find(|b| b["name"] == name).unwrap_or_else(|| panic!("no {name}"))["balance_minor"]
+            .as_i64().unwrap()
+    };
+    assert_eq!(bal("Current"), 125_000);
+    assert_eq!(bal("Credit card"), -43_000, "a liability starts negative -- you owe it");
+    assert_eq!(bal("Euro pot"), 50_000);
+
+    // ONE equity account per currency: a transaction balances per currency, and the composite FK
+    // ties a posting's currency to its account's, so a single shared one could not work.
+    assert_eq!(bal("Opening balances (GBP)"), -82_000, "1250.00 asset less 430.00 owed");
+    assert_eq!(bal("Opening balances (EUR)"), -50_000);
+
+    // Only three opening transactions -- the two accounts without a balance wrote nothing.
+    let rows = out[6]["result"]["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "an absent or zero opening balance must not write a transaction");
+    assert!(rows.iter().all(|t| t["description"].as_str().unwrap().starts_with("Opening balance:")));
+
+    assert_eq!(out[7]["result"]["ok"], true, "the whole point: it still balances");
+}

@@ -70,6 +70,16 @@ ShellRoot {
             win.refresh();
         }
 
+        function createAccount(params) {
+            Ledger.write("account.create", params, (r, e) => {
+                if (!e) {
+                    accName.clear();
+                    accOpening.clear();
+                    newAccount.visible = false;
+                }
+            });
+        }
+
         function refresh() {
             Ledger.request("account.balances", {}, (r, e) => {
                 if (!e) {
@@ -291,6 +301,21 @@ ShellRoot {
                                         }
                                     }
                                 }
+                                // Only for the kinds that can HOLD anything. An income or
+                                // expense account is a running total of flow and starts at zero
+                                // by definition, so offering it a starting balance would invite
+                                // an entry that means nothing.
+                                Field {
+                                    id: accOpening
+                                    visible: newAccount.kind === "asset"
+                                             || newAccount.kind === "liability"
+                                    width: parent.width
+                                    numeric: true
+                                    label: newAccount.kind === "liability"
+                                           ? "currently owed (optional)"
+                                           : "starting balance (optional)"
+                                    placeholder: "0.00"
+                                }
                                 Row {
                                     spacing: 6
                                     PushButton {
@@ -298,12 +323,30 @@ ShellRoot {
                                         primary: true
                                         enabled: accName.text.length > 0
                                         onClicked: {
-                                            Ledger.write("account.create",
-                                                { name: accName.text, kind: newAccount.kind,
-                                                  currency: newAccount.currency },
-                                                (r, e) => {
-                                                    if (!e) { accName.clear(); newAccount.visible = false; }
-                                                });
+                                            const params = { name: accName.text,
+                                                             kind: newAccount.kind,
+                                                             currency: newAccount.currency };
+                                            const typed = accOpening.text.trim();
+                                            if (accOpening.visible && typed.length > 0) {
+                                                // Parsed by the core at the account's own scale,
+                                                // then signed by kind: "currently owed" is a
+                                                // NEGATIVE balance, which is the one place the
+                                                // phrasing and the arithmetic disagree.
+                                                Ledger.request("money.parse",
+                                                    { text: typed,
+                                                      minor_digits: Money.digits(newAccount.currency) },
+                                                    (pr, pe) => {
+                                                        if (pe) { accOpening.invalid = true; return; }
+                                                        accOpening.invalid = false;
+                                                        params.opening_minor =
+                                                            newAccount.kind === "liability"
+                                                            ? -Math.abs(pr.minor) : pr.minor;
+                                                        params.opening_on = win.asOf;
+                                                        win.createAccount(params);
+                                                    });
+                                                return;
+                                            }
+                                            win.createAccount(params);
                                         }
                                     }
                                     PushButton { label: "Cancel"; onClicked: newAccount.visible = false }
