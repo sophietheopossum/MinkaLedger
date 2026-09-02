@@ -335,6 +335,60 @@ pub fn browse(
     }))
 }
 
+/// Distinct descriptions, commonest first: what a "pick a description you have used before" box
+/// offers.
+///
+/// Ordered by USE COUNT rather than recency, because the point is the handful of labels typed
+/// every month -- recency alone would put a one-off from yesterday above the weekly shop. `last_on`
+/// breaks ties toward the one still in use, and the description itself breaks the remaining ties so
+/// that two labels used equally often do not swap places between identical calls: a suggestion list
+/// that reshuffles under the cursor is worse than one in a slightly arbitrary order.
+///
+/// Grouping is on the description EXACTLY as stored, so "Rent" and "RENT" are two entries. They are
+/// two different strings in the book, and the caller inserts whichever it is given verbatim --
+/// folding them would mean choosing a spelling on the operator's behalf and quietly hiding that the
+/// book holds both.
+///
+/// `prefix` is a misnomer inherited from the caller: it matches anywhere in the description, so
+/// typing "tesco" finds "Weekly TESCO shop". A search box that only matched the front would miss
+/// the label whenever the memorable word is not the first one.
+///
+/// Nothing is filtered out by provenance. An imported or generated description is still a real
+/// label from this book, and if it has been used often enough to reach the top of this list it is
+/// exactly the one worth offering.
+pub fn descriptions(
+    conn: &Connection,
+    prefix: Option<&str>,
+    limit: i64,
+) -> Result<Vec<serde_json::Value>, EntryError> {
+    // `%` and `_` are LIKE wildcards, and this pattern is rebuilt from the box on every keystroke:
+    // without escaping, typing "50% off" would match every description in the book and the list
+    // would appear to ignore what was typed. ESCAPE names the escape character, since SQLite has no
+    // default one.
+    let pattern = prefix.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).map(|s| {
+        format!("%{}%", s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+    });
+
+    let mut stmt = conn.prepare(
+        "SELECT description, COUNT(*) AS uses, MAX(occurred_on) AS last_on
+           FROM txn
+          WHERE (?1 IS NULL OR lower(description) LIKE ?1 ESCAPE '\\')
+          GROUP BY description
+          ORDER BY uses DESC, last_on DESC, description ASC
+          LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![pattern, limit], |r| {
+            Ok(serde_json::json!({
+                "description": r.get::<_, String>(0)?,
+                "count": r.get::<_, i64>(1)?,
+                "last_on": r.get::<_, String>(2)?,
+            }))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Current balance per account, from real postings only. The forecast's starting point.
 pub fn balances(conn: &Connection, as_of: Option<&str>) -> Result<Vec<serde_json::Value>, EntryError> {
     let mut stmt = conn.prepare(

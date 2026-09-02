@@ -1181,3 +1181,93 @@ fn renaming_a_plan_leaves_the_payments_it_already_made_alone() {
     assert_eq!(out[9]["error"]["code"], "not_found");
     assert_eq!(out[10]["result"]["ok"], true);
 }
+
+/// The description box is a shortcut, not a vocabulary. What matters is that the labels she types
+/// every month float to the top of it -- ordering by recency instead would put yesterday's one-off
+/// above the weekly shop, which is exactly backwards for something meant to save typing.
+#[test]
+fn descriptions_offer_the_labels_she_types_most_and_filter_case_insensitively() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Shop","kind":"expense","currency":"GBP"}}"#,
+        // Three shops, but all of them OLD -- the frequent label is also the least recent one, so
+        // count and recency disagree and the assertion below can only pass one way round.
+        r#"{"id":3,"method":"txn.create","params":{"occurred_on":"2026-01-05","description":"Weekly shop",
+             "postings":[{"account_id":1,"amount_minor":-1000},{"account_id":2,"amount_minor":1000}]}}"#,
+        r#"{"id":4,"method":"txn.create","params":{"occurred_on":"2026-02-05","description":"Weekly shop",
+             "postings":[{"account_id":1,"amount_minor":-1000},{"account_id":2,"amount_minor":1000}]}}"#,
+        r#"{"id":5,"method":"txn.create","params":{"occurred_on":"2026-03-05","description":"Weekly shop",
+             "postings":[{"account_id":1,"amount_minor":-1000},{"account_id":2,"amount_minor":1000}]}}"#,
+        // Rent and Coffee are used equally often, and only last_on separates them.
+        r#"{"id":6,"method":"txn.create","params":{"occurred_on":"2026-08-01","description":"Rent",
+             "postings":[{"account_id":1,"amount_minor":-5000},{"account_id":2,"amount_minor":5000}]}}"#,
+        r#"{"id":7,"method":"txn.create","params":{"occurred_on":"2026-09-01","description":"Rent",
+             "postings":[{"account_id":1,"amount_minor":-5000},{"account_id":2,"amount_minor":5000}]}}"#,
+        r#"{"id":8,"method":"txn.create","params":{"occurred_on":"2026-04-01","description":"Coffee",
+             "postings":[{"account_id":1,"amount_minor":-300},{"account_id":2,"amount_minor":300}]}}"#,
+        r#"{"id":9,"method":"txn.create","params":{"occurred_on":"2026-05-01","description":"Coffee",
+             "postings":[{"account_id":1,"amount_minor":-300},{"account_id":2,"amount_minor":300}]}}"#,
+        r#"{"id":10,"method":"txn.create","params":{"occurred_on":"2026-09-02","description":"One-off gift",
+             "postings":[{"account_id":1,"amount_minor":-2000},{"account_id":2,"amount_minor":2000}]}}"#,
+        r#"{"id":11,"method":"txn.create","params":{"occurred_on":"2026-09-03","description":"50% bonus",
+             "postings":[{"account_id":1,"amount_minor":9000},{"account_id":2,"amount_minor":-9000}]}}"#,
+        r#"{"id":12,"method":"txn.descriptions"}"#,
+        r#"{"id":13,"method":"txn.descriptions","params":{"prefix":"SHOP"}}"#,
+        r#"{"id":14,"method":"txn.descriptions","params":{"prefix":"%"}}"#,
+        r#"{"id":15,"method":"txn.descriptions","params":{"limit":2}}"#,
+        r#"{"id":16,"method":"txn.descriptions","params":{"prefix":" "}}"#,
+        r#"{"id":17,"method":"db.check"}"#,
+    ]);
+
+    let all = out[11]["result"].as_array().expect("a plain array of rows");
+    let order: Vec<&str> = all.iter().map(|r| r["description"].as_str().unwrap()).collect();
+    assert_eq!(
+        order,
+        vec!["Weekly shop", "Rent", "Coffee", "50% bonus", "One-off gift"],
+        "commonest first, then most recently used; NOT newest first"
+    );
+    assert_eq!(all[0]["count"], 3);
+    assert_eq!(all[0]["last_on"], "2026-03-05", "the count winner is the oldest label of the lot");
+    // Rent and Coffee are both used twice, so the only thing that can have separated them is the
+    // date of the last one.
+    assert_eq!(all[1]["count"], 2);
+    assert_eq!(all[1]["last_on"], "2026-09-01");
+    assert_eq!(all[2]["count"], 2);
+    assert_eq!(all[2]["last_on"], "2026-05-01");
+
+    // Case-insensitive, and matching ANYWHERE: "shop" is the second word of "Weekly shop", so a
+    // strict prefix match would return nothing here.
+    let shop = out[12]["result"].as_array().unwrap();
+    assert_eq!(shop.len(), 1, "{shop:?}");
+    assert_eq!(shop[0]["description"], "Weekly shop");
+
+    // A bare "%" is a LIKE wildcard. Unescaped it would match every description in the book, and
+    // the box would look like it was ignoring what she typed.
+    let pct = out[13]["result"].as_array().unwrap();
+    assert_eq!(pct.len(), 1, "the wildcard is escaped, not honoured: {pct:?}");
+    assert_eq!(pct[0]["description"], "50% bonus");
+
+    let two = out[14]["result"].as_array().unwrap();
+    assert_eq!(two.len(), 2, "limit is honoured");
+    assert_eq!(two[0]["description"], "Weekly shop", "and it truncates the ranked list, not a random one");
+    assert_eq!(two[1]["description"], "Rent");
+
+    // A box that has been typed into and cleared again sends whitespace, which is not a filter.
+    assert_eq!(out[15]["result"].as_array().unwrap().len(), 5, "a blank prefix filters nothing");
+
+    assert_eq!(out[16]["result"]["ok"], true);
+}
+
+/// A book with no payments in it yet is the FIRST thing the form meets, so the suggestion list has
+/// to come back empty rather than as an error -- an error here would break the panel on a new book.
+#[test]
+fn an_empty_book_offers_an_empty_description_list() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"txn.descriptions"}"#,
+        r#"{"id":3,"method":"txn.descriptions","params":{"prefix":"anything"}}"#,
+    ]);
+    assert!(err_of(&out[1]).is_none(), "nothing to suggest is not a failure: {}", out[1]);
+    assert_eq!(out[1]["result"].as_array().unwrap().len(), 0);
+    assert_eq!(out[2]["result"].as_array().unwrap().len(), 0);
+}

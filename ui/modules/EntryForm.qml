@@ -222,7 +222,11 @@ Rectangle {
             }
         }
 
-        Field {
+        // A Field that also suggests the descriptions already in the book, most-used first. It is
+        // still free text -- `complete` and `save()` read `descField.text` exactly as they did
+        // when this was a plain Field, because most descriptions are new and the list only exists
+        // to save retyping the ones that are not.
+        DescriptionPicker {
             id: descField
             width: parent.width
             label: "description"

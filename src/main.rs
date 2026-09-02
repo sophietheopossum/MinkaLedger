@@ -1618,6 +1618,18 @@ fn dispatch(
             )?)
         }
 
+        // What the description box offers before she has typed anything worth searching. Most
+        // descriptions ARE new, so this suggests without restricting: nothing here constrains what
+        // txn.create will accept, it just saves retyping the labels that repeat.
+        "txn.descriptions" => {
+            let prefix = params.get("prefix").and_then(|v| v.as_str());
+            Ok(serde_json::Value::Array(entry::descriptions(
+                conn,
+                prefix,
+                params.get("limit").and_then(|v| v.as_i64()).unwrap_or(50).clamp(1, 500),
+            )?))
+        }
+
         // ---- free-form links between payments (req 10, graph form) ----
         //
         // Distinct from journeys on purpose: a journey is an ordered container you plan, this is
