@@ -42,7 +42,7 @@ ShellRoot {
         readonly property bool panelOpen: win.showEntry || win.showSeries || win.showImport
                                           || win.showBrief || win.showScenarios
                                           || win.showCurrencies || win.showDanger
-                                          || win.showPayments
+                                          || win.showPayments || win.showExport
         property var projection: ({ balances: [], occurrences: [] })
         property string asOf: Qt.formatDate(new Date(), "yyyy-MM-dd")
         property string horizon: Qt.formatDate(
@@ -54,6 +54,7 @@ ShellRoot {
         property bool showEntry: false      // the record-a-payment form
         property bool showSeries: false     // the new-recurring-payment form
         property bool showImport: false     // the CSV import screen
+        property bool showExport: false     // taking a backup, and the two readable exports
         property bool showBrief: false      // the computed brief, for reading and for handing over
         property bool showScenarios: false  // the what-if panel
         property int seriesScenario: -1     // >=0 makes the recurring form build a hypothetical
@@ -142,7 +143,8 @@ ShellRoot {
                 PushButton {
                     label: win.showEntry ? "Close" : "+ payment"
                     primary: !win.showEntry
-                    onClicked: { win.showEntry = !win.showEntry; if (win.showEntry) win.showSeries = false; }
+                    onClicked: { win.showEntry = !win.showEntry;
+                                 if (win.showEntry) { win.showSeries = false; win.showExport = false; } }
                 }
                 PushButton {
                     label: win.showSeries ? "Close" : "+ recurring"
@@ -151,13 +153,24 @@ ShellRoot {
                                  // silently make a real commitment hypothetical.
                                  win.seriesScenario = -1;
                                  if (win.showSeries) { win.showEntry = false; win.showImport = false;
-                                                       win.showScenarios = false; } }
+                                                       win.showScenarios = false; win.showExport = false; } }
                 }
                 PushButton {
                     label: win.showImport ? "Close" : "import"
                     onClicked: { win.showImport = !win.showImport;
                                  if (win.showImport) { win.showEntry = false; win.showSeries = false;
-                                                       win.showBrief = false; } }
+                                                       win.showBrief = false; win.showExport = false; } }
+                }
+                // Next to import, because it is the same question pointed the other way. Every
+                // other panel closes: a backup is wanted when something has gone wrong or is
+                // about to, and a column squeezed between two screens is the last thing needed.
+                PushButton {
+                    label: win.showExport ? "Close" : "back up"
+                    onClicked: { win.showExport = !win.showExport;
+                                 if (win.showExport) { win.showEntry = false; win.showSeries = false;
+                                                       win.showImport = false; win.showBrief = false;
+                                                       win.showScenarios = false; win.showDanger = false;
+                                                       win.showCurrencies = false; win.showPayments = false; } }
                 }
                 PushButton {
                     label: win.showPayments ? "Close" : "payments"
@@ -165,19 +178,21 @@ ShellRoot {
                                  if (win.showPayments) { win.showEntry = false; win.showSeries = false;
                                                          win.showImport = false; win.showBrief = false;
                                                          win.showScenarios = false; win.showDanger = false;
-                                                         win.showCurrencies = false; } }
+                                                         win.showCurrencies = false; win.showExport = false; } }
                 }
                 PushButton {
                     label: win.showScenarios ? "Close" : "what if"
                     onClicked: { win.showScenarios = !win.showScenarios;
                                  if (win.showScenarios) { win.showEntry = false; win.showSeries = false;
-                                                          win.showImport = false; win.showBrief = false; } }
+                                                          win.showImport = false; win.showBrief = false;
+                                                          win.showExport = false; } }
                 }
                 PushButton {
                     label: win.showBrief ? "Close" : "brief"
                     onClicked: { win.showBrief = !win.showBrief;
                                  if (win.showBrief) { win.showEntry = false; win.showSeries = false;
-                                                      win.showImport = false; win.showScenarios = false; } }
+                                                      win.showImport = false; win.showScenarios = false;
+                                                      win.showExport = false; } }
                 }
                 Text {
                     text: Ledger.running ? "core up" : "core down"
@@ -297,7 +312,7 @@ ShellRoot {
                                             win.showEntry = false; win.showSeries = false;
                                             win.showImport = false; win.showBrief = false;
                                             win.showScenarios = false; win.showDanger = false;
-                                            win.showCurrencies = true;
+                                            win.showExport = false; win.showCurrencies = true;
                                         }
                                     }
                                 }
@@ -366,7 +381,7 @@ ShellRoot {
                             onEmptyBookRequested: {
                                 win.showEntry = false; win.showSeries = false;
                                 win.showImport = false; win.showBrief = false;
-                                win.showScenarios = false;
+                                win.showScenarios = false; win.showExport = false;
                                 win.showDanger = true;
                             }
                         }
@@ -575,6 +590,17 @@ ShellRoot {
                 visible: win.showImport
                 accounts: win.accounts
                 onChanged: win.refresh()
+            }
+
+            // Writes nothing to the book, so it takes no onChanged: a snapshot is a read, and
+            // refreshing the window after one would only redraw the same numbers.
+            ExportPanel {
+                Layout.fillWidth: true
+                // No explicit height: the panel reports its own, and it changes when a result
+                // line or the next-name offer appears.
+                visible: win.showExport
+                horizon: win.horizon
+                onDone: win.showExport = false
             }
 
             OccurrenceEditor {
