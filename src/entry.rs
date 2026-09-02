@@ -365,14 +365,22 @@ pub fn descriptions(
     // without escaping, typing "50% off" would match every description in the book and the list
     // would appear to ignore what was typed. ESCAPE names the escape character, since SQLite has no
     // default one.
-    let pattern = prefix.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).map(|s| {
+    //
+    // The case fold is left to LIKE, which is why neither side lowercases. Folding here AND in SQL
+    // looked symmetrical and was not: Rust's `to_lowercase` is Unicode-aware while stock SQLite's
+    // `lower()` folds ASCII only, so an imported "CAFÉ NERO" became "café nero" on one side and
+    // "cafÉ nero" on the other and could never match itself -- typing a label exactly as the book
+    // holds it returned nothing at all. Bank statements arrive in capitals routinely, so that was
+    // not a corner. LIKE's own fold is ASCII-only too, but it is the SAME fold on both sides, so a
+    // description always at least matches itself.
+    let pattern = prefix.map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| {
         format!("%{}%", s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
     });
 
     let mut stmt = conn.prepare(
         "SELECT description, COUNT(*) AS uses, MAX(occurred_on) AS last_on
            FROM txn
-          WHERE (?1 IS NULL OR lower(description) LIKE ?1 ESCAPE '\\')
+          WHERE (?1 IS NULL OR description LIKE ?1 ESCAPE '\\')
           GROUP BY description
           ORDER BY uses DESC, last_on DESC, description ASC
           LIMIT ?2",

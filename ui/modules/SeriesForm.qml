@@ -218,7 +218,11 @@ Rectangle {
             id: r1
             spacing: 8
             width: parent.width
-            Field {
+            // The same suggestion list the one-off form has, and if anything it belongs here more:
+            // these are the descriptions that repeat by definition. A drop-in for the Field it
+            // replaces -- text, clear(), label and placeholder are the whole of what this form
+            // asks of it.
+            DescriptionPicker {
                 id: descField
                 width: (r1.width - 8) * 0.6
                 label: "description"

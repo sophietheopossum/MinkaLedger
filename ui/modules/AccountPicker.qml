@@ -42,7 +42,28 @@ Rectangle {
         // Taking focus is new, so giving it back has to be too: she opens this mid-form, and
         // before the search field existed the amount she was typing in kept the cursor. Without
         // this, picking an account leaves the keyboard pointing at nothing.
-        popup.restoreFocus = root.Window.activeFocusItem;
+        //
+        // What must NOT be captured is another picker's search box. Opening the second picker of
+        // the from/to pair while the first is still up used to save that first search field as the
+        // place to hand the keyboard back to; it is gone by the time the hand-back happens (this
+        // popup taking focus is what closes it), so the caret went into a field that was no longer
+        // on screen and nothing she typed reached anything. What she was typing in before the
+        // FIRST picker opened is the right answer, and the first picker is still holding it.
+        //
+        // The two names are looked up through variables because the walk is over plain Items, and
+        // only a picker's popup carries either one -- a name that is not there reads as undefined,
+        // which is the test. Spelled as literals the linter resolves them against QQuickItem and
+        // reports the very absence this relies on.
+        const mark = "accountPickerPopup";
+        const saved = "restoreFocus";
+        let back = root.Window.activeFocusItem;
+        for (let it = back; it; it = it.parent) {
+            if (it[mark] === true) {
+                back = it[saved];
+                break;
+            }
+        }
+        popup.restoreFocus = back;
         // Visible before focus: an invisible item cannot take active focus, so the order here is
         // what makes typing work the instant the list opens.
         popup.visible = true;
@@ -66,7 +87,7 @@ Rectangle {
 
     // A popup reparented to the window outlives the form that owns it, so it has to be dismissed
     // when that form goes away -- otherwise it hangs over whatever replaces it.
-    onVisibleChanged: if (!root.visible) popup.visible = false
+    onVisibleChanged: if (!root.visible) popup.close(false)
 
     implicitHeight: 46
     radius: 6
@@ -121,7 +142,7 @@ Rectangle {
         cursorShape: Qt.PointingHandCursor
         onClicked: {
             if (popup.visible)
-                popup.visible = false;
+                popup.close(true);
             else
                 root.openList();
         }
@@ -142,6 +163,10 @@ Rectangle {
         border.color: Theme.purple
         radius: 6
 
+        // Read by a sibling picker walking up from the focused item, to tell "the keyboard is in
+        // another picker's search box" from "the keyboard is in the form".
+        readonly property bool accountPickerPopup: true
+
         readonly property int rowHeight: 24
         readonly property int listHeight: Math.min(Math.max(popup.matches.length, 1) * popup.rowHeight, 168)
 
@@ -155,31 +180,57 @@ Rectangle {
         // Whatever held the cursor when the list opened, handed back when it closes.
         property Item restoreFocus: null
 
+        // RANKED, not filtered in the accounts' own order, because Enter takes the top row: typing
+        // an account's whole name has to land on THAT account. Left unranked, "rent" put "Current
+        // account" first -- it contains the letters and it happens to be account 1 -- so the
+        // fastest path the search invites, type the name and press Enter, picked the wrong side of
+        // a payment. Exact name, then names that start with it, then names that contain it, then
+        // the kind; source order within each tier, so nothing reshuffles between keystrokes.
         readonly property var matches: {
             const all = root.accounts || [];
             const q = popup.query.trim().toLowerCase();
             if (q.length === 0)
                 return all;
-            const out = [];
+            const exact = [], starts = [], contains = [], kinds = [];
             for (const a of all) {
                 const name = (a.name || "").toLowerCase();
                 const kind = (a.kind || "").toLowerCase();
-                if (name.indexOf(q) >= 0 || kind.indexOf(q) >= 0)
-                    out.push(a);
+                if (name === q)
+                    exact.push(a);
+                else if (name.startsWith(q))
+                    starts.push(a);
+                else if (name.indexOf(q) >= 0)
+                    contains.push(a);
+                else if (kind.indexOf(q) >= 0)
+                    kinds.push(a);
             }
-            return out;
+            return exact.concat(starts, contains, kinds);
         }
 
-        // Every close path runs through here -- picking, Escape, clicking the field again, and the
-        // owning form going away -- so this is the one place the search has to be reset for the
-        // next open to start unfiltered.
+        // The one place the search is reset, so the next open starts unfiltered however it closed.
         onVisibleChanged: if (!popup.visible) {
             search.text = "";
             popup.highlight = 0;
             popup.keyNav = false;
+        }
+
+        // Every close runs through here -- picking, Escape, clicking the field again, the keyboard
+        // moving out, and the owning form going away.
+        //
+        // `giveBack` is false whenever focus has already gone somewhere she chose, because handing
+        // it back then is not restoring the caret, it is stealing it off whatever she just clicked.
+        function close(giveBack: bool) {
+            if (!popup.visible)
+                return;
+            // Read and cleared BEFORE hiding: hiding drops the search's focus, which re-enters here
+            // through onActiveFocusChanged, and the second pass must not undo the first's.
             const back = popup.restoreFocus;
             popup.restoreFocus = null;
-            if (back)
+            popup.visible = false;
+            // `visible` on an Item is EFFECTIVE visibility, so a field inside a popup that has
+            // since closed reports false and the hand-back is skipped rather than stranding the
+            // keyboard in something that is not on screen.
+            if (giveBack && back && back.visible && back.enabled)
                 back.forceActiveFocus();
         }
 
@@ -196,7 +247,7 @@ Rectangle {
                 return;
             root.selected = opts[i].account_id;
             root.picked(opts[i].account_id);
-            popup.visible = false;
+            popup.close(true);
         }
 
         function moveHighlight(delta: int) {
@@ -246,7 +297,7 @@ Rectangle {
                     event.accepted = true;
                 }
                 Keys.onEscapePressed: event => {
-                    popup.visible = false;
+                    popup.close(true);
                     event.accepted = true;
                 }
                 Keys.onDownPressed: event => {
@@ -257,6 +308,12 @@ Rectangle {
                     popup.moveHighlight(-1);
                     event.accepted = true;
                 }
+
+                // Losing the keyboard closes the list. That is click-outside-to-close wherever the
+                // click lands on something focusable, and it is what stops two of these being open
+                // at once: opening the second takes the focus off the first. No hand-back -- focus
+                // is already where she put it.
+                onActiveFocusChanged: if (!search.activeFocus) popup.close(false)
 
                 Text {
                     anchors.fill: parent

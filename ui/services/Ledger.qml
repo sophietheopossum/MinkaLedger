@@ -96,16 +96,9 @@ Singleton {
                 root._flushPendingStart();
             } else {
                 // ONLY a DROPPED transport invalidates outstanding callbacks, so the reset belongs
-                // here and not on the way up as well.
-                //
-                // Resetting on the way up threw away requests that had been sent perfectly well:
-                // `proc.running` already reads true inside request() a moment BEFORE this signal is
-                // delivered, so the window's Component.onCompleted burst goes straight down the
-                // pipe, and the reset a moment later dropped the callbacks waiting for it. The core
-                // answered and nothing was listening. `account.balances` is in that burst, so the
-                // cost was every AccountPicker in the window coming up with an empty list on a cold
-                // start. Nothing needs clearing on the way up in any case: a previous process's
-                // callbacks were already dropped when IT exited, and ids are never reused.
+                // here and not on the way up as well. Nothing needs clearing on the way up: a
+                // previous process's callbacks were dropped when IT exited, and ids are never
+                // reused.
                 rpc.reset();
                 root.lastError = "ledger core exited";
             }

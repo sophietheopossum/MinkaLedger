@@ -1258,6 +1258,38 @@ fn descriptions_offer_the_labels_she_types_most_and_filter_case_insensitively() 
     assert_eq!(out[16]["result"]["ok"], true);
 }
 
+/// A label typed exactly as the book holds it has to find itself, whatever alphabet it is in.
+///
+/// It did not: the pattern was folded in Rust (Unicode-aware) and the column in SQL (ASCII-only),
+/// so any uppercase non-ASCII letter landed on a different case on the two sides and the row was
+/// unreachable -- "CAFÉ NERO" could be found by "CAF" and by "NERO" but never by "CAFÉ". Imported
+/// bank descriptions are routinely all-capitals, so this was the everyday path, and the failure
+/// looked to the operator like the suggestion box being broken.
+#[test]
+fn descriptions_find_an_accented_label_typed_exactly_as_it_is_stored() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Coffee","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"txn.create","params":{"occurred_on":"2026-08-01","description":"CAFÉ NERO",
+             "postings":[{"account_id":1,"amount_minor":-350},{"account_id":2,"amount_minor":350}]}}"#,
+        r#"{"id":4,"method":"txn.descriptions","params":{"prefix":"CAFÉ NERO"}}"#,
+        r#"{"id":5,"method":"txn.descriptions","params":{"prefix":"CAFÉ"}}"#,
+        r#"{"id":6,"method":"txn.descriptions","params":{"prefix":"café"}}"#,
+        r#"{"id":7,"method":"txn.descriptions","params":{"prefix":"NERO"}}"#,
+        r#"{"id":8,"method":"txn.descriptions","params":{"prefix":"nero"}}"#,
+    ]);
+
+    for (i, typed) in [(3, "CAFÉ NERO"), (4, "CAFÉ"), (6, "NERO"), (7, "nero")] {
+        let rows = out[i]["result"].as_array().unwrap_or_else(|| panic!("{}", out[i]));
+        assert_eq!(rows.len(), 1, "typing {typed:?} finds the label it names: {rows:?}");
+        assert_eq!(rows[0]["description"], "CAFÉ NERO");
+    }
+    // ASCII case-insensitivity is what LIKE gives; the É keeps its case on both sides, so a
+    // lowercase "café" is a different string and misses. That is the honest limit of the fold, and
+    // it is not the case that matters: nobody types an accent they cannot see in the book.
+    assert_eq!(out[5]["result"].as_array().unwrap().len(), 0, "ASCII fold only, symmetrically");
+}
+
 /// A book with no payments in it yet is the FIRST thing the form meets, so the suggestion list has
 /// to come back empty rather than as an error -- an error here would break the panel on a new book.
 #[test]
