@@ -198,18 +198,16 @@ pub fn convert(
     Ok((out, rate, as_of))
 }
 
-/// Find (creating if needed) the per-currency conversion account. `system = 1` keeps every other
-/// writer out: entry.rs refuses postings to it, so only this module can move money through.
+/// Find (creating if needed) the per-currency conversion account.
+///
+/// It used to be found by the literal name `Conversion:<CUR>`, which stopped being safe the moment
+/// `account.rename` existed: an ordinary EUR account renamed to `Conversion:EUR` before the book's
+/// first conversion would have received the conversion leg and sat permanently negative by the whole
+/// conversion volume, with `v_check_missing_conversion` still reading zero because the other side
+/// hit a real one. crate::roles matches on `kind = 'conversion'` instead, which the schema's
+/// `CHECK (kind <> 'conversion' OR system = 1)` makes unreachable from `account.create`.
 fn conversion_account(conn: &Connection, code: &str) -> Result<i64, FxError> {
-    let name = format!("Conversion:{code}");
-    if let Ok(id) = conn.query_row("SELECT id FROM account WHERE name = ?1", [&name], |r| r.get(0)) {
-        return Ok(id);
-    }
-    conn.execute(
-        "INSERT INTO account(name, kind, currency, system) VALUES(?1,'conversion',?2,1)",
-        rusqlite::params![name, code],
-    )?;
-    Ok(conn.last_insert_rowid())
+    Ok(crate::roles::conversion(conn, code)?)
 }
 
 /// Build a currency conversion as one balanced transaction.

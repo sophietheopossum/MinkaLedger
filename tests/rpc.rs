@@ -906,3 +906,278 @@ fn the_equity_counterweight_cannot_itself_be_given_an_opening_balance() {
     assert!(out2[6]["result"]["removed"].is_i64(), "zero removes the transaction");
     assert_eq!(out2[7]["result"]["ok"], true);
 }
+
+/// Renaming is a label change and nothing else: the book refers to an account by id everywhere, so
+/// every posting, count and balance must come through untouched. The UNIQUE constraint on
+/// account.name is the interesting part -- it has to arrive as a refusal an operator can act on.
+#[test]
+fn an_account_can_be_renamed_but_never_onto_a_name_already_taken() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Currnet","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Rent","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"txn.create","params":{"occurred_on":"2026-08-01","description":"Rent",
+             "postings":[{"account_id":1,"amount_minor":-90000},{"account_id":2,"amount_minor":90000}]}}"#,
+        // Surrounding space is trimmed rather than stored: a name is a handle, not a layout.
+        r#"{"id":4,"method":"account.rename","params":{"id":1,"name":" Current account "}}"#,
+        // Saving a form without changing the field must not be an error.
+        r#"{"id":5,"method":"account.rename","params":{"id":1,"name":"Current account"}}"#,
+        r#"{"id":6,"method":"account.rename","params":{"id":2,"name":"Current account"}}"#,
+        r#"{"id":7,"method":"account.rename","params":{"id":2,"name":" "}}"#,
+        r#"{"id":8,"method":"account.rename","params":{"id":404,"name":"Ghost"}}"#,
+        r#"{"id":9,"method":"account.list"}"#,
+        r#"{"id":10,"method":"txn.get","params":{"id":1}}"#,
+        r#"{"id":11,"method":"db.check"}"#,
+    ]);
+
+    assert_eq!(out[3]["result"]["name"], "Current account", "the name is stored trimmed");
+    assert_eq!(out[3]["result"]["id"], 1);
+    assert!(err_of(&out[4]).is_none(), "renaming to the current name is a no-op, not a clash");
+
+    // The collision is reported as a collision, not as "UNIQUE constraint failed: account.name".
+    assert_eq!(out[5]["error"]["code"], "already_exists");
+    let msg = out[5]["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("Current account"), "the message names what is taken: {msg}");
+    assert!(!msg.contains("UNIQUE"), "the raw constraint must not reach the operator: {msg}");
+
+    // NOT NULL accepts a blank string happily; an account called " " is unfindable.
+    assert_eq!(out[6]["error"]["code"], "bad_params");
+    assert_eq!(out[7]["error"]["code"], "not_found");
+
+    let listed = out[8]["result"].as_array().unwrap();
+    let renamed = listed.iter().find(|a| a["name"] == "Current account").expect("renamed account");
+    assert_eq!(renamed["id"], 1);
+    assert_eq!(renamed["postings"], 1, "its history came with it -- references are by id");
+    assert!(!listed.iter().any(|a| a["name"] == "Currnet"), "the typo is gone");
+    assert!(listed.iter().any(|a| a["name"] == "Rent"), "the other account is untouched");
+
+    // The transaction still reads the same, now under the corrected account name.
+    let postings = out[9]["result"]["postings"].as_array().unwrap();
+    let bank = postings.iter().find(|p| p["account_id"] == 1).unwrap();
+    assert_eq!(bank["account"], "Current account");
+    assert_eq!(bank["amount_minor"], -90_000, "renaming moved no money");
+
+    assert_eq!(out[10]["result"]["ok"], true, "the book still balances");
+}
+
+/// The FX conversion accounts are the book's own machinery, not accounts anyone owns -- entry.rs
+/// already refuses postings to them, and this is the same rule about the same accounts. (fx.rs no
+/// longer depends on their names: roles.rs finds them by a `kind` the schema makes unforgeable. The
+/// refusal is about ownership now, not about keeping a lookup working.)
+#[test]
+fn a_system_account_is_never_renamable() {
+    let setup = [
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Euro pot","kind":"asset","currency":"EUR"}}"#,
+        r#"{"id":3,"method":"txn.convert","params":{"occurred_on":"2026-08-01","description":"holiday money",
+             "from_account":1,"from_minor":40000,"to_account":2,"to_minor":46664}}"#,
+    ];
+    let mut discover = setup.to_vec();
+    discover.push(r#"{"id":4,"method":"account.list"}"#);
+    let out = run(&discover);
+    let sys: Vec<_> =
+        out[3]["result"].as_array().unwrap().iter().filter(|a| a["system"] == true).collect();
+    assert!(!sys.is_empty(), "a conversion should have created a system account");
+    let id = sys[0]["id"].as_i64().unwrap();
+
+    let attempt = format!(r#"{{"id":4,"method":"account.rename","params":{{"id":{id},"name":"My trading account"}}}}"#);
+    let mut lines = setup.to_vec();
+    lines.push(&attempt);
+    lines.push(r#"{"id":5,"method":"account.list"}"#);
+    let out = run(&lines);
+
+    assert_eq!(out[3]["error"]["code"], "system_account", "{}", out[3]);
+    let msg = out[3]["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("cannot be renamed"), "it must say what was refused: {msg}");
+    let still: Vec<_> = out[4]["result"].as_array().unwrap().iter()
+        .filter(|a| a["system"] == true).collect();
+    assert!(still.iter().any(|a| a["name"].as_str().unwrap().starts_with("Conversion:")),
+            "the machinery keeps the name fx.rs looks it up by");
+}
+
+/// The counterweight is an ORDINARY account -- not system -- so it can be renamed, and someone will.
+///
+/// account.set_opening used to resolve it BY NAME on its update path. A renamed counterweight was
+/// therefore missed, a fresh equity account was silently created in its place, and the UPDATE against
+/// that new account matched zero rows while the asset leg had already moved. The pair stopped summing
+/// to zero, the handler still answered `updated: true`, and nothing in the UI runs db.check -- so the
+/// book was left unbalanced with no surface anywhere that said so. Two clicks, in a panel whose own
+/// help text promised no figure moves.
+#[test]
+fn renaming_the_counterweight_leaves_the_next_opening_edit_balanced() {
+    let create = r#"{"id":1,"method":"account.create","params":{"name":"Bank","kind":"asset","currency":"GBP",
+         "opening_minor":100000,"opening_on":"2026-01-01"}}"#;
+    let out = run(&[create, r#"{"id":2,"method":"account.list"}"#]);
+    let eq = out[1]["result"].as_array().unwrap().iter()
+        .find(|a| a["name"] == "Opening balances (GBP)")
+        .expect("the create wrote a counterweight").clone();
+    let eq_id = eq["id"].as_i64().unwrap();
+    assert_eq!(eq["system"], false, "it is deliberately renamable, which is why this test exists");
+
+    let rename = format!(
+        r#"{{"id":2,"method":"account.rename","params":{{"id":{eq_id},"name":"Seed money"}}}}"#);
+    let out = run(&[
+        create,
+        &rename,
+        // The edit that used to break it: change an opening balance the counterweight is party to.
+        r#"{"id":3,"method":"account.set_opening","params":{"id":1,"amount_minor":123400}}"#,
+        r#"{"id":4,"method":"db.check"}"#,
+        r#"{"id":5,"method":"account.balances"}"#,
+        r#"{"id":6,"method":"account.opening","params":{"id":1}}"#,
+        // A SECOND opening balance must reuse the renamed counterweight, not grow another one.
+        r#"{"id":7,"method":"account.create","params":{"name":"Savings","kind":"asset","currency":"GBP",
+             "opening_minor":50000,"opening_on":"2026-01-01"}}"#,
+        r#"{"id":8,"method":"account.list"}"#,
+        r#"{"id":9,"method":"db.check"}"#,
+    ]);
+    for r in &out {
+        assert!(err_of(r).is_none(), "{r}");
+    }
+    assert_eq!(out[3]["result"]["ok"], true, "the edit must not unbalance the book: {}", out[3]);
+
+    let bal = |i: usize, name: &str| -> i64 {
+        out[i]["result"].as_array().unwrap().iter()
+            .find(|b| b["name"] == name).unwrap_or_else(|| panic!("no {name}"))["balance_minor"]
+            .as_i64().unwrap()
+    };
+    assert_eq!(bal(4, "Bank"), 123_400);
+    assert_eq!(bal(4, "Seed money"), -123_400, "the counterweight absorbed the whole change");
+
+    // Still found structurally, by the equity KIND of its far leg rather than by any name.
+    assert_eq!(out[5]["result"]["amount_minor"], 123_400);
+
+    let equities: Vec<_> = out[7]["result"].as_array().unwrap().iter()
+        .filter(|a| a["kind"] == "equity").collect();
+    assert_eq!(equities.len(), 1, "a renamed counterweight must be reused, not duplicated: {equities:?}");
+    assert_eq!(equities[0]["name"], "Seed money");
+    assert_eq!(out[8]["result"]["ok"], true);
+}
+
+/// The system guard was complete in ONE direction only: it stopped a magic account being renamed
+/// AWAY from its name, and nothing stopped an ordinary account being renamed INTO one. The collision
+/// check only refuses names already taken, so any reserved name the book did not yet hold was free to
+/// squat -- and every squat corrupted silently, with db.check green throughout.
+///
+/// roles.rs means a squat can no longer redirect anything. This is the second half: the core keeps
+/// the names it creates its own accounts with, so a squat cannot collide with them later either.
+#[test]
+fn an_ordinary_account_cannot_squat_on_a_name_the_core_owns() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Savings","kind":"asset","currency":"GBP"}}"#,
+        // A: the compounding one -- set_opening would have posted counterweights into a real asset.
+        r#"{"id":2,"method":"account.rename","params":{"id":1,"name":"Opening balances (GBP)"}}"#,
+        // B: a real EUR account taking the conversion leg and sitting permanently negative.
+        r#"{"id":3,"method":"account.rename","params":{"id":1,"name":"Conversion:EUR"}}"#,
+        // C: the importer's bucket, which analysis.rs sums as uncategorised spend.
+        r#"{"id":4,"method":"account.rename","params":{"id":1,"name":"Expenses:Unclassified"}}"#,
+        // The same hole at creation: a reserved name for a currency the book has never held.
+        r#"{"id":5,"method":"account.create","params":{"name":"Conversion:USD","kind":"asset","currency":"USD"}}"#,
+        r#"{"id":6,"method":"account.list"}"#,
+    ]);
+    for (i, r) in out.iter().enumerate().skip(1).take(4) {
+        assert_eq!(r["error"]["code"], "reserved_name", "reply {i}: {r}");
+        let msg = r["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("the book keeps that name for it"), "{msg}");
+    }
+    let listed = out[5]["result"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "nothing was created or renamed: {listed:?}");
+    assert_eq!(listed[0]["name"], "Savings");
+}
+
+/// The counterweight and the importer's bucket are ordinary accounts wearing a reserved name, and a
+/// form that saves an unchanged field must not be an error. The refusal is about MOVING a name onto
+/// an account, so the account that already holds it is unaffected.
+#[test]
+fn an_account_already_holding_a_reserved_name_can_still_save_it_unchanged() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Bank","kind":"asset","currency":"GBP",
+             "opening_minor":100000,"opening_on":"2026-01-01"}}"#,
+        r#"{"id":2,"method":"account.rename","params":{"id":2,"name":"Opening balances (GBP)"}}"#,
+        r#"{"id":3,"method":"db.check"}"#,
+    ]);
+    for r in &out {
+        assert!(err_of(r).is_none(), "{r}");
+    }
+    assert_eq!(out[1]["result"]["name"], "Opening balances (GBP)");
+    assert_eq!(out[2]["result"]["ok"], true);
+}
+
+/// A description is a label and labels get edited -- "CARD PAYMENT 4412" means nothing six months
+/// later. What it must NOT do is disturb the record: the date, the postings and the amounts are
+/// what actually happened.
+#[test]
+fn a_payment_can_be_relabelled_without_touching_what_it_records() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Groceries","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"txn.create","params":{"occurred_on":"2026-08-01","description":"CARD PAYMENT 4412",
+             "postings":[{"account_id":1,"amount_minor":-4599},{"account_id":2,"amount_minor":4599}]}}"#,
+        r#"{"id":4,"method":"txn.get","params":{"id":1}}"#,
+        r#"{"id":5,"method":"txn.rename","params":{"id":1,"description":" Weekly shop "}}"#,
+        r#"{"id":6,"method":"txn.get","params":{"id":1}}"#,
+        r#"{"id":7,"method":"txn.rename","params":{"id":1,"description":" "}}"#,
+        r#"{"id":8,"method":"txn.rename","params":{"id":404,"description":"Ghost"}}"#,
+        r#"{"id":9,"method":"txn.rename","params":{"id":1}}"#,
+        r#"{"id":10,"method":"db.check"}"#,
+    ]);
+
+    let before = out[3]["result"].clone();
+    assert_eq!(out[4]["result"]["description"], "Weekly shop", "stored trimmed");
+    assert_eq!(out[4]["result"]["id"], 1);
+
+    let after = out[5]["result"].clone();
+    assert_eq!(after["description"], "Weekly shop");
+    assert_eq!(after["occurred_on"], before["occurred_on"], "the date is not a label");
+    assert_eq!(after["postings"], before["postings"], "no money moved and no posting id changed");
+
+    assert_eq!(out[6]["error"]["code"], "bad_params", "a blank description is refused");
+    assert_eq!(out[7]["error"]["code"], "not_found");
+    assert_eq!(out[8]["error"]["code"], "bad_params", "a missing description is refused");
+    assert_eq!(out[9]["result"]["ok"], true);
+}
+
+/// The one that matters: renaming a PLAN must not rewrite HISTORY.
+///
+/// A projected occurrence takes its description from the series row, so a transaction generated
+/// from a series carries a copy of the description the series had at the time. That copy is the
+/// record of what happened and stays as written -- rewriting it would silently alter entries the
+/// operator has already reconciled against a statement. Everything still to come picks the new
+/// description up on the next projection, which is the whole of what a rename should do.
+#[test]
+fn renaming_a_plan_leaves_the_payments_it_already_made_alone() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Bank","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Gym","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"series.create","params":{"description":"Gym","rrule":"FREQ=MONTHLY;BYMONTHDAY=1",
+             "dtstart":"2026-01-01","postings":[{"account_id":1,"amount_minor":-3000,"role":"primary"},
+                                                {"account_id":2,"amount_minor":3000,"role":"balancing"}]}}"#,
+        // An occurrence that has already happened, written with the description the series had.
+        r#"{"id":4,"method":"txn.create","params":{"occurred_on":"2026-08-01","description":"Gym",
+             "postings":[{"account_id":1,"amount_minor":-3000},{"account_id":2,"amount_minor":3000}]}}"#,
+        r#"{"id":5,"method":"series.rename","params":{"id":1,"description":" Gym membership "}}"#,
+        r#"{"id":6,"method":"series.list"}"#,
+        r#"{"id":7,"method":"txn.get","params":{"id":1}}"#,
+        r#"{"id":8,"method":"forecast.project","params":{"as_of":"2026-08-31","horizon":"2026-12-31"}}"#,
+        r#"{"id":9,"method":"series.rename","params":{"id":1,"description":" "}}"#,
+        r#"{"id":10,"method":"series.rename","params":{"id":404,"description":"Ghost"}}"#,
+        r#"{"id":11,"method":"db.check"}"#,
+    ]);
+
+    assert_eq!(out[4]["result"]["description"], "Gym membership", "stored trimmed");
+    assert_eq!(out[4]["result"]["id"], 1);
+    assert_eq!(out[5]["result"][0]["description"], "Gym membership", "the plan reads as renamed");
+
+    // The whole point.
+    assert_eq!(out[6]["result"]["description"], "Gym",
+               "a payment already made is a historical record, not a copy of the plan");
+
+    // ...while everything still ahead carries the new name.
+    let occ = out[7]["result"]["occurrences"].as_array().unwrap();
+    let future: Vec<&serde_json::Value> = occ.iter().filter(|o| o["series_id"] == 1).collect();
+    assert!(!future.is_empty(), "the series still projects after being renamed");
+    assert!(future.iter().all(|o| o["description"] == "Gym membership"),
+            "the forecast reads the series row live: {:?}", future.first());
+
+    assert_eq!(out[8]["error"]["code"], "bad_params", "a blank description is refused");
+    assert_eq!(out[9]["error"]["code"], "not_found");
+    assert_eq!(out[10]["result"]["ok"], true);
+}

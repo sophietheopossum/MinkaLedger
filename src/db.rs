@@ -14,6 +14,7 @@ use rusqlite::Connection;
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_txn_link.sql"),
+    include_str!("../migrations/0003_role_account_pins.sql"),
 ];
 
 pub fn current_version() -> i64 {

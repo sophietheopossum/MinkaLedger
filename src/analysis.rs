@@ -544,16 +544,34 @@ fn limits(
     }
 
     // Unclassified spend is the one that silently invalidates every category conclusion.
-    let mut st = conn.prepare(
-        "SELECT p.currency, SUM(p.amount_minor)
-           FROM posting p JOIN account a ON a.id = p.account_id
-           JOIN txn t ON t.id = p.txn_id
-          WHERE a.name = 'Expenses:Unclassified' AND t.occurred_on >= ?1
-          GROUP BY p.currency",
-    )?;
-    let unclassified: Vec<(String, Minor)> = st
-        .query_map(rusqlite::params![window_from.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<Result<_, _>>()?;
+    //
+    // Found by ID, not by the name it was created with. Matching the string was how this caveat
+    // could be switched OFF by a rename: the money stayed exactly where it was and stayed exactly as
+    // uncategorised, but the brief stopped saying so, and every category total it prints kept being
+    // wrong by that much with nothing left to warn the reader. The account is also NAMED by whatever
+    // it is called now, so the caveat points at something the operator can actually find.
+    let bucket = crate::roles::unclassified_existing(conn);
+    let unclassified: Vec<(String, Minor)> = match bucket.as_ref() {
+        // A book that has never imported anything has no bucket, which is an absence of
+        // uncategorised spend rather than a missing measurement.
+        None => Vec::new(),
+        Some((id, _)) => {
+            let mut st = conn.prepare(
+                "SELECT p.currency, SUM(p.amount_minor)
+                   FROM posting p JOIN txn t ON t.id = p.txn_id
+                  WHERE p.account_id = ?1 AND t.occurred_on >= ?2
+                  GROUP BY p.currency",
+            )?;
+            let rows = st
+                .query_map(rusqlite::params![id, window_from.to_string()], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?
+                .collect::<Result<_, _>>()?;
+            rows
+        }
+    };
+    let bucket_name =
+        bucket.map(|(_, n)| n).unwrap_or_else(|| crate::roles::UNCLASSIFIED_NAME.to_string());
     let mut st = conn.prepare(
         "SELECT p.currency, SUM(p.amount_minor)
            FROM posting p JOIN account a ON a.id = p.account_id
@@ -571,7 +589,7 @@ fn limits(
             if pct >= 10 { "high" } else { "medium" },
             "spending that has no category",
             format!(
-                "{} {cur} ({pct}% of expenditure since {window_from}) sits in Expenses:Unclassified. \
+                "{} {cur} ({pct}% of expenditure since {window_from}) sits in {bucket_name}. \
                  Category totals and medians are wrong by up to that much, in an unknown direction.",
                 sc.dec(amount, &cur)
             ),
@@ -1059,6 +1077,38 @@ mod tests {
         assert_eq!(l["severity"], "high");
         assert!(l["detail"].as_str().unwrap().contains("1000.00"), "the figure itself must be shown");
         assert!(l["detail"].as_str().unwrap().contains("13%"));
+    }
+
+    /// The caveat used to be keyed on the account's literal NAME, so `account.rename` could switch
+    /// it off: the money stayed exactly where it was and stayed exactly as uncategorised, but the
+    /// brief stopped saying so and every category total it printed went on being wrong by that much
+    /// with nothing left to warn the reader. Nothing is left behind as a trace either -- unlike the
+    /// equity case there is no second account to notice.
+    #[test]
+    fn renaming_the_unclassified_bucket_does_not_silence_its_caveat() {
+        let mut c = book();
+        entry::create(&mut c, &NewTxn {
+            occurred_on: "2026-07-20".into(), description: "Card payment".into(),
+            payee: None, note: None,
+            postings: vec![NewPosting { account_id: 1, amount_minor: -100_000 },
+                           NewPosting { account_id: 5, amount_minor: 100_000 }],
+        }).unwrap();
+        // The fixture builds the book at 0001 and inserts its accounts afterwards, so run the pin
+        // backfill here -- which is exactly the order a real upgrade sees it in: db::migrate runs
+        // 0003 against a book whose accounts already exist, before any handler can rename one.
+        c.execute_batch(include_str!("../migrations/0003_role_account_pins.sql")).unwrap();
+        c.execute("UPDATE account SET name = 'Misc spending' WHERE id = 5", []).unwrap();
+
+        let b = brief(&c, &opts("2026-08-15")).unwrap();
+        let l = b["limits"].as_array().unwrap().iter()
+            .find(|l| l["limit"] == "spending that has no category")
+            .expect("a rename must not be able to switch the caveat off");
+        assert_eq!(l["severity"], "high");
+        let detail = l["detail"].as_str().unwrap();
+        assert!(detail.contains("1000.00"), "the figure is unchanged by a rename: {detail}");
+        // Named by what it is called NOW, or the caveat points at an account nobody can find.
+        assert!(detail.contains("Misc spending"), "{detail}");
+        assert!(!detail.contains("Expenses:Unclassified"), "{detail}");
     }
 
     #[test]

@@ -22,6 +22,7 @@ mod interest;
 mod journey;
 mod link;
 mod money;
+mod roles;
 
 use std::io::{BufRead, Write};
 
@@ -357,6 +358,16 @@ fn dispatch(
             let kind = params.get("kind").and_then(|v| v.as_str()).ok_or_else(|| bad("kind"))?;
             let cur = params.get("currency").and_then(|v| v.as_str()).unwrap_or("GBP");
             let parent = params.get("parent_id").and_then(|v| v.as_i64());
+            // Same refusal as account.rename, and for the same reason: these are names the core
+            // creates for itself. Nothing is redirected by a squat any more -- roles.rs resolves all
+            // three by identity -- but the core would collide with account.name's UNIQUE index the
+            // first time it tried to create the real one, and answering here says whose name it is.
+            if let Some(role) = roles::reserved_for(name.trim()) {
+                return Err(Error {
+                    code: "reserved_name",
+                    message: format!("{} is {role}, and the book keeps that name for it", name.trim()),
+                });
+            }
             conn.execute(
                 "INSERT INTO account(name, kind, currency, parent_id) VALUES(?1,?2,?3,?4)",
                 rusqlite::params![name, kind, cur, parent],
@@ -373,8 +384,10 @@ fn dispatch(
             // counterweight is bookkeeping the app owes them, not a decision.
             //
             // One equity account PER CURRENCY, because a transaction balances per currency and
-            // the composite FK ties a posting's currency to its account's. The name carries the
-            // code so that is visible rather than surprising.
+            // the composite FK ties a posting's currency to its account's. The name it is created
+            // with carries the code so that is visible rather than surprising -- but it is only a
+            // label from that moment on: roles.rs finds it again by a pinned id, so the operator can
+            // rename it without the next opening balance growing a second counterweight.
             let opening = params
                 .get("opening_minor")
                 .and_then(|v| v.as_i64())
@@ -388,22 +401,10 @@ fn dispatch(
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
-                let eq_name = format!("Opening balances ({cur})");
-                let eq_id: i64 = match conn.query_row(
-                    "SELECT id FROM account WHERE name = ?1",
-                    [&eq_name],
-                    |r| r.get(0),
-                ) {
-                    Ok(existing) => existing,
-                    Err(_) => {
-                        conn.execute(
-                            "INSERT INTO account(name, kind, currency) VALUES(?1,'equity',?2)",
-                            rusqlite::params![eq_name, cur],
-                        )
-                        .map_err(|e| Error { code: "sql", message: e.to_string() })?;
-                        conn.last_insert_rowid()
-                    }
-                };
+                // By identity, not by name: the counterweight is an ordinary account the operator
+                // may rename, and finding it by string would grow a second one the moment they did.
+                let eq_id = roles::opening_equity(conn, cur)
+                    .map_err(|e| Error { code: "sql", message: e.to_string() })?;
                 // Through entry::create like everything else, so the balance guarantee is the
                 // same one every other transaction gets rather than a second write path.
                 entry::create(
@@ -465,6 +466,96 @@ fn dispatch(
                 .and_then(|m| m.collect())
                 .map_err(|e| Error { code: "sql", message: e.to_string() })?;
             Ok(serde_json::Value::Array(rows))
+        }
+
+        // Renaming an account changes its label and nothing else.
+        //
+        // That is a claim worth stating precisely, because it was NOT true when this method was
+        // written and the difference was invisible. Every reference to an account in the schema is by
+        // id -- posting, series_posting, interest_rule, payment_rule, import_row,
+        // import_rule.set_far_account_id and txn_import_key all carry an account_id -- so no posting
+        // moves, no balance changes and no rule loses its target.
+        //
+        // What DID follow a name was three lookups the CORE makes for accounts it creates itself,
+        // and they were the whole of the risk here. Each resolved by literal string, so a rename
+        // could break them in EITHER direction: away from the name, and the lookup missed and grew a
+        // duplicate; onto the name, and an ordinary account holding real money started receiving the
+        // core's postings. `db.check` reads ok either way, because both books still balance.
+        //
+        // All three now resolve by identity instead, in src/roles.rs -- conversion accounts by a
+        // `kind` the schema makes unforgeable, the opening counterweight and the unclassified bucket
+        // by an id pinned in `book_meta` (migration 0003 backfills existing books). So renaming any
+        // of them is now genuinely cosmetic, which is what lets the equity counterweight stay
+        // renamable: it is an ordinary account someone may reasonably want called something
+        // friendlier, and calling it "Seed money" no longer strands the next opening balance.
+        // account.opening keeps finding the entry structurally, by the equity KIND of its far leg.
+        //
+        // Two names are still refused, for two different reasons.
+        //
+        // SYSTEM accounts cannot be renamed at all, the same way account.set_opening refuses them.
+        // They are the book's own machinery rather than accounts anyone owns; entry.rs already
+        // refuses postings to them, and this is the same rule about the same accounts.
+        //
+        // A RESERVED name cannot be moved onto an ordinary account. Nothing is redirected by that
+        // any more, but the core would collide with account.name's UNIQUE index the first time it
+        // tried to create the real one, and "that name belongs to the book" is a better answer now
+        // than a constraint failure later. If a fourth account is ever created by the core, it
+        // belongs in roles.rs with the others rather than being looked up by what it is called.
+        //
+        // One more thing is checked before the write rather than left to the schema.
+        //
+        // account.name is UNIQUE, and "UNIQUE constraint failed: account.name" tells the operator
+        // nothing about which account already holds the name they typed. Excluding this row from
+        // that lookup is also what lets a rename to the CURRENT name succeed: a form that saves
+        // an unchanged field should not be an error.
+        "account.rename" => {
+            let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
+            let name =
+                params.get("name").and_then(|v| v.as_str()).ok_or_else(|| bad("name"))?.trim();
+            // Trimmed before it is judged: NOT NULL stops a missing name, not a blank one, and an
+            // account called " " is unfindable in every picker that shows it.
+            if name.is_empty() {
+                return Err(bad("name must not be empty"));
+            }
+            let (current, system): (String, i64) = conn
+                .query_row("SELECT name, system FROM account WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .map_err(|_| Error { code: "not_found", message: format!("no such account: {id}") })?;
+            if system == 1 {
+                return Err(Error {
+                    code: "system_account",
+                    message: format!("{current} is a system account and cannot be renamed"),
+                });
+            }
+            // Only when the name is MOVING. An account that already holds a reserved name is the
+            // one the book reserved it for -- the counterweight and the unclassified bucket are both
+            // ordinary non-system accounts -- and saving a form without touching the field must stay
+            // the success it is everywhere else.
+            if name != current {
+                if let Some(role) = roles::reserved_for(name) {
+                    return Err(Error {
+                        code: "reserved_name",
+                        message: format!("{name} is {role}, and the book keeps that name for it"),
+                    });
+                }
+            }
+            let taken: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM account WHERE name = ?1 AND id <> ?2",
+                    rusqlite::params![name, id],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(other) = taken {
+                return Err(Error {
+                    code: "already_exists",
+                    message: format!("another account (id {other}) is already called {name}"),
+                });
+            }
+            conn.execute("UPDATE account SET name = ?2 WHERE id = ?1", rusqlite::params![id, name])
+                .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            Ok(serde_json::json!({ "id": id, "name": name }))
         }
 
         "account.close" => {
@@ -623,21 +714,6 @@ fn dispatch(
                 return Ok(serde_json::json!(null));
             }
 
-            let eq_name = format!("Opening balances ({cur})");
-            let eq_id: i64 = match conn.query_row(
-                "SELECT id FROM account WHERE name = ?1", [&eq_name], |r| r.get(0)
-            ) {
-                Ok(e) => e,
-                Err(_) => {
-                    conn.execute(
-                        "INSERT INTO account(name, kind, currency) VALUES(?1,'equity',?2)",
-                        rusqlite::params![eq_name, cur],
-                    )
-                    .map_err(|e| Error { code: "sql", message: e.to_string() })?;
-                    conn.last_insert_rowid()
-                }
-            };
-
             match existing {
                 Some(txn) => {
                     let tx = conn.transaction()
@@ -645,20 +721,44 @@ fn dispatch(
                     tx.execute("UPDATE txn SET occurred_on = ?2 WHERE id = ?1",
                                rusqlite::params![txn, on])
                         .map_err(|e| Error { code: "sql", message: e.to_string() })?;
-                    tx.execute(
+                    let near = tx.execute(
                         "UPDATE posting SET amount_minor = ?3 WHERE txn_id = ?1 AND account_id = ?2",
                         rusqlite::params![txn, id, amount],
                     ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
-                    // The equity leg absorbs the change, keeping the pair summed to zero.
-                    tx.execute(
-                        "UPDATE posting SET amount_minor = ?3 WHERE txn_id = ?1 AND account_id = ?2",
-                        rusqlite::params![txn, eq_id, -amount],
+                    // The counterweight is "the OTHER leg of this pair", found from the transaction
+                    // itself rather than looked up again. Resolving it a second time -- by name, as
+                    // this did -- was how an edit could silently unbalance the book: a renamed
+                    // counterweight missed, a fresh equity account was created in its place, and
+                    // this UPDATE then matched zero rows while the asset leg had already moved. The
+                    // pair stopped summing to zero, the handler still answered `updated: true`, and
+                    // nothing in the UI runs db.check.
+                    let far = tx.execute(
+                        "UPDATE posting SET amount_minor = ?3 WHERE txn_id = ?1 AND account_id <> ?2",
+                        rusqlite::params![txn, id, -amount],
                     ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+                    // Counted, not assumed. An opening transaction is the two-posting pair written
+                    // below and nothing else writes one -- but if this ever meets something other
+                    // than that shape, saying so beats committing half of an edit. Dropping `tx`
+                    // uncommitted rolls the whole thing back, including the date.
+                    if near != 1 || far != 1 {
+                        return Err(Error {
+                            code: "shape",
+                            message: format!(
+                                "opening transaction {txn} is not the two-posting pair set_opening \
+                                 writes ({near} account leg(s), {far} counterweight leg(s)) -- \
+                                 refusing to leave it half-updated"
+                            ),
+                        });
+                    }
                     tx.commit().map_err(|e| Error { code: "sql", message: e.to_string() })?;
                     Ok(serde_json::json!({ "txn_id": txn, "occurred_on": on,
                                            "amount_minor": amount, "updated": true }))
                 }
                 None => {
+                    // Only the CREATE path needs a counterweight account, and it asks roles.rs for
+                    // it by identity rather than by name.
+                    let eq_id = roles::opening_equity(conn, &cur)
+                        .map_err(|e| Error { code: "sql", message: e.to_string() })?;
                     let txn = entry::create(conn, &entry::NewTxn {
                         occurred_on: on.clone(),
                         description: format!("Opening balance: {name}"),
@@ -698,6 +798,42 @@ fn dispatch(
             let to = params.get("to").and_then(|v| v.as_str());
             let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(200);
             Ok(serde_json::Value::Array(entry::list(conn, from, to, limit)?))
+        }
+
+        // A description is a label, and labels get edited: a payment that arrived from the importer
+        // as "CARD PAYMENT 4412" says nothing six months later. Only the label moves -- the date,
+        // the postings and the amounts are the record of what happened and are not this method's
+        // business.
+        //
+        // Nothing is refused on provenance: an imported or generated transaction is still the
+        // operator's to name. account.opening already depends on that being allowed, which is why
+        // it finds the opening entry STRUCTURALLY (posted against equity) rather than by reading
+        // its description.
+        "txn.rename" => {
+            let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
+            let desc = params
+                .get("description")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| bad("description"))?
+                .trim();
+            // NOT NULL rejects a missing description but is perfectly happy with a blank one, and
+            // a row with no readable label cannot be picked out of a list at all.
+            if desc.is_empty() {
+                return Err(bad("description must not be empty"));
+            }
+            let n = conn
+                .execute(
+                    "UPDATE txn SET description = ?2 WHERE id = ?1",
+                    rusqlite::params![id, desc],
+                )
+                .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            if n == 0 {
+                return Err(Error {
+                    code: "not_found",
+                    message: format!("no such transaction: {id}"),
+                });
+            }
+            Ok(serde_json::json!({ "id": id, "description": desc }))
         }
 
         "txn.delete" => {
@@ -809,6 +945,39 @@ fn dispatch(
                 }))
             }).and_then(|m| m.collect()).map_err(|e| Error { code: "sql", message: e.to_string() })?;
             Ok(serde_json::Value::Array(rows))
+        }
+
+        // Rename the RULE, and only the rule.
+        //
+        // Transactions already generated from this series keep the description they were written
+        // with, deliberately. They are what happened, not what is planned: money that went out
+        // labelled "Gym" did go out labelled "Gym", and rewriting those to match a rule renamed
+        // today would quietly alter records the operator has already reconciled against a
+        // statement. The projection reads the series row live, so every occurrence still to come
+        // carries the new description from the next forecast onwards -- which is the whole of what
+        // renaming a plan should change.
+        "series.rename" => {
+            let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
+            let desc = params
+                .get("description")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| bad("description"))?
+                .trim();
+            // Same reason as txn.rename: NOT NULL does not stop a blank one, and an unnamed series
+            // is indistinguishable from every other unnamed series in the list.
+            if desc.is_empty() {
+                return Err(bad("description must not be empty"));
+            }
+            let n = conn
+                .execute(
+                    "UPDATE series SET description = ?2 WHERE id = ?1",
+                    rusqlite::params![id, desc],
+                )
+                .map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            if n == 0 {
+                return Err(Error { code: "not_found", message: format!("no such series: {id}") });
+            }
+            Ok(serde_json::json!({ "id": id, "description": desc }))
         }
 
         // Bound a series that is already running, or unbound it again.

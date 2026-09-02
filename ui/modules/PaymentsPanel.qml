@@ -2,7 +2,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import "../services"
 
-// Browse payments, and link any of them into a chain.
+// Browse payments, rename them, and link any of them into a chain.
 //
 // TWO MODES, ONE PANEL. Browsing and following a thread are the same activity a minute apart: you
 // find a payment, then you want to know what it is connected to. Splitting them across two screens
@@ -30,12 +30,57 @@ Rectangle {
     property int total: 0
     property var picked: []            // txn ids ticked for linking
     property int following: -1         // txn id whose chain is being shown
+    property int renaming: -1          // txn id whose description is being retyped
     property var chain: null
     property string note: ""
     property int accountFilter: -1
 
+    // A payment that was renamed OUT of the active search: { id, at, row }.
+    //
+    // Renaming re-runs the browse, and the payment can then fail the search that found it — you
+    // rename "TESCO STORES 4711" to "Weekly shop" while the search box still says "tesco". Letting
+    // it drop out would make the only feedback for a successful rename its DISAPPEARANCE, which
+    // reads as a delete. So the renamed payment is kept on screen, in the place it already held,
+    // marked as outside the search, and it stays there until the search text or the account filter
+    // is changed by hand — at which point the filter is honest again because the operator, not the
+    // panel, decided what to look at. The alternative, silently clearing the search box, throws
+    // away the filter being worked in and reshuffles every other row on screen to explain one.
+    //
+    // One at a time: renaming a second payment retires the first, because the exemption exists to
+    // show you the edit you just made, not to accumulate a private list beside the search.
+    property var kept: null
+
+    // What the list actually shows: the core's answer, plus a kept renamed payment put back at the
+    // index it held. Whether the row needs keeping is decided by LOOKING at the new answer rather
+    // than by re-implementing the core's matching (which spans description and payee) here.
+    readonly property var listRows: root.withKept(root.rows, root.kept)
+
+    function withKept(rows, kept) {
+        if (!kept)
+            return rows;
+        for (const r of rows)
+            if (r.id === kept.id) return rows;   // still matches; nothing to keep
+        const out = rows.slice();
+        out.splice(Math.min(kept.at, out.length), 0, kept.row);
+        return out;
+    }
+    function isKept(id) {
+        if (!root.kept || root.kept.id !== id)
+            return false;
+        for (const r of root.rows)
+            if (r.id === id) return false;
+        return true;
+    }
+    // Changing what is being looked at retires the exemption: the filter should mean what it says.
+    function refilter() {
+        root.kept = null;
+        root.search();
+    }
+
     Component.onCompleted: if (root.visible) root.search()
-    onVisibleChanged: if (root.visible) root.search()
+    // Reopening the panel is a fresh look at the book, so it retires a kept row too: an amber
+    // "not in this search" against an edit made before the panel was closed explains nothing.
+    onVisibleChanged: if (root.visible) root.refilter()
     Connections {
         target: Ledger
         function onRevisionChanged() { if (root.visible) root.refreshCurrent(); }
@@ -61,6 +106,29 @@ Rectangle {
         });
     }
 
+    // Relabelling a payment, not restating it: the date, the accounts and the amounts are what the
+    // money did and are edited elsewhere. Only the words are yours.
+    function rename(id, text) {
+        const description = text.trim();
+        if (description.length === 0) {
+            root.note = "a payment needs a description";
+            return;
+        }
+        Ledger.write("txn.rename", { id: id, description: description }, (r, e) => {
+            if (e) { root.note = e.message; return; }
+            root.note = "";
+            root.renaming = -1;
+            // The core trims before it writes, so what it echoes back is what is stored — the
+            // typed string is not necessarily it.
+            const at = root.listRows.findIndex(x => x.id === id);
+            root.kept = at < 0 ? null
+                      : { id: id, at: at,
+                          row: Object.assign({}, root.listRows[at],
+                                             { description: r.description }) };
+            root.refreshCurrent();
+        });
+    }
+
     function isPicked(id) { return root.picked.indexOf(id) >= 0; }
     function toggle(id) {
         const next = root.picked.slice();
@@ -74,8 +142,10 @@ Rectangle {
     function linkPicked() {
         if (root.picked.length < 2)
             return;
+        // listRows, not rows: a payment kept on screen after a rename is tickable like any other,
+        // and looking it up here is what keeps it in date order rather than falling back to id.
         const byId = {};
-        for (const r of root.rows) byId[r.id] = r;
+        for (const r of root.listRows) byId[r.id] = r;
         const ordered = root.picked.slice().sort((a, b) => {
             const ra = byId[a], rb = byId[b];
             if (!ra || !rb) return a - b;
@@ -150,18 +220,27 @@ Rectangle {
                 width: 190
                 label: "search"
                 placeholder: "description or payee"
-                onEdited: root.search()
+                onEdited: root.refilter()
             }
             AccountPicker {
                 width: 170
                 label: "account"
                 accounts: root.accounts
-                onPicked: id => { root.accountFilter = id; root.search(); }
+                onPicked: id => { root.accountFilter = id; root.refilter(); }
             }
             Text {
                 anchors.verticalCenter: parent.verticalCenter
                 text: root.rows.length + " of " + root.total
                 color: Theme.textFaint
+                font.family: Theme.monoFamily
+                font.pixelSize: Theme.fontSize - 3
+            }
+            // Why the list is one longer than the count beside it.
+            Text {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.listRows.length > root.rows.length
+                text: "+1 renamed"
+                color: Theme.warnAmber
                 font.family: Theme.monoFamily
                 font.pixelSize: Theme.fontSize - 3
             }
@@ -198,30 +277,43 @@ Rectangle {
                     anchors.fill: parent
                     anchors.margins: 4
                     clip: true
-                    model: root.rows
+                    model: root.listRows
                     delegate: Rectangle {
                         id: prow
                         required property var modelData
+                        readonly property bool held: root.isKept(prow.modelData.id)
+                        readonly property bool editing: root.renaming === prow.modelData.id
                         width: ListView.view.width
-                        height: 34
+                        // Grows to carry the rename editor beneath the row it belongs to, so the
+                        // payment stays readable while its words are being retyped.
+                        height: prow.editing ? 86 : 34
                         radius: 3
                         color: root.isPicked(prow.modelData.id) ? Theme.purpleDim
                              : phov.containsMouse ? Theme.surface : "transparent"
-                        border.width: root.following === prow.modelData.id ? 1 : 0
-                        border.color: Theme.purple
+                        border.width: root.following === prow.modelData.id || prow.held ? 1 : 0
+                        border.color: root.following === prow.modelData.id
+                                      ? Theme.purple : Theme.warnAmber
 
+                        // Top strip only: the row GROWS when the editor opens beneath it, and a
+                        // filling hit area would make a click into the editor tick the payment.
                         MouseArea {
                             id: phov
-                            anchors.fill: parent
+                            anchors.top: parent.top
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            height: 34
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
                             onClicked: root.toggle(prow.modelData.id)
                         }
 
                         Row {
-                            anchors.fill: parent
+                            anchors.top: parent.top
+                            anchors.left: parent.left
+                            anchors.right: parent.right
                             anchors.leftMargin: 6
                             anchors.rightMargin: 6
+                            height: 34
                             spacing: 8
                             Text {
                                 width: 14
@@ -239,7 +331,7 @@ Rectangle {
                                 font.pixelSize: Theme.fontSize - 3
                             }
                             Column {
-                                width: parent.width - 250
+                                width: parent.width - 284
                                 anchors.verticalCenter: parent.verticalCenter
                                 spacing: 0
                                 Text {
@@ -250,13 +342,27 @@ Rectangle {
                                     font.family: Theme.fontFamily
                                     font.pixelSize: Theme.fontSize - 2
                                 }
-                                Text {
+                                Row {
                                     width: parent.width
-                                    elide: Text.ElideRight
-                                    text: root.route(prow.modelData)
-                                    color: Theme.textFaint
-                                    font.family: Theme.fontFamily
-                                    font.pixelSize: Theme.fontSize - 4
+                                    spacing: 6
+                                    Text {
+                                        width: parent.width - (prow.held ? 146 : 0)
+                                        elide: Text.ElideRight
+                                        text: root.route(prow.modelData)
+                                        color: Theme.textFaint
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 4
+                                    }
+                                    // Says why a row the search no longer matches is still here.
+                                    Text {
+                                        width: 140
+                                        visible: prow.held
+                                        elide: Text.ElideRight
+                                        text: "· renamed, not in this search"
+                                        color: Theme.warnAmber
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 4
+                                    }
                                 }
                             }
                             Text {
@@ -267,6 +373,22 @@ Rectangle {
                                 color: Theme.text
                                 font.family: Theme.monoFamily
                                 font.pixelSize: Theme.fontSize - 2
+                            }
+                            PushButton {
+                                anchors.verticalCenter: parent.verticalCenter
+                                implicitWidth: 26
+                                implicitHeight: 22
+                                label: "✎"
+                                primary: prow.editing
+                                onClicked: {
+                                    if (prow.editing) {
+                                        root.renaming = -1;
+                                    } else {
+                                        root.renaming = prow.modelData.id;
+                                        nameEdit.text = prow.modelData.description;
+                                        nameEdit.focusInput();
+                                    }
+                                }
                             }
                             // The chain marker doubles as the way in: a payment that is already
                             // threaded says so, and pressing it follows the thread.
@@ -291,6 +413,40 @@ Rectangle {
                                     cursorShape: Qt.PointingHandCursor
                                     onClicked: root.follow(prow.modelData.id)
                                 }
+                            }
+                        }
+
+                        // The rename editor, below the payment it renames.
+                        Row {
+                            visible: prow.editing
+                            anchors.left: parent.left
+                            anchors.leftMargin: 28
+                            anchors.right: parent.right
+                            anchors.rightMargin: 6
+                            anchors.bottom: parent.bottom
+                            anchors.bottomMargin: 4
+                            spacing: 6
+                            Field {
+                                id: nameEdit
+                                width: parent.width - 100
+                                label: "description"
+                                placeholder: "what this payment was"
+                                onAccepted: root.rename(prow.modelData.id, nameEdit.text)
+                            }
+                            PushButton {
+                                anchors.verticalCenter: parent.verticalCenter
+                                implicitWidth: 44
+                                implicitHeight: 22
+                                label: "save"
+                                primary: true
+                                onClicked: root.rename(prow.modelData.id, nameEdit.text)
+                            }
+                            PushButton {
+                                anchors.verticalCenter: parent.verticalCenter
+                                implicitWidth: 44
+                                implicitHeight: 22
+                                label: "cancel"
+                                onClicked: root.renaming = -1
                             }
                         }
                     }

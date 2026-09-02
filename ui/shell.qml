@@ -535,10 +535,17 @@ ShellRoot {
             // The recurring-payments screen both LISTS and creates, like the accounts sidebar:
             // one button, and an existing rule can be bounded without hunting for it.
             SeriesList {
+                id: seriesList
                 Layout.fillWidth: true
                 // Deliberately tight: the creation form below is ~390px, and on a 773px
                 // window every row here comes off its Create button. Scrolls past three.
-                Layout.preferredHeight: Math.min(150, 22 + 30 * win.seriesCount)
+                //
+                // The row height comes FROM the list rather than being restated here. Restating it
+                // is what clipped the rename editor at one series: a row can be taller than 30 now,
+                // and a formula that did not know it left the description field half outside a
+                // viewport that could not be scrolled far enough to reach the rest.
+                Layout.preferredHeight: Math.min(150, 22 + seriesList.rowHeight * win.seriesCount
+                                                      + seriesList.extraHeight)
                 visible: win.showSeries && win.seriesCount > 0
                 today: win.asOf
                 onChanged: win.refresh()

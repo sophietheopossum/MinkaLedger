@@ -2,7 +2,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import "../services"
 
-// The recurring payments that already exist, and where to stop them.
+// The recurring payments that already exist, what they are called, and where to stop them.
 //
 // WHY THIS EXISTS AT ALL: until now nothing in the app listed your recurring payments. You could
 // create one and see its occurrences in UPCOMING, but never the rules themselves — so a series
@@ -13,6 +13,10 @@ import "../services"
 // series already generated exactly where it is, which is what you want for a gym membership you
 // cancelled in March. There is deliberately no delete: a series a transaction points at cannot go
 // without orphaning it.
+//
+// Renaming is not retrospective either. The description here is what the NEXT projection will be
+// called; occurrences already written keep the wording they were written with, because that copy
+// is the record of what happened and may already have been reconciled against a statement.
 Rectangle {
     id: root
 
@@ -21,8 +25,23 @@ Rectangle {
     signal changed
 
     color: "transparent"
-    property int editing: -1
+    property int editing: -1     // series whose end date is being set
+    property int renaming: -1    // series whose description is being retyped
     property string note: ""
+
+    // The row height, and what the rename editor ADDS to it, PUBLISHED rather than kept private:
+    // the caller sizes this panel from them.
+    //
+    // shell.qml used to restate the 30 in its own formula and know nothing about the 52, which
+    // clipped the rename editor outright at ONE series -- the state every new book passes through,
+    // and the only state in which the panel appears at all with a single rule. The ListView viewport
+    // was 32px while the delegate grew to 52, so the description field's box, its focus border and
+    // the bottom of its text line fell outside it, and because contentHeight then exceeded the
+    // viewport with nowhere to scroll to, no amount of dragging could bring them back.
+    readonly property int rowHeight: 30
+    readonly property int namingHeight: 52
+    readonly property int extraHeight: root.renaming >= 0
+                                       ? root.namingHeight - root.rowHeight : 0
 
     function reload() {
         Ledger.request("series.list", {}, (r, e) => {
@@ -44,6 +63,18 @@ Rectangle {
         Ledger.write("series.end", params, (r, e) => {
             root.note = e ? e.message : "";
             if (!e) { root.editing = -1; root.reload(); root.changed(); }
+        });
+    }
+
+    function rename(id, text) {
+        const description = text.trim();
+        if (description.length === 0) {
+            root.note = "a recurring payment needs a description";
+            return;
+        }
+        Ledger.write("series.rename", { id: id, description: description }, (r, e) => {
+            root.note = e ? e.message : "";
+            if (!e) { root.renaming = -1; root.reload(); root.changed(); }
         });
     }
 
@@ -98,10 +129,16 @@ Rectangle {
             delegate: Rectangle {
                 id: srow
                 required property var modelData
+                readonly property bool naming: root.renaming === srow.modelData.id
+                readonly property bool ending: root.editing === srow.modelData.id
                 width: ListView.view.width
-                implicitHeight: 30
+                // Grows for the name editor: the description field is full width, so leaving it to
+                // overhang a 30px row the way the narrow date field does would put it across the
+                // neighbouring rows' text. Both numbers come from root, which is also what the
+                // caller sizes the panel by -- stating either one twice is what clipped the editor.
+                implicitHeight: srow.naming ? root.namingHeight : root.rowHeight
                 radius: 3
-                color: shov.containsMouse || root.editing === srow.modelData.id
+                color: shov.containsMouse || srow.ending || srow.naming
                        ? Theme.surfaceRaised : "transparent"
                 MouseArea { id: shov; anchors.fill: parent; hoverEnabled: true }
 
@@ -112,10 +149,11 @@ Rectangle {
                     spacing: 8
 
                     Column {
-                        // Reserves room for the WIDEST case: "change end" plus "clear". Sizing
-                        // for "set end" alone pushed clear off the right edge as soon as a series
-                        // had an end date.
-                        width: parent.width - 380
+                        // Reserves room for the WIDEST case: the rename button, "change end" and
+                        // "clear". Sizing for "set end" alone pushed clear off the right edge as
+                        // soon as a series had an end date.
+                        width: parent.width - 420
+                        visible: !srow.naming
                         anchors.verticalCenter: parent.verticalCenter
                         spacing: 0
                         Text {
@@ -136,6 +174,16 @@ Rectangle {
                             font.pixelSize: Theme.fontSize - 4
                         }
                     }
+                    // In the name's own place, so it is edited where it is read.
+                    Field {
+                        id: nameEdit
+                        visible: srow.naming
+                        width: parent.width - 420
+                        anchors.verticalCenter: parent.verticalCenter
+                        label: "description"
+                        placeholder: "what this payment is"
+                        onAccepted: root.rename(srow.modelData.id, nameEdit.text)
+                    }
 
                     Text {
                         width: 74
@@ -154,7 +202,7 @@ Rectangle {
                     Text {
                         width: 96
                         anchors.verticalCenter: parent.verticalCenter
-                        visible: root.editing !== srow.modelData.id
+                        visible: !srow.ending
                         text: srow.modelData.until_on
                               ? "ends " + srow.modelData.until_on : "no end date"
                         color: srow.modelData.until_on ? Theme.text : Theme.warnAmber
@@ -163,7 +211,7 @@ Rectangle {
                     }
                     Field {
                         id: endEdit
-                        visible: root.editing === srow.modelData.id
+                        visible: srow.ending
                         width: 116
                         anchors.verticalCenter: parent.verticalCenter
                         label: "last payment"
@@ -171,16 +219,45 @@ Rectangle {
                         placeholder: "YYYY-MM-DD"
                     }
 
+                    // One row, one edit at a time: each editor hides the other's controls so the
+                    // buttons on screen always belong to the thing being changed.
+                    PushButton {
+                        anchors.verticalCenter: parent.verticalCenter
+                        implicitWidth: srow.naming ? 44 : 26
+                        implicitHeight: 22
+                        visible: !srow.ending
+                        label: srow.naming ? "save" : "✎"
+                        primary: srow.naming
+                        onClicked: {
+                            if (srow.naming)
+                                root.rename(srow.modelData.id, nameEdit.text);
+                            else {
+                                root.renaming = srow.modelData.id;
+                                nameEdit.text = srow.modelData.description;
+                                nameEdit.focusInput();
+                            }
+                        }
+                    }
+                    PushButton {
+                        anchors.verticalCenter: parent.verticalCenter
+                        implicitWidth: 22
+                        implicitHeight: 22
+                        visible: srow.naming
+                        label: "×"
+                        onClicked: root.renaming = -1
+                    }
+
                     PushButton {
                         anchors.verticalCenter: parent.verticalCenter
                         implicitHeight: 22
+                        visible: !srow.naming
                         // "set end" only reads right the first time; once a series is bounded
                         // the action is to move the date, and the button should say so.
-                        label: root.editing === srow.modelData.id ? "save"
+                        label: srow.ending ? "save"
                              : srow.modelData.until_on ? "change end" : "set end"
-                        primary: root.editing === srow.modelData.id
+                        primary: srow.ending
                         onClicked: {
-                            if (root.editing === srow.modelData.id)
+                            if (srow.ending)
                                 root.setEnd(srow.modelData.id, endEdit.text);
                             else {
                                 root.editing = srow.modelData.id;
@@ -192,7 +269,7 @@ Rectangle {
                         anchors.verticalCenter: parent.verticalCenter
                         implicitHeight: 22
                         visible: srow.modelData.until_on !== null
-                                 && root.editing !== srow.modelData.id
+                                 && !srow.ending && !srow.naming
                         label: "clear"
                         onClicked: root.setEnd(srow.modelData.id, "")
                     }

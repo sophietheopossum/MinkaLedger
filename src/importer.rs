@@ -447,19 +447,13 @@ pub fn revert(conn: &mut Connection, batch_id: i64) -> Result<usize, ImportError
     Ok(ids.len())
 }
 
+/// The bucket an uncategorised row lands in, created on first use.
+///
+/// Resolved by crate::roles rather than by the literal name: `account.rename` can retitle this
+/// account, and a name lookup would then quietly create a SECOND one -- splitting old uncategorised
+/// spend from new across two accounts no report joins.
 fn unclassified_account(conn: &Connection) -> Result<i64, ImportError> {
-    if let Ok(id) =
-        conn.query_row("SELECT id FROM account WHERE name='Expenses:Unclassified'", [], |r| r.get(0))
-    {
-        return Ok(id);
-    }
-    let cur: String =
-        conn.query_row("SELECT value FROM book_meta WHERE key='display_currency'", [], |r| r.get(0))?;
-    conn.execute(
-        "INSERT INTO account(name, kind, currency) VALUES('Expenses:Unclassified','expense',?1)",
-        [cur],
-    )?;
-    Ok(conn.last_insert_rowid())
+    Ok(crate::roles::unclassified(conn)?)
 }
 
 pub fn rows(conn: &Connection, batch_id: i64) -> Result<Vec<serde_json::Value>, ImportError> {
