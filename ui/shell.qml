@@ -47,7 +47,18 @@ ShellRoot {
         property string asOf: Qt.formatDate(new Date(), "yyyy-MM-dd")
         property string horizon: Qt.formatDate(
             new Date(new Date().setMonth(new Date().getMonth() + 12)), "yyyy-MM-dd")
-        property int focusAccount: -1
+        // The chart looks back as far as it looks forward, so today sits in the middle.
+        property string historyFrom: Qt.formatDate(
+            new Date(new Date().setMonth(new Date().getMonth() - 12)), "yyyy-MM-dd")
+        // Balance history per open account over that window, from account.history.
+        property var history: []
+        // The accounts the chart draws: click one to see it alone, shift-click to add or remove,
+        // Escape to clear. Empty means every asset, summed per currency -- the household's money
+        // as one line, which is what the chart is for when nothing in particular is being asked.
+        property var selectedAccounts: []
+        readonly property var chartAccountIds: win.selectedAccounts.length > 0
+            ? win.selectedAccounts
+            : win.accounts.filter(a => a.kind === "asset").map(a => a.account_id)
         property var scenarios: []
         property var activeScenarios: []
         property var editing: null          // the occurrence open in the editor
@@ -85,10 +96,14 @@ ShellRoot {
             Ledger.request("account.balances", {}, (r, e) => {
                 if (!e) {
                     win.accounts = r || [];
-                    if (win.focusAccount < 0 && win.accounts.length > 0)
-                        win.focusAccount = win.accounts[0].account_id;
+                    // An account that went away takes its selection with it. (No const inside
+                    // the callback: qmllint silently stops checking a file that has one.)
+                    win.selectedAccounts = win.selectedAccounts.filter(
+                        id => win.accounts.some(a => a.account_id === id));
                 }
             });
+            Ledger.request("account.history", { from: win.historyFrom, to: win.asOf },
+                           (r, e) => { if (!e) win.history = r || []; });
             Ledger.request("scenario.list", {}, (r, e) => { if (!e) win.scenarios = r || []; });
             Ledger.request("account.list", {}, (r, e) => { if (!e) win.allAccounts = r || []; });
             Ledger.request("currency.list", {}, (r, e) => { if (!e) win.currencies = r || []; });
@@ -106,20 +121,114 @@ ShellRoot {
             function onRevisionChanged() { win.refresh(); }
         }
 
-        // The projected balance series for the focused account, seeded with today's actual so the
-        // line starts from where the money really is.
-        function seriesFor(accountId) {
-            const out = [];
+        function pickAccount(id, extend) {
+            if (!extend) {
+                win.selectedAccounts = [id];
+                return;
+            }
+            const next = win.selectedAccounts.slice();
+            const at = next.indexOf(id);
+            if (at >= 0) next.splice(at, 1); else next.push(id);
+            win.selectedAccounts = next;
+        }
+
+        // One account's balance line: the history window, then today, then the projection --
+        // so the line starts where the money was, passes through where it is, and ends where
+        // the rules say it will be.
+        //
+        // Today's point comes from the history, not from the sidebar's balance: the sidebar
+        // counts a post-dated payment already, while history and projection both stop at today,
+        // and mixing the two put a one-day spike on the line. When the projection has a point
+        // on today it wins, because it already includes whatever is due today.
+        function lineFor(accountId) {
+            const pts = [];
+            const h = win.history.find(a => a.account_id === accountId);
+            let today = h ? h.opening_minor : 0;
+            if (h) {
+                // A movement on the window's first day is a point, not part of the opening.
+                if (!(h.points.length > 0 && h.points[0].on === win.historyFrom))
+                    pts.push({ on: win.historyFrom, balance_minor: h.opening_minor });
+                for (const p of h.points) {
+                    if (p.on >= win.historyFrom && p.on <= win.asOf) {
+                        pts.push(p);
+                        today = p.balance_minor;
+                    }
+                }
+            }
+            const projected = (win.projection.balances || []).filter(
+                b => b.account_id === accountId && b.on >= win.asOf);
+            if (!(projected.length > 0 && projected[0].on === win.asOf)
+                && !(pts.length > 0 && pts[pts.length - 1].on === win.asOf))
+                pts.push({ on: win.asOf, balance_minor: today });
+            for (const b of projected)
+                pts.push({ on: b.on, balance_minor: b.balance_minor });
             const acc = win.accounts.find(a => a.account_id === accountId);
-            if (acc)
-                out.push({ on: win.asOf, balance_minor: acc.balance_minor });
-            for (const b of (win.projection.balances || []))
-                if (b.account_id === accountId)
-                    out.push({ on: b.on, balance_minor: b.balance_minor });
-            return out;
+            return {
+                label: acc ? acc.name : String(accountId),
+                currency: acc ? acc.currency : (h ? h.currency : ""),
+                points: pts
+            };
+        }
+
+        // Several lines added up: on every date any of them moves, the sum of each one's latest
+        // value. A balance carries forward between its own points, so this is the sum of what
+        // every account held that day, not just of the ones that moved.
+        function sumLines(members, label, currency) {
+            const dates = {};
+            const byDate = [];
+            for (const m of members) {
+                const mine = {};
+                for (const p of m.points) {
+                    dates[p.on] = true;
+                    mine[p.on] = p.balance_minor;
+                }
+                byDate.push(mine);
+            }
+            const latest = members.map(() => 0);
+            const pts = [];
+            for (const on of Object.keys(dates).sort()) {
+                let total = 0;
+                for (let i = 0; i < members.length; i++) {
+                    if (byDate[i][on] !== undefined)
+                        latest[i] = byDate[i][on];
+                    total += latest[i];
+                }
+                pts.push({ on: on, balance_minor: total });
+            }
+            return { label: label, currency: currency, points: pts };
+        }
+
+        readonly property var chartLines: {
+            if (win.selectedAccounts.length > 0)
+                return win.selectedAccounts.map(id => win.lineFor(id));
+            // Every asset, one summed line per currency: money in different currencies is not
+            // one number, and pretending it is would be worse than two lines.
+            const byCurrency = {};
+            for (const a of win.accounts.filter(a => a.kind === "asset"))
+                (byCurrency[a.currency] = byCurrency[a.currency] || []).push(win.lineFor(a.account_id));
+            return Object.keys(byCurrency).sort().map(cur =>
+                win.sumLines(byCurrency[cur], "all assets", cur));
+        }
+        readonly property string chartCurrency: win.chartLines.length > 0 ? win.chartLines[0].currency : "GBP"
+
+        // Escape clears the selection. A window Shortcut sees the key BEFORE any item does and
+        // consumes it, so it is switched off whenever a panel is open: that is where the
+        // pickers live, and Escape there already means "close the list without picking".
+        Shortcut {
+            sequences: ["Escape"]
+            enabled: !win.panelOpen && win.selectedAccounts.length > 0
+            onActivated: {
+                // Quickshell's window has no activeFocusItem of its own; the attached Window
+                // property on any item inside it does, the same way the pickers read it.
+                const it = body.Window.activeFocusItem;
+                if (it && it.hasOwnProperty("cursorPosition"))
+                    return;
+                win.selectedAccounts = [];
+            }
         }
 
         ColumnLayout {
+            id: body
             anchors.fill: parent
             anchors.margins: 14
             spacing: 12
@@ -395,7 +504,7 @@ ShellRoot {
                             delegate: Rectangle {
                                 width: ListView.view.width
                                 height: 26
-                                color: modelData.account_id === win.focusAccount
+                                color: win.selectedAccounts.indexOf(modelData.account_id) >= 0
                                        ? Theme.surfaceRaised : "transparent"
                                 RowLayout {
                                     anchors.fill: parent
@@ -418,7 +527,10 @@ ShellRoot {
                                 }
                                 MouseArea {
                                     anchors.fill: parent
-                                    onClicked: win.focusAccount = modelData.account_id
+                                    // Shift adds to (or takes from) the selection; a plain click
+                                    // replaces it.
+                                    onClicked: mouse => win.pickAccount(modelData.account_id,
+                                                                        (mouse.modifiers & Qt.ShiftModifier) !== 0)
                                 }
                             }
                         }
@@ -441,24 +553,75 @@ ShellRoot {
                         RowLayout {
                             Layout.fillWidth: true
                             Text {
-                                text: "PROJECTED BALANCE"
+                                text: "BALANCE"
                                 color: Theme.textMuted
                                 font.family: Theme.fontFamily
                                 font.pixelSize: Theme.fontSize - 2
                             }
+                            Text {
+                                text: win.selectedAccounts.length === 0
+                                      ? "all assets · click an account, shift-click for more"
+                                      : "shift-click to add or remove, Esc for all assets"
+                                color: Theme.textFaint
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 4
+                            }
                             Item { Layout.fillWidth: true }
                             Text {
-                                text: win.asOf + "  to  " + win.horizon
+                                text: win.historyFrom + "  to  " + win.horizon
                                 color: Theme.textFaint
                                 font.family: Theme.monoFamily
                                 font.pixelSize: Theme.fontSize - 2
                             }
                         }
 
+                        // One chip per line: its colour, its name, and where it ends up.
+                        Flow {
+                            Layout.fillWidth: true
+                            spacing: 10
+                            Repeater {
+                                model: win.chartLines
+                                Row {
+                                    id: chip
+                                    required property var modelData
+                                    required property int index
+                                    spacing: 5
+                                    readonly property int endMinor: chip.modelData.points.length > 0
+                                        ? chip.modelData.points[chip.modelData.points.length - 1].balance_minor : 0
+                                    Rectangle {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: 10
+                                        height: 3
+                                        radius: 1
+                                        // The same rule the chart uses: a lone line that ends
+                                        // below zero is drawn red.
+                                        color: win.chartLines.length === 1 && chip.endMinor < 0
+                                               ? Theme.red
+                                               : Theme.seriesPalette[chip.index % Theme.seriesPalette.length]
+                                    }
+                                    Text {
+                                        text: chip.modelData.label
+                                              + (win.chartLines.length > 1 || win.selectedAccounts.length === 0
+                                                 ? " · " + chip.modelData.currency : "")
+                                        color: Theme.textMuted
+                                        font.family: Theme.fontFamily
+                                        font.pixelSize: Theme.fontSize - 3
+                                    }
+                                    Text {
+                                        text: Money.format(chip.endMinor, chip.modelData.currency)
+                                        color: chip.endMinor < 0 ? Theme.red : Theme.textFaint
+                                        font.family: Theme.monoFamily
+                                        font.pixelSize: Theme.fontSize - 3
+                                    }
+                                }
+                            }
+                        }
+
                         ForecastChart {
                             Layout.fillWidth: true
                             Layout.fillHeight: true
-                            series: win.seriesFor(win.focusAccount)
+                            lines: win.chartLines
+                            currency: win.chartCurrency
                             todayIso: win.asOf
                         }
 
@@ -644,9 +807,10 @@ ShellRoot {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         clip: true
-                        // One line per occurrence on the focused account, in date order.
+                        // One line per occurrence on the accounts the chart is drawing, in
+                        // date order: the selection, or every asset when there is none.
                         model: (win.projection.occurrences || []).filter(
-                            o => o.account_id === win.focusAccount)
+                            o => win.chartAccountIds.indexOf(o.account_id) >= 0)
                         // An Item, not a RowLayout, because the MouseArea has to cover the whole
                         // row and a layout MANAGES its children's geometry -- anchoring inside one
                         // is undefined behaviour Qt warns about, and this is the row you click to
@@ -676,7 +840,10 @@ ShellRoot {
                             }
                             Text {
                                 Layout.fillWidth: true
-                                text: modelData.description
+                                // With several accounts on the chart a row has to say whose it
+                                // is: a transfer between two of them is two rows, one per side.
+                                text: (win.chartAccountIds.length > 1 ? modelData.account + ": " : "")
+                                       + modelData.description
                                        + (modelData.chain_len
                                           ? "  ⛓ " + (modelData.chain_seq + 1) + "/" + modelData.chain_len : "")
                                        + (modelData.value_on !== modelData.occurrence_on

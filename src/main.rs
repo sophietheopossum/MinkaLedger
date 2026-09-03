@@ -806,6 +806,18 @@ fn dispatch(
             Ok(serde_json::Value::Array(entry::balances(conn, as_of)?))
         }
 
+        // Balance history for the chart: a point per day an account moved, and the balance it
+        // carried into the window.
+        "account.history" => {
+            let from = params.get("from").and_then(|v| v.as_str());
+            let to = params.get("to").and_then(|v| v.as_str());
+            let ids: Option<Vec<i64>> = params
+                .get("account_ids")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_i64()).collect());
+            Ok(serde_json::Value::Array(entry::history(conn, from, to, ids.as_deref())?))
+        }
+
         // ---- transactions ----
         "txn.create" => {
             let new: entry::NewTxn = serde_json::from_value(params)

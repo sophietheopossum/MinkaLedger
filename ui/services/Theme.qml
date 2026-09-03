@@ -21,6 +21,13 @@ Singleton {
     readonly property color purpleDim: Proustite.purpleDim
     readonly property color okGreen: Proustite.okGreen
     readonly property color warnAmber: Proustite.warnAmber
+    // Line colours for the balance chart when it draws several accounts at once, in the order
+    // they are handed out. Tokens only, so the chart stays inside the palette; six is as many
+    // lines as the chart can keep legible anyway.
+    readonly property var seriesPalette: [
+        Proustite.okGreen, Proustite.purple, Proustite.warnAmber,
+        Proustite.text, Proustite.redDim, Proustite.textMuted,
+    ]
 
     readonly property string fontFamily: Proustite.fontFamily
     readonly property string monoFamily: Proustite.monoFamily

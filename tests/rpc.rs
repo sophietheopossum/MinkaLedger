@@ -1593,3 +1593,52 @@ fn a_recurring_chain_is_refused_whole_when_wrong() {
     assert_eq!(out[8]["error"]["code"], "bad_rule", "{}", out[8]);
     assert_eq!(out[10]["result"].as_array().unwrap().len(), 0, "nothing was created");
 }
+
+
+/// The chart's history is a point per day an account moved, starting from the balance the window
+/// inherited; what happened after the window's end is not counted anywhere.
+#[test]
+fn balance_history_starts_from_what_the_window_inherited() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Salary","kind":"income"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"Sam","kind":"asset"}}"#,
+        r#"{"id":4,"method":"txn.create","params":{"occurred_on":"2026-06-01","description":"pay",
+             "postings":[{"account_id":1,"amount_minor":100000},{"account_id":2,"amount_minor":-100000}]}}"#,
+        r#"{"id":5,"method":"txn.create","params":{"occurred_on":"2026-07-15","description":"lend",
+             "postings":[{"account_id":1,"amount_minor":-20000},{"account_id":3,"amount_minor":20000}]}}"#,
+        r#"{"id":6,"method":"txn.create","params":{"occurred_on":"2026-08-01","description":"lend more",
+             "postings":[{"account_id":1,"amount_minor":-30000},{"account_id":3,"amount_minor":30000}]}}"#,
+        r#"{"id":7,"method":"txn.create","params":{"occurred_on":"2026-09-05","description":"after the window",
+             "postings":[{"account_id":1,"amount_minor":-1000},{"account_id":3,"amount_minor":1000}]}}"#,
+        r#"{"id":8,"method":"account.history","params":{"from":"2026-07-01","to":"2026-08-31"}}"#,
+        r#"{"id":9,"method":"account.history","params":{"from":"2026-07-01","to":"2026-08-31","account_ids":[3]}}"#,
+        // A movement ON the window's first day is a point, not part of the opening.
+        r#"{"id":10,"method":"account.history","params":{"from":"2026-07-15","to":"2026-08-31","account_ids":[1]}}"#,
+        // No window at all: nothing is carried in, everything is a point.
+        r#"{"id":11,"method":"account.history","params":{"account_ids":[1]}}"#,
+    ]);
+    for r in &out {
+        assert!(err_of(r).is_none(), "no step may fail: {r}");
+    }
+    let rows = out[7]["result"].as_array().unwrap();
+    let current = rows.iter().find(|a| a["name"] == "Current").unwrap();
+    assert_eq!(current["opening_minor"], 100000, "June's pay is carried in, not drawn");
+    assert_eq!(current["points"], serde_json::json!([
+        { "on": "2026-07-15", "balance_minor": 80000 },
+        { "on": "2026-08-01", "balance_minor": 50000 },
+    ]), "one point per day it moved, at the closing balance");
+
+    let on_the_day = &out[9]["result"][0];
+    assert_eq!(on_the_day["opening_minor"], 100000);
+    assert_eq!(on_the_day["points"][0], serde_json::json!({ "on": "2026-07-15", "balance_minor": 80000 }));
+    let whole = &out[10]["result"][0];
+    assert_eq!(whole["opening_minor"], 0);
+    assert_eq!(whole["points"].as_array().unwrap().len(), 4, "{whole}");
+    let salary = rows.iter().find(|a| a["name"] == "Salary").unwrap();
+    assert_eq!((salary["opening_minor"].as_i64(), salary["points"].as_array().unwrap().len()), (Some(-100000), 0));
+
+    let only_sam = out[8]["result"].as_array().unwrap();
+    assert_eq!(only_sam.len(), 1);
+    assert_eq!(only_sam[0]["points"].as_array().unwrap().len(), 2, "{only_sam:?}");
+}

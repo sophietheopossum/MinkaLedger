@@ -585,6 +585,73 @@ pub fn balances(conn: &Connection, as_of: Option<&str>) -> Result<Vec<serde_json
     Ok(rows)
 }
 
+/// Daily closing balances per open account across a window, for drawing history on the chart.
+///
+/// One point per day an account moved, from `from` to `to` inclusive, plus `opening_minor`: the
+/// balance carried in from before `from`, so a line starts at its true level rather than at
+/// zero. Days between points carry the previous point forward; the caller draws that however it
+/// likes. Closed accounts are left out, as `balances` leaves them out. Postings after `to` are
+/// not counted anywhere, so `to` is the date the last point can be trusted to.
+pub fn history(
+    conn: &Connection,
+    from: Option<&str>,
+    to: Option<&str>,
+    ids: Option<&[i64]>,
+) -> Result<Vec<serde_json::Value>, EntryError> {
+    let wanted = |id: i64| ids.is_none_or(|ids| ids.contains(&id));
+
+    let mut stmt =
+        conn.prepare("SELECT id, name, kind, currency FROM account WHERE closed = 0 ORDER BY kind, name")?;
+    let accounts: Vec<(i64, String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .filter_map(|row| row.ok())
+        .filter(|(id, ..)| wanted(*id))
+        .collect();
+
+    let mut stmt = conn.prepare(
+        "SELECT p.account_id, t.occurred_on, SUM(p.amount_minor)
+           FROM posting p JOIN txn t ON t.id = p.txn_id
+          WHERE (?1 IS NULL OR t.occurred_on <= ?1)
+          GROUP BY p.account_id, t.occurred_on
+          ORDER BY p.account_id, t.occurred_on",
+    )?;
+    let mut opening: BTreeMap<i64, Minor> = BTreeMap::new();
+    let mut running: BTreeMap<i64, Minor> = BTreeMap::new();
+    let mut points: BTreeMap<i64, Vec<serde_json::Value>> = BTreeMap::new();
+    for row in stmt.query_map([to], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Minor>(2)?))
+    })? {
+        let (account_id, on, moved) = row?;
+        if !wanted(account_id) {
+            continue;
+        }
+        let balance = running.entry(account_id).or_insert(0);
+        *balance += moved;
+        if from.is_some_and(|f| on.as_str() < f) {
+            opening.insert(account_id, *balance);
+        } else {
+            points
+                .entry(account_id)
+                .or_default()
+                .push(serde_json::json!({ "on": on, "balance_minor": *balance }));
+        }
+    }
+
+    Ok(accounts
+        .into_iter()
+        .map(|(id, name, kind, currency)| {
+            serde_json::json!({
+                "account_id": id,
+                "name": name,
+                "kind": kind,
+                "currency": currency,
+                "opening_minor": opening.get(&id).copied().unwrap_or(0),
+                "points": points.remove(&id).unwrap_or_default(),
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
