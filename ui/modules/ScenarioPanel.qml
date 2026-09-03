@@ -49,13 +49,19 @@ Rectangle {
         function onRevisionChanged() { root.reload(); }
     }
 
+    // A recurring chain is one commitment in several series; it is listed once, by its first leg.
+    // Cancelling that leg cancels the chain -- the projection treats a cancel of any leg that way.
+    function firstLeg(s) {
+        return s.chain_id === null || s.chain_id === undefined || s.chain_seq === 0;
+    }
     function changesIn(scenarioId) {
-        return (root.series || []).filter(s => s.scenario_id === scenarioId);
+        return (root.series || []).filter(s => s.scenario_id === scenarioId && root.firstLeg(s));
     }
     // Only baseline series can be cancelled: superseding a scenario row would be a change to a
     // change, which the projection has no notion of.
     function baselineSeries() {
-        return (root.series || []).filter(s => s.scenario_id === null || s.scenario_id === undefined);
+        return (root.series || []).filter(s => (s.scenario_id === null || s.scenario_id === undefined)
+                                               && root.firstLeg(s));
     }
     function isActive(id) { return (root.active || []).indexOf(id) >= 0; }
 

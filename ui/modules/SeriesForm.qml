@@ -12,6 +12,11 @@ import "../services"
 // AND IT PREVIEWS. `series.preview` expands the rule without saving, so you see the real dates --
 // including where a weekend rule will move one -- before committing to twelve months of it. Getting
 // a recurrence subtly wrong is otherwise something you discover a month later.
+//
+// A CHAIN, as in the payment form: stops the money passes through on its way, each becoming its own
+// recurring payment on the same rule, sharing the description, tied together so ending, renaming or
+// skipping any one of them does it to all. Only the amount is per leg -- a leg is bound to the
+// rule's date, so "lands a day later" is an override on the occurrence, not a field here.
 Rectangle {
     id: root
 
@@ -35,6 +40,11 @@ Rectangle {
 
     property int fromAccount: -1
     property int toAccount: -1
+    // The stops the money passes THROUGH, in order: { account, amountText, amountMinor, amountOk,
+    // amountBad }, `amountText` blank meaning "same as the leg above". Same split as the payment
+    // form: `stopCount` is the Repeater's model and rebuilds the rows, `stops` is what they show.
+    property var stops: []
+    property int stopCount: 0
     property int amountMinor: 0
     property bool amountOk: false
     property string preset: "monthly_day"
@@ -54,6 +64,76 @@ Rectangle {
     }
     // The series is denominated in the account the money leaves.
     readonly property string fromCurrency: root.currencyOf(root.fromAccount)
+
+    // Every account the money visits, in order.
+    readonly property var route: [root.fromAccount].concat(root.stops.map(s => s.account), [root.toAccount])
+    readonly property bool routeChosen: root.route.every(id => id >= 0)
+    readonly property bool routeMoves: root.route.every((id, i) => i === 0 || id !== root.route[i - 1])
+    readonly property bool routeOneCurrency: root.route.every(id => id < 0 || root.currencyOf(id) === root.fromCurrency)
+    readonly property bool stopsFilledIn: root.stops.every(s => s.amountOk)
+    readonly property var passThroughAccounts: (root.accounts || []).filter(a => a.kind === "asset" || a.kind === "liability")
+
+    function nameOf(id) {
+        const a = (root.accounts || []).find(x => x.account_id === id);
+        return a ? a.name : "…";
+    }
+    readonly property string routeText: root.route.map(id => root.nameOf(id)).join(" → ")
+
+    function addStop() {
+        root.stops = root.stops.concat([{ account: -1, amountText: "", amountMinor: 0, amountOk: true, amountBad: false }]);
+        root.stopCount = root.stops.length;
+    }
+    function updateStop(i, patch) {
+        const s = root.stops.slice();
+        s[i] = Object.assign({}, s[i], patch);
+        root.stops = s;
+    }
+    function removeStop(i) {
+        const s = root.stops.slice();
+        s.splice(i, 1);
+        root.stopCount = s.length;
+        root.stops = s;
+        status.text = "";
+    }
+    function validateStopAmount(i, text) {
+        if (text.trim().length === 0) {
+            root.updateStop(i, { amountText: text, amountMinor: 0, amountOk: true, amountBad: false });
+            status.text = "";
+            return;
+        }
+        root.updateStop(i, { amountText: text, amountOk: false, amountBad: false });
+        Ledger.request("money.parse",
+                       { text: text, minor_digits: Money.digits(root.fromCurrency) }, (r, e) => {
+            if (i >= root.stops.length || root.stops[i].amountText !== text)
+                return;
+            if (e) {
+                status.text = e.message;
+                root.updateStop(i, { amountBad: true });
+            } else {
+                status.text = r.minor > 0 ? "" : "an amount is always positive";
+                root.updateStop(i, { amountMinor: r.minor, amountOk: r.minor > 0, amountBad: r.minor <= 0 });
+            }
+        });
+    }
+    onFromCurrencyChanged: {
+        root.stops.forEach((s, i) => {
+            if (s.amountText.trim().length > 0)
+                root.validateStopAmount(i, s.amountText);
+        });
+    }
+    // One hop per leg: the headline amount for the first, then each stop's onward amount or the
+    // same again.
+    function chainHops() {
+        let amount = root.amountMinor;
+        const targets = root.stops.map(s => s.account).concat([root.toAccount]);
+        const hops = [];
+        for (let i = 0; i < targets.length; i++) {
+            if (i > 0 && root.stops[i - 1].amountText.trim().length > 0)
+                amount = root.stops[i - 1].amountMinor;
+            hops.push({ to_account: targets[i], amount_minor: amount });
+        }
+        return hops;
+    }
 
     // Each preset knows how to render itself as an RRULE. Kept as one function so the mapping from
     // "what a person means" to "what RFC 5545 says" lives in a single readable place.
@@ -82,6 +162,10 @@ Rectangle {
         root.amountOk = false;
         root.fromAccount = -1;
         root.toAccount = -1;
+        fromPicker.selected = -1;
+        toPicker.selected = -1;
+        root.stops = [];
+        root.stopCount = 0;
         root.previewDates = [];
         root.endMode = "never";
         root.computedUntil = "";
@@ -166,13 +250,37 @@ Rectangle {
         return "";
     }
 
-    readonly property bool complete: root.amountOk && root.fromAccount >= 0 && root.toAccount >= 0
-                                     && root.fromAccount !== root.toAccount
+    readonly property bool complete: root.amountOk && root.routeChosen && root.routeMoves
+                                     && (root.stopCount > 0 || root.fromAccount !== root.toAccount)
+                                     && (root.stopCount === 0 || (root.routeOneCurrency && root.stopsFilledIn))
                                      && descField.text.length > 0 && root.previewDates.length > 0
 
     function save() {
         if (!root.complete)
             return;
+        if (root.stopCount > 0) {
+            const chain = {
+                description: descField.text,
+                rrule: root.rrule,
+                dtstart: startField.text,
+                weekend_rule: root.weekendRule,
+                from_account: root.fromAccount,
+                hops: root.chainHops()
+            };
+            if (root.scenarioId >= 0)
+                chain.scenario_id = root.scenarioId;
+            if (root.endsOn.length === 10)
+                chain.until_on = root.endsOn;
+            Ledger.write("series.create_chain", chain, (r, e) => {
+                if (e)
+                    status.text = e.message;
+                else {
+                    root.reset();
+                    root.saved();
+                }
+            });
+            return;
+        }
         const params = {
             description: descField.text,
             rrule: root.rrule,
@@ -207,8 +315,9 @@ Rectangle {
 
         Text {
             text: root.scenarioId < 0
-                  ? "NEW RECURRING PAYMENT"
-                  : "HYPOTHETICAL PAYMENT — only in “" + root.scenarioName + "”"
+                  ? (root.stopCount > 0 ? "NEW RECURRING CHAIN" : "NEW RECURRING PAYMENT")
+                  : "HYPOTHETICAL " + (root.stopCount > 0 ? "CHAIN" : "PAYMENT")
+                    + " — only in “" + root.scenarioName + "”"
             color: root.scenarioId < 0 ? Theme.textMuted : Theme.purple
             font.family: Theme.fontFamily
             font.pixelSize: Theme.fontSize - 2
@@ -314,16 +423,94 @@ Rectangle {
                 onEdited: root.refreshPreview()
             }
             AccountPicker {
-                width: (r2.width - 166) / 2
+                id: fromPicker
+                width: (r2.width - 150 - addStopButton.width - 24) / 2
                 label: "from"
                 accounts: root.accounts
                 onPicked: id => root.fromAccount = id
             }
             AccountPicker {
-                width: (r2.width - 166) / 2
+                id: toPicker
+                width: (r2.width - 150 - addStopButton.width - 24) / 2
                 label: "to"
                 accounts: root.accounts
                 onPicked: id => root.toAccount = id
+            }
+            // In this row rather than on one of its own: this form is already the tallest panel
+            // and the plain case must not pay a line for the chain it is not making.
+            PushButton {
+                id: addStopButton
+                anchors.verticalCenter: parent.verticalCenter
+                label: "+ stop"
+                onClicked: root.addStop()
+            }
+        }
+
+        // One row per stop, rebuilt from `stops` when the count changes.
+        Repeater {
+            model: root.stopCount
+            delegate: Row {
+                id: stopRow
+                required property int index
+                readonly property var stop: root.stops[stopRow.index]
+                                            ?? ({ account: -1, amountText: "", amountMinor: 0, amountOk: true, amountBad: false })
+                width: form.width
+                spacing: 8
+                AccountPicker {
+                    width: (stopRow.width - 16) * 0.55
+                    label: "via"
+                    accounts: root.passThroughAccounts
+                    selected: stopRow.stop.account
+                    onPicked: id => root.updateStop(stopRow.index, { account: id })
+                }
+                Field {
+                    width: (stopRow.width - 16) * 0.30
+                    label: root.fromCurrency.length > 0 ? "then sends (" + root.fromCurrency + ")" : "then sends"
+                    placeholder: "same amount"
+                    numeric: true
+                    text: stopRow.stop.amountText
+                    onEdited: value => root.validateStopAmount(stopRow.index, value)
+                    Binding on invalid {
+                        value: stopRow.stop.amountBad
+                    }
+                }
+                PushButton {
+                    anchors.verticalCenter: parent.verticalCenter
+                    label: "remove"
+                    onClicked: root.removeStop(stopRow.index)
+                }
+            }
+        }
+
+        Column {
+            width: parent.width
+            visible: root.stopCount > 0
+            spacing: 1
+            Text {
+                width: parent.width
+                elide: Text.ElideRight
+                text: root.routeText
+                color: Theme.text
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 2
+            }
+            Text {
+                width: parent.width
+                elide: Text.ElideRight
+                text: (root.stopCount + 1) + " recurring payments, one for each leg, sharing the description and the rule"
+                      + " — every leg lands on the rule's date; a blank amount on a stop reuses the one above"
+                color: Theme.textFaint
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 4
+            }
+            Text {
+                width: parent.width
+                elide: Text.ElideRight
+                visible: root.routeChosen && root.fromAccount === root.toAccount
+                text: "a round trip: leaves and comes back to " + root.nameOf(root.fromAccount)
+                color: Theme.textFaint
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 4
             }
         }
 
@@ -462,7 +649,7 @@ Rectangle {
         Row {
             spacing: 8
             PushButton {
-                label: "Create"
+                label: root.stopCount > 0 ? "Create " + (root.stopCount + 1) + " payments" : "Create"
                 primary: true
                 enabled: root.complete
                 onClicked: root.save()
@@ -473,6 +660,22 @@ Rectangle {
                     root.reset();
                     root.cancelled();
                 }
+            }
+            Text {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.stopCount > 0 && root.routeChosen && !root.routeMoves
+                text: "the same account twice in a row"
+                color: Theme.warnAmber
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 2
+            }
+            Text {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.stopCount > 0 && root.routeChosen && root.routeMoves && !root.routeOneCurrency
+                text: "a chain stays in one currency"
+                color: Theme.warnAmber
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 2
             }
         }
     }

@@ -16,6 +16,10 @@ Rectangle {
 
     property var occurrence: null
     readonly property bool active: occurrence !== null
+    // A leg of a recurring chain is edited as the chain: a month with no payment is a month with
+    // no payment end to end. The core fans it out; this only says so.
+    readonly property bool chained: root.active && root.occurrence.chain_len !== undefined
+                                    && root.occurrence.chain_len !== null
 
     signal changed
     signal dismissed
@@ -113,8 +117,11 @@ Rectangle {
             font.pixelSize: Theme.fontSize
         }
         Text {
-            text: root.active ? ("occurrence " + root.occurrence.occurrence_on
-                                 + " · one instance only") : ""
+            text: !root.active ? ""
+                  : "occurrence " + root.occurrence.occurrence_on
+                    + (root.chained
+                       ? " · all " + root.occurrence.chain_len + " legs of this chain"
+                       : " · one instance only")
             color: Theme.textFaint
             font.family: Theme.monoFamily
             font.pixelSize: Theme.fontSize - 3
@@ -141,6 +148,16 @@ Rectangle {
         }
 
         Text {
+            visible: root.chained
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: "the amount change carries through every leg as a difference, so a fee stays a fee"
+            color: Theme.textFaint
+            font.family: Theme.fontFamily
+            font.pixelSize: Theme.fontSize - 4
+        }
+
+        Text {
             id: status
             width: parent.width
             wrapMode: Text.Wrap
@@ -158,7 +175,7 @@ Rectangle {
                 onClicked: root.apply("amend")
             }
             PushButton {
-                label: "Skip this one"
+                label: root.chained ? "Skip all " + root.occurrence.chain_len + " legs" : "Skip this one"
                 onClicked: root.apply("skip")
             }
             PushButton {

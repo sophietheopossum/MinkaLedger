@@ -677,6 +677,8 @@ ShellRoot {
                             Text {
                                 Layout.fillWidth: true
                                 text: modelData.description
+                                       + (modelData.chain_len
+                                          ? "  ⛓ " + (modelData.chain_seq + 1) + "/" + modelData.chain_len : "")
                                        + (modelData.value_on !== modelData.occurrence_on
                                           ? "  (moved from " + modelData.occurrence_on + ")" : "")
                                 elide: Text.ElideRight

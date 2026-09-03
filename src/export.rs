@@ -230,7 +230,7 @@ mod tests {
     fn book() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        conn.execute_batch(include_str!("../migrations/0001_init.sql")).unwrap();
+        crate::db::migrate(&conn).unwrap();
         conn.execute_batch(
             "INSERT INTO account(id,name,kind,currency) VALUES
                (1,'Current','asset','GBP'), (2,'Salary','income','GBP'),

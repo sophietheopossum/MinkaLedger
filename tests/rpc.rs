@@ -1417,3 +1417,179 @@ fn a_chain_is_refused_whole_when_any_hop_is_wrong() {
     assert!(err_of(&out[10]).unwrap().contains("hop 2"), "it must say which hop: {}", out[10]);
     assert_eq!(out[13]["result"].as_array().unwrap().len(), 0, "nothing was written, not even the first hop");
 }
+
+/// A recurring chain is one commitment in several series: every hop projects, the intermediate
+/// keeps only what it keeps, the brief counts it once, and ending, renaming, skipping or
+/// re-pricing any hop does the same to the chain.
+#[test]
+fn a_recurring_chain_projects_every_hop_and_behaves_as_one() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Sam","kind":"asset"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"Bookmaker","kind":"asset"}}"#,
+        r#"{"id":4,"method":"series.create_chain","params":{"description":"stake via Sam",
+             "rrule":"FREQ=MONTHLY;BYMONTHDAY=1","dtstart":"2026-10-01","from_account":1,
+             "hops":[{"to_account":2,"amount_minor":10000},{"to_account":3,"amount_minor":9500}]}}"#,
+        r#"{"id":5,"method":"series.list"}"#,
+        r#"{"id":6,"method":"forecast.project","params":{"as_of":"2026-09-30","horizon":"2026-12-31"}}"#,
+        r#"{"id":7,"method":"analysis.brief","params":{"as_of":"2026-09-30","months":3}}"#,
+        r#"{"id":8,"method":"series.end","params":{"id":2,"until_on":"2026-11-30"}}"#,
+        r#"{"id":9,"method":"series.rename","params":{"id":2,"description":"bets via Sam"}}"#,
+        r#"{"id":10,"method":"series.list"}"#,
+        r#"{"id":11,"method":"series.override","params":{"series_id":2,"occurrence_on":"2026-10-01","action":"skip"}}"#,
+        r#"{"id":12,"method":"forecast.project","params":{"as_of":"2026-09-30","horizon":"2026-12-31"}}"#,
+        r#"{"id":13,"method":"series.override","params":{"series_id":1,"occurrence_on":"2026-11-01","action":"amend","amount_minor":-12000}}"#,
+        r#"{"id":14,"method":"forecast.project","params":{"as_of":"2026-09-30","horizon":"2026-12-31"}}"#,
+        r#"{"id":15,"method":"series.clear_override","params":{"series_id":2,"occurrence_on":"2026-11-01"}}"#,
+        r#"{"id":16,"method":"forecast.project","params":{"as_of":"2026-09-30","horizon":"2026-12-31"}}"#,
+    ]);
+    for r in &out {
+        assert!(err_of(r).is_none(), "no step may fail: {r}");
+    }
+    assert_eq!(out[3]["result"]["ids"], serde_json::json!([1, 2]));
+    assert_eq!(out[3]["result"]["chain_id"], 1);
+
+    let rows = out[4]["result"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0]["chain_id"].as_i64(), rows[0]["chain_seq"].as_i64(), rows[0]["chain_len"].as_i64()), (Some(1), Some(0), Some(2)));
+    assert_eq!((rows[1]["chain_id"].as_i64(), rows[1]["chain_seq"].as_i64()), (Some(1), Some(1)));
+    assert_eq!((rows[0]["from_account"].as_str(), rows[0]["to_account"].as_str()), (Some("Current"), Some("Sam")));
+    assert_eq!((rows[1]["from_account"].as_str(), rows[1]["to_account"].as_str()), (Some("Sam"), Some("Bookmaker")));
+    assert_eq!(rows[1]["amount_minor"], -9500, "each hop keeps its own amount");
+
+    // Three months, both hops, two legs each; Sam keeps 5.00 a month; every leg says which it is.
+    let proj = &out[5]["result"];
+    let occ = proj["occurrences"].as_array().unwrap();
+    assert_eq!(occ.iter().filter(|o| o["series_id"] == 1).count(), 6);
+    assert_eq!(occ.iter().filter(|o| o["series_id"] == 2).count(), 6);
+    assert!(occ.iter().all(|o| o["chain_len"] == 2), "{occ:?}");
+    assert!(occ.iter().any(|o| o["series_id"] == 2 && o["chain_seq"] == 1));
+    let closing = |p: &serde_json::Value, id: i64| p["balances"].as_array().unwrap().iter()
+        .filter(|b| b["account_id"] == id).last().map(|b| b["balance_minor"].as_i64().unwrap());
+    assert_eq!((closing(proj, 1), closing(proj, 2), closing(proj, 3)), (Some(-30000), Some(1500), Some(28500)));
+
+    // The brief sees one commitment, leaving Current, not two.
+    let commitments = out[6]["result"]["commitments"]["series"].as_array().unwrap();
+    let ours: Vec<&serde_json::Value> = commitments.iter().filter(|c| c["description"] == "stake via Sam").collect();
+    assert_eq!(ours.len(), 1, "{commitments:?}");
+    assert_eq!(ours[0]["account"], "Current");
+    assert_eq!(ours[0]["monthly_equivalent_minor"], -10000);
+    assert_eq!(out[6]["result"]["commitments"]["monthly_equivalent_by_currency"][0]["amount_minor"], -10000,
+               "the household total counts the stake once");
+
+    // Ending and renaming hop 2 did it to hop 1 as well.
+    assert_eq!(out[7]["result"]["applied_to"], serde_json::json!([1, 2]));
+    let rows = out[9]["result"].as_array().unwrap();
+    assert!(rows.iter().all(|r| r["until_on"] == "2026-11-30" && r["description"] == "bets via Sam"), "{rows:?}");
+
+    // Skipping October on hop 2 skipped it on hop 1; November survives.
+    let occ = out[11]["result"]["occurrences"].as_array().unwrap();
+    assert!(!occ.iter().any(|o| o["occurrence_on"] == "2026-10-01"), "{occ:?}");
+    assert_eq!(occ.iter().filter(|o| o["occurrence_on"] == "2026-11-01").count(), 4);
+    assert_eq!(occ.len(), 4, "the end date holds on both hops: {occ:?}");
+
+    // Re-pricing hop 1 to 120.00 carries the +20.00 through: hop 2 becomes 115.00, the fee stays.
+    let occ = out[13]["result"]["occurrences"].as_array().unwrap();
+    let primary = |series: i64, on: &str, account: i64| occ.iter()
+        .find(|o| o["series_id"] == series && o["occurrence_on"] == on && o["account_id"] == account)
+        .map(|o| o["amount_minor"].as_i64().unwrap());
+    assert_eq!(primary(1, "2026-11-01", 1), Some(-12000));
+    assert_eq!(primary(2, "2026-11-01", 2), Some(-11500));
+    assert_eq!(primary(2, "2026-11-01", 3), Some(11500));
+
+    // Clearing from hop 2 cleared hop 1 too.
+    assert_eq!(out[14]["result"]["cleared"], 2);
+    let occ = out[15]["result"]["occurrences"].as_array().unwrap();
+    let primary = |series: i64, on: &str, account: i64| occ.iter()
+        .find(|o| o["series_id"] == series && o["occurrence_on"] == on && o["account_id"] == account)
+        .map(|o| o["amount_minor"].as_i64().unwrap());
+    assert_eq!((primary(1, "2026-11-01", 1), primary(2, "2026-11-01", 2)), (Some(-10000), Some(-9500)));
+}
+
+/// An amount override is a magnitude on the primary leg in the template's own direction: edited
+/// from the receiving account's side it used to flip the payment into income.
+#[test]
+fn an_amount_override_keeps_the_direction_whichever_leg_it_came_from() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Rent","kind":"expense"}}"#,
+        r#"{"id":3,"method":"series.create","params":{"description":"Rent","rrule":"FREQ=MONTHLY;BYMONTHDAY=1",
+             "dtstart":"2026-10-01","postings":[{"account_id":1,"amount_minor":-90000,"role":"primary"},
+                                                {"account_id":2,"amount_minor":90000,"role":"balancing"}]}}"#,
+        // +95000 is what the editor sends when the Rent leg (a positive one) was the row clicked.
+        r#"{"id":4,"method":"series.override","params":{"series_id":1,"occurrence_on":"2026-10-01","action":"amend","amount_minor":95000}}"#,
+        r#"{"id":5,"method":"forecast.project","params":{"as_of":"2026-09-30","horizon":"2026-10-31"}}"#,
+    ]);
+    for r in &out {
+        assert!(err_of(r).is_none(), "no step may fail: {r}");
+    }
+    let occ = out[4]["result"]["occurrences"].as_array().unwrap();
+    let on_current = occ.iter().find(|o| o["account_id"] == 1).unwrap()["amount_minor"].as_i64().unwrap();
+    assert_eq!(on_current, -95000, "rent still leaves the current account: {occ:?}");
+}
+
+/// Cancelling any hop of a chain in a scenario cancels the chain: the hops are one commitment.
+#[test]
+fn cancelling_one_hop_of_a_recurring_chain_in_a_scenario_cancels_the_chain() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Sam","kind":"asset"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"Bookmaker","kind":"asset"}}"#,
+        r#"{"id":4,"method":"series.create_chain","params":{"description":"stake via Sam",
+             "rrule":"FREQ=MONTHLY;BYMONTHDAY=1","dtstart":"2026-10-01","from_account":1,
+             "hops":[{"to_account":2,"amount_minor":10000},{"to_account":3,"amount_minor":10000}]}}"#,
+        r#"{"id":5,"method":"scenario.create","params":{"name":"no bets"}}"#,
+        // Cancelling by the second leg, or replacing a leg, is refused: a chain is cancelled whole,
+        // from its first leg.
+        r#"{"id":6,"method":"series.create","params":{"description":"cancelled: stake via Sam",
+             "rrule":"FREQ=MONTHLY;BYMONTHDAY=1","dtstart":"2026-10-01","scenario_id":1,"supersedes_id":2,"postings":[]}}"#,
+        r#"{"id":7,"method":"series.create","params":{"description":"cheaper leg","rrule":"FREQ=MONTHLY;BYMONTHDAY=1",
+             "dtstart":"2026-10-01","scenario_id":1,"supersedes_id":1,
+             "postings":[{"account_id":1,"amount_minor":-5000,"role":"primary"},{"account_id":2,"amount_minor":5000,"role":"balancing"}]}}"#,
+        r#"{"id":8,"method":"series.create","params":{"description":"cancelled: stake via Sam",
+             "rrule":"FREQ=MONTHLY;BYMONTHDAY=1","dtstart":"2026-10-01","scenario_id":1,"supersedes_id":1,"postings":[]}}"#,
+        r#"{"id":9,"method":"forecast.project","params":{"as_of":"2026-09-30","horizon":"2026-12-31","scenarios":[1]}}"#,
+        r#"{"id":10,"method":"forecast.project","params":{"as_of":"2026-09-30","horizon":"2026-12-31"}}"#,
+        r#"{"id":11,"method":"scenario.list"}"#,
+    ]);
+    assert!(err_of(&out[5]).unwrap().contains("first leg"), "{}", out[5]);
+    assert!(err_of(&out[6]).unwrap().contains("cancelled"), "{}", out[6]);
+    for r in [&out[7], &out[8], &out[9], &out[10]] {
+        assert!(err_of(r).is_none(), "no step may fail: {r}");
+    }
+    let with = out[8]["result"]["occurrences"].as_array().unwrap();
+    assert!(!with.iter().any(|o| o["series_id"] == 1 || o["series_id"] == 2), "both hops must go: {with:?}");
+    let without = out[9]["result"]["occurrences"].as_array().unwrap();
+    assert_eq!(without.iter().filter(|o| o["series_id"] == 1 || o["series_id"] == 2).count(), 12);
+    let scenario = &out[10]["result"][0];
+    assert_eq!(scenario["supersedes_count"], 1, "{scenario}");
+}
+
+#[test]
+fn a_recurring_chain_is_refused_whole_when_wrong() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Sam","kind":"asset"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"Groceries","kind":"expense"}}"#,
+        r#"{"id":4,"method":"account.create","params":{"name":"Euro wallet","kind":"asset","currency":"EUR"}}"#,
+        r#"{"id":5,"method":"series.create_chain","params":{"description":"x","rrule":"FREQ=MONTHLY;BYMONTHDAY=1",
+             "dtstart":"2026-10-01","from_account":1,"hops":[{"to_account":2,"amount_minor":100}]}}"#,
+        r#"{"id":6,"method":"series.create_chain","params":{"description":"x","rrule":"FREQ=MONTHLY;BYMONTHDAY=1",
+             "dtstart":"2026-10-01","from_account":1,"hops":[{"to_account":2,"amount_minor":100},{"to_account":2,"amount_minor":100}]}}"#,
+        r#"{"id":7,"method":"series.create_chain","params":{"description":"x","rrule":"FREQ=MONTHLY;BYMONTHDAY=1",
+             "dtstart":"2026-10-01","from_account":1,"hops":[{"to_account":3,"amount_minor":100},{"to_account":2,"amount_minor":100}]}}"#,
+        r#"{"id":8,"method":"series.create_chain","params":{"description":"x","rrule":"FREQ=MONTHLY;BYMONTHDAY=1",
+             "dtstart":"2026-10-01","from_account":1,"hops":[{"to_account":2,"amount_minor":100},{"to_account":4,"amount_minor":100}]}}"#,
+        r#"{"id":9,"method":"series.create_chain","params":{"description":"x","rrule":"FREQ=NOPE",
+             "dtstart":"2026-10-01","from_account":1,"hops":[{"to_account":2,"amount_minor":100},{"to_account":1,"amount_minor":100}]}}"#,
+        r#"{"id":10,"method":"series.create_chain","params":{"description":"x","rrule":"FREQ=MONTHLY;BYMONTHDAY=1",
+             "dtstart":"2026-10-01","from_account":1,"hops":[{"to_account":2,"amount_minor":100},{"to_account":1,"amount_minor":0}]}}"#,
+        r#"{"id":11,"method":"series.list"}"#,
+    ]);
+    for (i, reason) in [(4, "stop"), (5, "itself"), (6, "pass through"), (7, "one currency"), (9, "positive")] {
+        let msg = err_of(&out[i]).unwrap_or_else(|| panic!("step {} must be refused: {}", i + 1, out[i]));
+        assert!(msg.contains(reason), "the error must say why: {msg}");
+    }
+    assert_eq!(out[8]["error"]["code"], "bad_rule", "{}", out[8]);
+    assert_eq!(out[10]["result"].as_array().unwrap().len(), 0, "nothing was created");
+}

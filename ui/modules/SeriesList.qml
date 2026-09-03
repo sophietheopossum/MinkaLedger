@@ -17,6 +17,10 @@ import "../services"
 // Renaming is not retrospective either. The description here is what the NEXT projection will be
 // called; occurrences already written keep the wording they were written with, because that copy
 // is the record of what happened and may already have been reconciled against a statement.
+//
+// A recurring chain is several rows here, one per leg, marked ⛓ and indented after the first. It
+// is bounded and renamed as one, because its legs are one commitment; the core does that, the row
+// only says so.
 Rectangle {
     id: root
 
@@ -142,9 +146,14 @@ Rectangle {
                        ? Theme.surfaceRaised : "transparent"
                 MouseArea { id: shov; anchors.fill: parent; hoverEnabled: true }
 
+                readonly property bool chained: srow.modelData.chain_id !== null
+                                                && srow.modelData.chain_id !== undefined
+                readonly property int legs: srow.chained ? srow.modelData.chain_len : 1
+
                 Row {
                     anchors.fill: parent
-                    anchors.leftMargin: 6
+                    // Later legs sit in from the edge, so the eye reads "belongs to the one above".
+                    anchors.leftMargin: srow.chained && srow.modelData.chain_seq > 0 ? 18 : 6
                     anchors.rightMargin: 6
                     spacing: 8
 
@@ -164,14 +173,34 @@ Rectangle {
                             font.family: Theme.fontFamily
                             font.pixelSize: Theme.fontSize - 2
                         }
-                        Text {
+                        Row {
                             width: parent.width
-                            elide: Text.ElideRight
-                            text: root.describe(srow.modelData.rrule)
-                                + " · from " + srow.modelData.dtstart
-                            color: Theme.textFaint
-                            font.family: Theme.fontFamily
-                            font.pixelSize: Theme.fontSize - 4
+                            spacing: 4
+                            Text {
+                                id: legMark
+                                visible: srow.chained
+                                text: "⛓ " + (srow.modelData.chain_seq + 1) + "/" + srow.legs
+                                color: Theme.purple
+                                font.family: Theme.monoFamily
+                                font.pixelSize: Theme.fontSize - 4
+                            }
+                            Text {
+                                width: parent.width - (legMark.visible ? legMark.width + 4 : 0)
+                                elide: Text.ElideRight
+                                // While a chain's end is being set, the line says what the date
+                                // will do, because the field beside it has no room to.
+                                text: srow.ending && srow.chained
+                                      ? "ends all " + srow.legs + " legs together"
+                                      : !srow.chained
+                                      ? root.describe(srow.modelData.rrule) + " · from " + srow.modelData.dtstart
+                                      : srow.modelData.from_account + " → " + srow.modelData.to_account + " · "
+                                        + (srow.modelData.chain_seq === 0
+                                           ? root.describe(srow.modelData.rrule) + " · from " + srow.modelData.dtstart
+                                           : "same rule")
+                                color: Theme.textFaint
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 4
+                            }
                         }
                     }
                     // In the name's own place, so it is edited where it is read.
@@ -180,7 +209,7 @@ Rectangle {
                         visible: srow.naming
                         width: parent.width - 420
                         anchors.verticalCenter: parent.verticalCenter
-                        label: "description"
+                        label: srow.chained ? "description, all " + srow.legs + " legs" : "description"
                         placeholder: "what this payment is"
                         onAccepted: root.rename(srow.modelData.id, nameEdit.text)
                     }

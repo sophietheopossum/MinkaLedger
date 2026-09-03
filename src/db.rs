@@ -15,6 +15,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_txn_link.sql"),
     include_str!("../migrations/0003_role_account_pins.sql"),
+    include_str!("../migrations/0004_series_chain.sql"),
 ];
 
 pub fn current_version() -> i64 {
@@ -68,7 +69,7 @@ fn read_version(conn: &Connection) -> i64 {
     .unwrap_or(0)
 }
 
-fn migrate(conn: &Connection) -> Result<(), DbError> {
+pub(crate) fn migrate(conn: &Connection) -> Result<(), DbError> {
     let found = read_version(conn);
     let known = current_version();
     if found > known {

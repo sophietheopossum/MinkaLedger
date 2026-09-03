@@ -175,6 +175,12 @@ fn commitments(
     // and summing both would net every commitment to exactly zero.
     let mut primary: HashMap<i64, i64> = HashMap::new();
     for s in &snap.series {
+        // A recurring chain is one commitment spread over several series; the money leaves the
+        // household once, on the first hop. Counting every hop would report a £100 stake routed
+        // through a friend as £200 of outgoings.
+        if s.chain_seq.is_some_and(|q| q > 0) {
+            continue;
+        }
         if let Some(p) = s.postings.iter().find(|p| p.role == "primary") {
             primary.insert(s.id, p.account_id);
         }
@@ -239,7 +245,7 @@ fn commitments(
     Ok(serde_json::json!({
         "derivation": format!(
             "every non-scenario series expanded from {as_of} to {year_end} through the projection \
-             engine, primary leg only, summed and divided by 12"),
+             engine, primary leg only, a chain counted once by its first hop, summed and divided by 12"),
         "window": { "from": as_of.to_string(), "to": year_end.to_string() },
         "series": rows,
         "monthly_equivalent_by_currency": monthly_by_currency.iter().map(|(c, v)| {
@@ -843,6 +849,9 @@ pub fn schema(conn: &Connection) -> Result<serde_json::Value, AnalysisError> {
             "Aggregate in SQL. SUM(), GROUP BY and strftime('%Y-%m', on_date) are exact here and \
              are not exact when done by reading rows.",
             "The three v_check_* views must return zero rows. If any returns a row, stop.",
+            "A recurring chain is several series rows sharing chain_id, one per leg; when summing \
+             commitments count only chain_seq = 0 (or NULL), or the same money is counted once \
+             per leg.",
         ],
         "objects": objects,
     }))
@@ -914,7 +923,7 @@ mod tests {
     fn book() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        conn.execute_batch(include_str!("../migrations/0001_init.sql")).unwrap();
+        crate::db::migrate(&conn).unwrap();
         conn.execute_batch(
             "INSERT INTO account(id,name,kind,currency) VALUES
                (1,'Current','asset','GBP'), (2,'Salary','income','GBP'),
@@ -1115,7 +1124,7 @@ mod tests {
     fn a_thin_book_says_it_has_no_baseline() {
         let mut c = Connection::open_in_memory().unwrap();
         c.pragma_update(None, "foreign_keys", "ON").unwrap();
-        c.execute_batch(include_str!("../migrations/0001_init.sql")).unwrap();
+        crate::db::migrate(&c).unwrap();
         c.execute_batch(
             "INSERT INTO account(id,name,kind,currency) VALUES
                (1,'Current','asset','GBP'), (3,'Groceries','expense','GBP');",
@@ -1137,7 +1146,7 @@ mod tests {
     fn an_empty_book_is_called_empty_rather_than_reported_as_zeroes() {
         let mut c = Connection::open_in_memory().unwrap();
         c.pragma_update(None, "foreign_keys", "ON").unwrap();
-        c.execute_batch(include_str!("../migrations/0001_init.sql")).unwrap();
+        crate::db::migrate(&c).unwrap();
         let b = brief(&c, &opts("2026-08-15")).unwrap();
         let fatal = b["limits"].as_array().unwrap().iter()
             .find(|l| l["severity"] == "fatal").unwrap();

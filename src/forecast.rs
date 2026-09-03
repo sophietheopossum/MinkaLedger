@@ -33,6 +33,10 @@ pub struct Series {
     pub scenario_id: Option<i64>,
     /// A scenario series that suppresses a baseline one -- "what if I cancel Netflix".
     pub supersedes_id: Option<i64>,
+    /// Set on every hop of a recurring chain: the id of the first hop's series, and the hop's
+    /// position from 0. A chain is one commitment expressed as several series; see 0004.
+    pub chain_id: Option<i64>,
+    pub chain_seq: Option<i64>,
     pub postings: Vec<SeriesPosting>,
 }
 
@@ -110,6 +114,10 @@ pub struct Occurrence {
     pub account: String,
     pub currency: String,
     pub amount_minor: Minor,
+    /// Which hop of a recurring chain this is, and how many there are; both absent for a plain
+    /// series. Carried so the occurrence list and editor can say "leg 2 of 3".
+    pub chain_seq: Option<i64>,
+    pub chain_len: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -152,6 +160,21 @@ pub fn project<R: Recurrence>(
         .filter_map(|s| s.supersedes_id)
         .collect();
 
+    // Cancelling any hop of a chain cancels the chain: the hops are one commitment, and a chain
+    // with its first hop gone would show the intermediate account paying out of its own pocket.
+    let suppressed_chains: HashSet<i64> = snap
+        .series
+        .iter()
+        .filter(|s| suppressed.contains(&s.id))
+        .filter_map(|s| s.chain_id)
+        .collect();
+    let mut chain_len: HashMap<i64, i64> = HashMap::new();
+    for s in &snap.series {
+        if let Some(c) = s.chain_id {
+            *chain_len.entry(c).or_insert(0) += 1;
+        }
+    }
+
     let mut occurrences: Vec<Occurrence> = Vec::new();
 
     for s in &snap.series {
@@ -159,7 +182,7 @@ pub fn project<R: Recurrence>(
             Some(id) if !active.contains(&id) => continue, // an inactive scenario's series
             _ => {}
         }
-        if suppressed.contains(&s.id) {
+        if suppressed.contains(&s.id) || s.chain_id.is_some_and(|c| suppressed_chains.contains(&c)) {
             continue;
         }
 
@@ -203,6 +226,8 @@ pub fn project<R: Recurrence>(
                         .unwrap_or_default(),
                     currency: p.currency.clone(),
                     amount_minor: amount,
+                    chain_seq: s.chain_seq,
+                    chain_len: s.chain_id.map(|c| chain_len[&c]),
                 });
             }
         }
@@ -315,6 +340,8 @@ pub fn project<R: Recurrence>(
                                 account: snap.account_name.get(&acct).cloned().unwrap_or_default(),
                                 currency: cur.clone(),
                                 amount_minor: amt,
+                            chain_seq: None,
+                            chain_len: None,
                             });
                         }
                     }
@@ -366,6 +393,8 @@ pub fn project<R: Recurrence>(
                             account: snap.account_name.get(&acct).cloned().unwrap_or_default(),
                             currency: cur.clone(),
                             amount_minor: amt,
+                            chain_seq: None,
+                            chain_len: None,
                         });
                     }
                 }
@@ -428,6 +457,8 @@ mod tests {
             weekend_rule: "none".into(),
             scenario_id: None,
             supersedes_id: None,
+            chain_id: None,
+            chain_seq: None,
             postings: vec![
                 SeriesPosting { account_id: 1, currency: "GBP".into(), amount_minor: 250_000, role: "primary".into() },
                 SeriesPosting { account_id: 2, currency: "GBP".into(), amount_minor: -250_000, role: "balancing".into() },
@@ -442,6 +473,8 @@ mod tests {
             weekend_rule: "none".into(),
             scenario_id: None,
             supersedes_id: None,
+            chain_id: None,
+            chain_seq: None,
             postings: vec![
                 SeriesPosting { account_id: 1, currency: "GBP".into(), amount_minor: -90_000, role: "primary".into() },
                 SeriesPosting { account_id: 3, currency: "GBP".into(), amount_minor: 90_000, role: "balancing".into() },
@@ -540,6 +573,8 @@ mod tests {
             weekend_rule: "none".into(),
             scenario_id: Some(1),
             supersedes_id: None,
+            chain_id: None,
+            chain_seq: None,
             postings: vec![
                 SeriesPosting { account_id: 1, currency: "GBP".into(), amount_minor: -4_000, role: "primary".into() },
                 SeriesPosting { account_id: 3, currency: "GBP".into(), amount_minor: 4_000, role: "balancing".into() },
@@ -567,6 +602,8 @@ mod tests {
             weekend_rule: "none".into(),
             scenario_id: Some(2),
             supersedes_id: Some(11),
+            chain_id: None,
+            chain_seq: None,
             postings: vec![],
         });
         let p = run(&s, "2026-08-01", "2026-10-31", &[2]);
@@ -778,7 +815,7 @@ pub mod load {
 
         let mut st = conn.prepare(
             "SELECT id, description, rrule, dtstart, until_on, weekend_rule, scenario_id,
-                    supersedes_id FROM series",
+                    supersedes_id, chain_id, chain_seq FROM series",
         )?;
         let heads: Vec<Series> = st
             .query_map([], |r| {
@@ -791,6 +828,8 @@ pub mod load {
                     weekend_rule: r.get(5)?,
                     scenario_id: r.get(6)?,
                     supersedes_id: r.get(7)?,
+                    chain_id: r.get(8)?,
+                    chain_seq: r.get(9)?,
                     postings: Vec::new(),
                 })
             })?

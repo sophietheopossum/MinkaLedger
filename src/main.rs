@@ -205,6 +205,31 @@ fn bad(msg: &str) -> Error {
     Error { code: "bad_params", message: msg.to_string() }
 }
 
+fn sql_err(e: rusqlite::Error) -> Error {
+    Error { code: "sql", message: e.to_string() }
+}
+
+/// Every series that must move with `id`: itself, and for a hop of a recurring chain every other
+/// hop of that chain, in hop order. Empty when the series does not exist. A chain's hops share
+/// description, rule, dates and scenario by construction (migrations/0004_series_chain.sql), so
+/// the methods that change those apply to the whole family.
+fn series_family(conn: &rusqlite::Connection, id: i64) -> Result<Vec<i64>, Error> {
+    let mut st = conn
+        .prepare(
+            "SELECT id FROM series
+              WHERE id = ?1 OR chain_id = (SELECT chain_id FROM series WHERE id = ?1)
+              ORDER BY chain_seq, id",
+        )
+        .map_err(sql_err)?;
+    st.query_map([id], |r| r.get::<_, i64>(0))
+        .and_then(|m| m.collect::<Result<Vec<_>, _>>())
+        .map_err(sql_err)
+}
+
+fn id_list(ids: &[i64]) -> String {
+    ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+}
+
 fn dispatch(
     conn: &mut rusqlite::Connection,
     method: &str,
@@ -895,6 +920,24 @@ fn dispatch(
             let scenario = params.get("scenario_id").and_then(|v| v.as_i64());
             let supersedes = params.get("supersedes_id").and_then(|v| v.as_i64());
             let postings = params.get("postings").and_then(|v| v.as_array()).ok_or_else(|| bad("postings"))?.clone();
+            // Superseding any leg of a recurring chain suppresses the whole chain in the
+            // projection, so it can only mean "cancel", and only from the first leg: a replacement
+            // for one leg would leave the intermediate paying the rest out of its own pocket.
+            if let Some(target) = supersedes {
+                let seq: Option<Option<i64>> = conn
+                    .query_row("SELECT chain_seq FROM series WHERE id = ?1", [target], |r| r.get(0))
+                    .ok();
+                if let Some(Some(seq)) = seq {
+                    if seq > 0 {
+                        return Err(bad("cancel a recurring chain by its first leg"));
+                    }
+                    if !postings.is_empty() {
+                        return Err(bad(
+                            "a recurring chain can only be cancelled in a scenario, not replaced leg by leg",
+                        ));
+                    }
+                }
+            }
 
             let tx = conn.transaction().map_err(|e| Error { code: "sql", message: e.to_string() })?;
             tx.execute(
@@ -920,6 +963,128 @@ fn dispatch(
             Ok(serde_json::json!({ "id": sid }))
         }
 
+        // A recurring chain: money that passes through somewhere on the way, every time. One
+        // series PER HOP so each leg keeps its own amount and its own slot for a real payment to
+        // claim, all sharing the description and the rule, tied together by chain_id and created
+        // whole or not at all. Each hop's PRIMARY posting is the account the money LEAVES, which is
+        // what a statement line for that account will one day be matched against.
+        "series.create_chain" => {
+            let desc = params
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .ok_or_else(|| bad("description"))?;
+            let rrule = params.get("rrule").and_then(|v| v.as_str()).ok_or_else(|| bad("rrule"))?;
+            let dtstart = params.get("dtstart").and_then(|v| v.as_str()).ok_or_else(|| bad("dtstart"))?;
+            let start = chrono::NaiveDate::parse_from_str(dtstart, "%Y-%m-%d")
+                .map_err(|_| bad("dtstart must be YYYY-MM-DD"))?;
+            let until = params.get("until_on").and_then(|v| v.as_str());
+            if let Some(u) = until {
+                let end = chrono::NaiveDate::parse_from_str(u, "%Y-%m-%d")
+                    .map_err(|_| bad("until_on must be YYYY-MM-DD"))?;
+                if end < start {
+                    return Err(Error {
+                        code: "bad_params",
+                        message: format!("it would end on {u}, before it starts on {dtstart}"),
+                    });
+                }
+            }
+            let weekend = params.get("weekend_rule").and_then(|v| v.as_str()).unwrap_or("none");
+            let scenario = params.get("scenario_id").and_then(|v| v.as_i64());
+            let from = params.get("from_account").and_then(|v| v.as_i64()).ok_or_else(|| bad("from_account"))?;
+            let hops = params.get("hops").and_then(|v| v.as_array()).ok_or_else(|| bad("hops"))?;
+            let mut route = vec![from];
+            let mut amounts: Vec<i64> = Vec::with_capacity(hops.len());
+            for h in hops {
+                route.push(h.get("to_account").and_then(|v| v.as_i64()).ok_or_else(|| bad("to_account"))?);
+                amounts.push(h.get("amount_minor").and_then(|v| v.as_i64()).ok_or_else(|| bad("amount_minor"))?);
+            }
+            let refuse = |m: String| Error { code: "bad_chain", message: m };
+            if hops.len() < 2 {
+                return Err(refuse("a chain needs at least one stop between from and to".to_string()));
+            }
+            if let Some(a) = amounts.iter().find(|&&a| a <= 0) {
+                return Err(refuse(format!("every leg of a chain moves a positive amount, and {a} is not one")));
+            }
+            if route.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(refuse("a chain cannot move money from an account to itself".to_string()));
+            }
+            // The rule has to expand, or every hop would fail together in the next forecast.
+            recur::RRuleCrate
+                .expand(rrule, start, None, start, start + chrono::Duration::days(366 * 2))
+                .map_err(|e| Error { code: "bad_rule", message: e.to_string() })?;
+
+            let tx = conn.transaction().map_err(sql_err)?;
+            // (name, kind, currency) for every account on the route, refusing the unknown and the
+            // system ones with the same words a single payment uses.
+            let mut info: Vec<(String, String, String)> = Vec::with_capacity(route.len());
+            for &id in &route {
+                let (name, kind, cur, system): (String, String, String, i64) = tx
+                    .query_row(
+                        "SELECT name, kind, currency, system FROM account WHERE id = ?1",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .map_err(|_| Error { code: "no_such_account", message: format!("no such account: {id}") })?;
+                if system == 1 {
+                    return Err(Error {
+                        code: "system_account",
+                        message: format!("{name} is a system account -- only the core may post to it"),
+                    });
+                }
+                info.push((name, kind, cur));
+            }
+            if let Some(i) = (1..info.len()).find(|&i| info[i].2 != info[0].2) {
+                return Err(refuse(format!(
+                    "a chain stays in one currency: {} holds {} but {} holds {} -- record that leg as a conversion",
+                    info[0].0, info[0].2, info[i].0, info[i].2
+                )));
+            }
+            for (name, kind, _) in &info[1..info.len() - 1] {
+                if kind != "asset" && kind != "liability" {
+                    return Err(refuse(format!(
+                        "money can only pass through an asset or liability account: {name} is an {kind} account"
+                    )));
+                }
+            }
+
+            let mut ids: Vec<i64> = Vec::with_capacity(hops.len());
+            let mut head: Option<i64> = None;
+            for (seq, (pair, &amount)) in route.windows(2).zip(&amounts).enumerate() {
+                tx.execute(
+                    "INSERT INTO series(description, rrule, dtstart, until_on, weekend_rule, scenario_id,
+                                        chain_id, chain_seq)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    rusqlite::params![desc, rrule, dtstart, until, weekend, scenario, head, head.map(|_| seq as i64)],
+                )
+                .map_err(sql_err)?;
+                let sid = tx.last_insert_rowid();
+                if head.is_none() {
+                    // The first hop points at itself, so every hop answers "which chain" the same way.
+                    tx.execute("UPDATE series SET chain_id = ?1, chain_seq = 0 WHERE id = ?1", [sid])
+                        .map_err(sql_err)?;
+                    head = Some(sid);
+                }
+                let cur = &info[seq].2;
+                tx.execute(
+                    "INSERT INTO series_posting(series_id, account_id, currency, amount_minor, role)
+                     VALUES(?1,?2,?3,?4,'primary')",
+                    rusqlite::params![sid, pair[0], cur, -amount],
+                )
+                .map_err(sql_err)?;
+                tx.execute(
+                    "INSERT INTO series_posting(series_id, account_id, currency, amount_minor, role)
+                     VALUES(?1,?2,?3,?4,'balancing')",
+                    rusqlite::params![sid, pair[1], cur, amount],
+                )
+                .map_err(sql_err)?;
+                ids.push(sid);
+            }
+            tx.commit().map_err(sql_err)?;
+            Ok(serde_json::json!({ "ids": ids, "chain_id": head }))
+        }
+
         "series.list" => {
             let mut stmt = conn.prepare(
                 "SELECT s.id, s.description, s.rrule, s.dtstart, s.until_on, s.weekend_rule, s.scenario_id,
@@ -936,10 +1101,19 @@ fn dispatch(
                         -- The currency travels with the amount: a series is denominated in its
                         -- primary account's currency and a caller must not assume 2dp GBP.
                         (SELECT sp.currency FROM series_posting sp
-                          WHERE sp.series_id = s.id AND sp.role = 'primary')
+                          WHERE sp.series_id = s.id AND sp.role = 'primary'),
+                        -- A hop of a recurring chain says which chain and where in it, and every
+                        -- row says where its money goes, so a list can read \"Current -> Sam\".
+                        s.chain_id, s.chain_seq,
+                        (SELECT COUNT(*) FROM series c WHERE c.chain_id = s.chain_id),
+                        (SELECT a.name FROM series_posting sp JOIN account a ON a.id = sp.account_id
+                          WHERE sp.series_id = s.id AND sp.role = 'primary'),
+                        (SELECT a.name FROM series_posting sp JOIN account a ON a.id = sp.account_id
+                          WHERE sp.series_id = s.id AND sp.role = 'balancing')
                    FROM series s ORDER BY s.id",
             ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
             let rows: Vec<serde_json::Value> = stmt.query_map([], |r| {
+                let chain_id = r.get::<_, Option<i64>>(12)?;
                 Ok(serde_json::json!({
                     "id": r.get::<_, i64>(0)?,
                     "description": r.get::<_, String>(1)?,
@@ -953,6 +1127,11 @@ fn dispatch(
                     "supersedes": r.get::<_, Option<String>>(9)?,
                     "amount_minor": r.get::<_, Option<i64>>(10)?,
                     "currency": r.get::<_, Option<String>>(11)?,
+                    "chain_id": chain_id,
+                    "chain_seq": r.get::<_, Option<i64>>(13)?,
+                    "chain_len": chain_id.map(|_| r.get::<_, i64>(14)).transpose()?,
+                    "from_account": r.get::<_, Option<String>>(15)?,
+                    "to_account": r.get::<_, Option<String>>(16)?,
                 }))
             }).and_then(|m| m.collect()).map_err(|e| Error { code: "sql", message: e.to_string() })?;
             Ok(serde_json::Value::Array(rows))
@@ -979,16 +1158,18 @@ fn dispatch(
             if desc.is_empty() {
                 return Err(bad("description must not be empty"));
             }
-            let n = conn
-                .execute(
-                    "UPDATE series SET description = ?2 WHERE id = ?1",
-                    rusqlite::params![id, desc],
-                )
-                .map_err(|e| Error { code: "sql", message: e.to_string() })?;
-            if n == 0 {
+            // A chain's hops share their description by construction, so renaming any hop
+            // renames the chain.
+            let family = series_family(conn, id)?;
+            if family.is_empty() {
                 return Err(Error { code: "not_found", message: format!("no such series: {id}") });
             }
-            Ok(serde_json::json!({ "id": id, "description": desc }))
+            conn.execute(
+                &format!("UPDATE series SET description = ?1 WHERE id IN ({})", id_list(&family)),
+                rusqlite::params![desc],
+            )
+            .map_err(sql_err)?;
+            Ok(serde_json::json!({ "id": id, "description": desc, "applied_to": family }))
         }
 
         // Bound a series that is already running, or unbound it again.
@@ -1017,12 +1198,16 @@ fn dispatch(
                     });
                 }
             }
+            // Every hop of a chain starts on the same day, so the check above holds for all of
+            // them, and a chain ends as one: a hop bounded alone would leave money arriving at
+            // the intermediate account with nowhere to go.
+            let family = series_family(conn, id)?;
             conn.execute(
-                "UPDATE series SET until_on = ?2 WHERE id = ?1",
-                rusqlite::params![id, until],
+                &format!("UPDATE series SET until_on = ?1 WHERE id IN ({})", id_list(&family)),
+                rusqlite::params![until],
             )
-            .map_err(|e| Error { code: "sql", message: e.to_string() })?;
-            Ok(serde_json::json!({ "id": id, "until_on": until }))
+            .map_err(sql_err)?;
+            Ok(serde_json::json!({ "id": id, "until_on": until, "applied_to": family }))
         }
 
         // req 4: alter or skip ONE occurrence
@@ -1033,25 +1218,82 @@ fn dispatch(
             let moved = params.get("moved_to").and_then(|v| v.as_str());
             let amount = params.get("amount_minor").and_then(|v| v.as_i64());
             let desc = params.get("description").and_then(|v| v.as_str());
-            conn.execute(
-                "INSERT INTO series_override(series_id, occurrence_on, action, moved_to, amount_minor, description)
-                 VALUES(?1,?2,?3,?4,?5,?6)
-                 ON CONFLICT(series_id, occurrence_on) DO UPDATE SET
-                   action=excluded.action, moved_to=excluded.moved_to,
-                   amount_minor=excluded.amount_minor, description=excluded.description",
-                rusqlite::params![sid, on, action, moved, amount, desc],
-            ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
-            Ok(serde_json::json!({ "series_id": sid, "occurrence_on": on, "action": action }))
+            // An override is a property of the occurrence, and for a chain the occurrence is all
+            // of its hops: a skipped month is skipped end to end, a moved one moves end to end.
+            let family = series_family(conn, sid)?;
+            if family.is_empty() {
+                return Err(Error { code: "not_found", message: format!("no such series: {sid}") });
+            }
+            // The amount is the MAGNITUDE on the primary leg, in the direction the template
+            // already has. The editor sends it with the sign of whichever leg was clicked, and a
+            // rent edited from the Rent account's side must not turn into income. Through a chain
+            // it travels as a delta from the hop it was set on, so a fee stays a fee.
+            let mut primaries: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+            {
+                let mut st = conn
+                    .prepare(&format!(
+                        "SELECT series_id, amount_minor FROM series_posting
+                          WHERE role = 'primary' AND series_id IN ({})",
+                        id_list(&family)
+                    ))
+                    .map_err(sql_err)?;
+                for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).map_err(sql_err)? {
+                    let (k, v) = row.map_err(sql_err)?;
+                    primaries.insert(k, v);
+                }
+            }
+            let tx = conn.transaction().map_err(sql_err)?;
+            for (leg, &member) in family.iter().enumerate() {
+                let amount_here = match amount {
+                    None => None,
+                    Some(a) => {
+                        let clicked = primaries.get(&sid).copied().unwrap_or(a);
+                        let mine = primaries.get(&member).copied().unwrap_or(clicked);
+                        let magnitude = mine.abs() + (a.abs() - clicked.abs());
+                        // Only a chain can get here: a plain series' magnitude is |a| itself.
+                        if magnitude < 0 {
+                            return Err(Error {
+                                code: "bad_params",
+                                message: format!(
+                                    "that would take leg {} of the chain below zero",
+                                    leg + 1
+                                ),
+                            });
+                        }
+                        Some(if mine < 0 { -magnitude } else { magnitude })
+                    }
+                };
+                tx.execute(
+                    "INSERT INTO series_override(series_id, occurrence_on, action, moved_to, amount_minor, description)
+                     VALUES(?1,?2,?3,?4,?5,?6)
+                     ON CONFLICT(series_id, occurrence_on) DO UPDATE SET
+                       action=excluded.action, moved_to=excluded.moved_to,
+                       amount_minor=excluded.amount_minor, description=excluded.description",
+                    rusqlite::params![member, on, action, moved, amount_here, desc],
+                )
+                .map_err(sql_err)?;
+            }
+            tx.commit().map_err(sql_err)?;
+            Ok(serde_json::json!({ "series_id": sid, "occurrence_on": on, "action": action, "applied_to": family }))
         }
 
         "series.clear_override" => {
             let sid = params.get("series_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("series_id"))?;
             let on = params.get("occurrence_on").and_then(|v| v.as_str()).ok_or_else(|| bad("occurrence_on"))?;
-            let n = conn.execute(
-                "DELETE FROM series_override WHERE series_id = ?1 AND occurrence_on = ?2",
-                rusqlite::params![sid, on],
-            ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
-            Ok(serde_json::json!({ "cleared": n }))
+            let family = series_family(conn, sid)?;
+            if family.is_empty() {
+                return Err(Error { code: "not_found", message: format!("no such series: {sid}") });
+            }
+            let n = conn
+                .execute(
+                    &format!(
+                        "DELETE FROM series_override WHERE occurrence_on = ?1 AND series_id IN ({})",
+                        id_list(&family)
+                    ),
+                    rusqlite::params![on],
+                )
+                .map_err(sql_err)?;
+            Ok(serde_json::json!({ "cleared": n, "applied_to": family }))
         }
 
         // ---- scenarios (req 8) ----
@@ -1082,7 +1324,9 @@ fn dispatch(
         "scenario.list" => {
             let mut stmt = conn.prepare(
                 "SELECT s.id, s.name, s.note,
-                        (SELECT COUNT(*) FROM series WHERE scenario_id = s.id),
+                        -- A recurring chain is one change, however many legs it has.
+                        (SELECT COUNT(*) FROM series WHERE scenario_id = s.id
+                            AND (chain_seq IS NULL OR chain_seq = 0)),
                         (SELECT COUNT(*) FROM series WHERE scenario_id = s.id
                                                        AND supersedes_id IS NOT NULL)
                    FROM scenario s ORDER BY s.id")
