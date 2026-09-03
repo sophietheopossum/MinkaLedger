@@ -15,6 +15,7 @@
 use rusqlite::{Connection, Transaction};
 use std::collections::BTreeMap;
 
+use crate::link::{self, LinkError};
 use crate::money::Minor;
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -34,6 +35,26 @@ pub struct NewTxn {
     pub postings: Vec<NewPosting>,
 }
 
+/// One leg of a payment chain: where the money goes next, on what day, and how much of it.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NewHop {
+    pub to_account: i64,
+    pub occurred_on: String,
+    pub amount_minor: Minor,
+}
+
+/// Money moving through several accounts, entered in one go. It leaves `from_account`; each hop
+/// says where it goes next. Every hop becomes an ordinary two-posting payment with its own date
+/// and amount -- a fee taken on the way, or a leg that lands days later, is just a hop that says
+/// so -- and all of them carry the one `description`, which is what the entry form means by a
+/// payment chain.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NewChain {
+    pub description: String,
+    pub from_account: i64,
+    pub hops: Vec<NewHop>,
+}
+
 #[derive(Debug)]
 pub enum EntryError {
     Sql(rusqlite::Error),
@@ -46,6 +67,9 @@ pub enum EntryError {
     /// reason: a hand-written entry there silently breaks the conversion residual.
     SystemAccount(String),
     NotFound(i64),
+    /// A payment chain that cannot be recorded as asked. The message says why in the operator's
+    /// terms; nothing of the chain is written.
+    Chain(String),
 }
 
 impl std::fmt::Display for EntryError {
@@ -63,6 +87,19 @@ impl std::fmt::Display for EntryError {
                 write!(f, "{n} is a system account -- only the core may post to it")
             }
             EntryError::NotFound(id) => write!(f, "no such transaction: {id}"),
+            EntryError::Chain(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl From<LinkError> for EntryError {
+    fn from(e: LinkError) -> Self {
+        match e {
+            LinkError::Sql(e) => EntryError::Sql(e),
+            // Cannot happen inside create_chain -- it links only what it has just written, in
+            // order -- but if it ever does, refuse the chain rather than misreport it as a
+            // database fault.
+            other => EntryError::Chain(other.to_string()),
         }
     }
 }
@@ -108,11 +145,18 @@ fn residual(postings: &[NewPosting], currencies: &[String]) -> BTreeMap<String, 
 }
 
 pub fn create(conn: &mut Connection, new: &NewTxn) -> Result<i64, EntryError> {
+    let tx = conn.transaction()?;
+    let id = create_in(&tx, new)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// `create` without the transaction, for callers that write several transactions as one unit.
+fn create_in(tx: &Transaction, new: &NewTxn) -> Result<i64, EntryError> {
     if new.postings.len() < 2 {
         return Err(EntryError::TooFewPostings);
     }
-    let tx = conn.transaction()?;
-    let currencies = resolve_currencies(&tx, &new.postings)?;
+    let currencies = resolve_currencies(tx, &new.postings)?;
     let residual = residual(&new.postings, &currencies);
     if !residual.is_empty() {
         return Err(EntryError::Unbalanced(residual));
@@ -132,8 +176,127 @@ pub fn create(conn: &mut Connection, new: &NewTxn) -> Result<i64, EntryError> {
             stmt.execute(rusqlite::params![txn_id, p.account_id, cur, p.amount_minor])?;
         }
     }
-    tx.commit()?;
     Ok(txn_id)
+}
+
+/// Record a payment chain: one payment per hop, each linked to the one before, all of them or none.
+///
+/// Each hop is an ordinary two-posting transaction, so every existing reader -- balances,
+/// history, the forecast -- sees plain payments and nothing new has to learn about chains. What
+/// ties them together is the link graph the payments panel already draws as a thread: hop N is
+/// linked to hop N+1, so following any one of them shows the whole chain and where the money
+/// ended up. (A journey could hold the same thing as a named container, but the panel reads
+/// links, and a chain typed in one go needs no name, sequence or roles to be declared.)
+///
+/// ONE CURRENCY END TO END. A hop between currencies is a conversion, which is a different shape
+/// of transaction (`fx::build_conversion`) with its own executed rate; it is refused here rather
+/// than guessed at, so the operator records that leg as the conversion it is.
+///
+/// ONLY BALANCE-SHEET ACCOUNTS IN THE MIDDLE. Money passes through places it can sit -- a friend,
+/// a wallet, a card -- and an expense or income account in the middle would post a spend and its
+/// exact reversal, which nets to nothing but reads as real spending in every report that looks
+/// at postings rather than balances. Either end may be anything.
+///
+/// Returns the transaction ids in hop order.
+pub fn create_chain(conn: &mut Connection, chain: &NewChain) -> Result<Vec<i64>, EntryError> {
+    if chain.hops.len() < 2 {
+        return Err(EntryError::Chain(
+            "a chain needs at least one stop between from and to".to_string(),
+        ));
+    }
+    if let Some(hop) = chain.hops.iter().find(|h| h.amount_minor <= 0) {
+        return Err(EntryError::Chain(format!(
+            "every payment in a chain moves a positive amount, and {} is not one",
+            hop.amount_minor
+        )));
+    }
+    let route: Vec<i64> = std::iter::once(chain.from_account)
+        .chain(chain.hops.iter().map(|h| h.to_account))
+        .collect();
+    if route.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(EntryError::Chain(
+            "a chain cannot move money from an account to itself".to_string(),
+        ));
+    }
+
+    let tx = conn.transaction()?;
+    // Each hop's date has to be a real day, said the one way SQLite's date() gives back, and the
+    // hops have to run forward in time: the link drawn between them says which came first. A
+    // single payment leaves the first check to the schema, but a chain has several dates and the
+    // refusal must say which one.
+    for (n, hop) in chain.hops.iter().enumerate() {
+        let canonical: Option<String> =
+            tx.query_row("SELECT date(?1)", [&hop.occurred_on], |r| r.get(0))?;
+        if canonical.as_deref() != Some(hop.occurred_on.as_str()) {
+            return Err(EntryError::Chain(format!(
+                "hop {} is on no such day: {}",
+                n + 1,
+                hop.occurred_on
+            )));
+        }
+        if n > 0 && hop.occurred_on < chain.hops[n - 1].occurred_on {
+            return Err(EntryError::Chain(format!(
+                "hop {} is dated {} but the hop before it is dated {}: a chain runs forward in time",
+                n + 1,
+                hop.occurred_on,
+                chain.hops[n - 1].occurred_on
+            )));
+        }
+    }
+    // Resolving every account up front also rejects unknown and system accounts before anything
+    // is written, with the same errors a single payment would give.
+    let probe: Vec<NewPosting> = route
+        .iter()
+        .map(|&account_id| NewPosting { account_id, amount_minor: 0 })
+        .collect();
+    let currencies = resolve_currencies(&tx, &probe)?;
+    if let Some(i) = currencies.iter().position(|c| c != &currencies[0]) {
+        let name_of = |id: i64| -> Result<String, rusqlite::Error> {
+            tx.query_row("SELECT name FROM account WHERE id = ?1", [id], |r| r.get(0))
+        };
+        return Err(EntryError::Chain(format!(
+            "a chain stays in one currency: {} holds {} but {} holds {} -- record that leg as a conversion",
+            name_of(route[0])?,
+            currencies[0],
+            name_of(route[i])?,
+            currencies[i]
+        )));
+    }
+    for &id in &route[1..route.len() - 1] {
+        let (name, kind): (String, String) = tx.query_row(
+            "SELECT name, kind FROM account WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if kind != "asset" && kind != "liability" {
+            return Err(EntryError::Chain(format!(
+                "money can only pass through an asset or liability account: {name} is an {kind} account"
+            )));
+        }
+    }
+
+    let mut txn_ids: Vec<i64> = Vec::with_capacity(chain.hops.len());
+    let mut from = chain.from_account;
+    for hop in &chain.hops {
+        let payment = NewTxn {
+            occurred_on: hop.occurred_on.clone(),
+            description: chain.description.clone(),
+            payee: None,
+            note: None,
+            postings: vec![
+                NewPosting { account_id: from, amount_minor: -hop.amount_minor },
+                NewPosting { account_id: hop.to_account, amount_minor: hop.amount_minor },
+            ],
+        };
+        let txn_id = create_in(&tx, &payment)?;
+        if let Some(&previous) = txn_ids.last() {
+            link::create(&tx, previous, txn_id, None, &hop.occurred_on)?;
+        }
+        txn_ids.push(txn_id);
+        from = hop.to_account;
+    }
+    tx.commit()?;
+    Ok(txn_ids)
 }
 
 /// Delete a transaction. Postings go with it via ON DELETE CASCADE.

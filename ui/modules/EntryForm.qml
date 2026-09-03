@@ -1,3 +1,4 @@
+pragma ComponentBehavior: Bound
 import QtQuick
 import "../services"
 
@@ -6,6 +7,13 @@ import "../services"
 // TWO POSTINGS ONLY. A split transaction is expressible in the core but not here: the common case
 // is money moving between two places, and making the form handle N legs would slow down the case
 // that happens fifty times a month to serve the one that happens twice a year.
+//
+// A CHAIN is not an exception to that. Money that passes through somewhere on the way -- current
+// account to a friend to a bookmaker -- is entered here as the stops it passes through, and the core
+// records one plain two-posting payment PER LEG, each linked to the one before so the payments
+// panel shows them as one thread. Only the description is shared: each leg has its own date and
+// amount, defaulting to the one above so the common case types nothing extra, and a fee on the way
+// or a leg that lands days later is just a stop that says so.
 //
 // The AMOUNT IS PARSED BY THE CORE, not here. `money.parse` exists precisely so the rounding rule
 // lives in one place -- a QML reimplementation would be a second rule waiting to disagree at the
@@ -29,6 +37,16 @@ Rectangle {
 
     property int fromAccount: -1
     property int toAccount: -1
+    // The stops the money passes THROUGH, in order. Each is { account, date, amountText,
+    // amountMinor, amountOk, amountBad }: `account` is -1 until chosen; `date` and `amountText`
+    // describe the leg LEAVING that stop and are blank to mean "same as the leg above"; `amountOk`
+    // is whether Record may go ahead (blank counts) and `amountBad` whether the core has refused
+    // what was typed. Kept apart from
+    // `stopCount`, the Repeater's model, so that editing a stop reassigns this array and
+    // re-evaluates every binding without rebuilding the rows; only adding or removing a stop
+    // changes the count, and that rebuilds every row from this array.
+    property var stops: []
+    property int stopCount: 0
     property int amountMinor: 0
     property bool amountOk: false
     // The second leg, only used when the two accounts are in different currencies.
@@ -42,10 +60,103 @@ Rectangle {
     readonly property string fromCurrency: root.currencyOf(root.fromAccount)
     readonly property string toCurrency: root.currencyOf(root.toAccount)
     // A transaction must balance PER CURRENCY, so two currencies cannot be two postings: it needs
-    // conversion postings through a trading account, which is what txn.convert builds.
-    readonly property bool crossCurrency: root.fromCurrency.length > 0
+    // conversion postings through a trading account, which is what txn.convert builds. A chain
+    // never takes this path: the core refuses a chain that changes currency, so the conversion
+    // hop is recorded on its own, as the different shape of transaction it is.
+    readonly property bool crossCurrency: root.stopCount === 0
+                                          && root.fromCurrency.length > 0
                                           && root.toCurrency.length > 0
                                           && root.fromCurrency !== root.toCurrency
+
+    // Every account the money visits, in order.
+    readonly property var route: [root.fromAccount].concat(root.stops.map(s => s.account), [root.toAccount])
+    readonly property bool routeChosen: root.route.every(id => id >= 0)
+    // Consecutive accounts must differ; from and to may coincide in a chain -- money that goes out
+    // through a friend and comes back is a real thing to record.
+    readonly property bool routeMoves: root.route.every((id, i) => i === 0 || id !== root.route[i - 1])
+    readonly property bool routeOneCurrency: root.route.every(id => id < 0 || root.currencyOf(id) === root.fromCurrency)
+    // A blank date or amount on a stop means "same as above"; a typed one must be whole.
+    readonly property bool stopDatesOk: root.stops.every(s => s.date.length === 0 || s.date.length === 10)
+    readonly property bool stopsFilledIn: root.stopDatesOk && root.stops.every(s => s.amountOk)
+    // Money can only pass through somewhere it can sit. The core refuses the rest; this just
+    // keeps them out of the via list.
+    readonly property var passThroughAccounts: (root.accounts || []).filter(a => a.kind === "asset" || a.kind === "liability")
+
+    function nameOf(id) {
+        const a = (root.accounts || []).find(x => x.account_id === id);
+        return a ? a.name : "…";
+    }
+    // "Current → Sam → Bookmaker", for the line that says what Record will do.
+    readonly property string routeText: root.route.map(id => root.nameOf(id)).join(" → ")
+
+    function addStop() {
+        root.stops = root.stops.concat([{ account: -1, date: "", amountText: "", amountMinor: 0,
+                                          amountOk: true, amountBad: false }]);
+        root.stopCount = root.stops.length;
+    }
+    function updateStop(i, patch) {
+        const s = root.stops.slice();
+        s[i] = Object.assign({}, s[i], patch);
+        root.stops = s;
+    }
+    function removeStop(i) {
+        const s = root.stops.slice();
+        s.splice(i, 1);
+        // Count first: the rows are rebuilt from the count, and shrinking the array while the last
+        // row still exists would have it read past the end.
+        root.stopCount = s.length;
+        root.stops = s;
+        status.text = "";
+    }
+    // A stop's onward amount, parsed by the core like the headline one. Blank means "same as
+    // above" and is fine; anything else must parse to a positive amount.
+    function validateStopAmount(i, text) {
+        if (text.trim().length === 0) {
+            root.updateStop(i, { amountText: text, amountMinor: 0, amountOk: true, amountBad: false });
+            status.text = "";
+            return;
+        }
+        root.updateStop(i, { amountText: text, amountOk: false, amountBad: false });
+        Ledger.request("money.parse",
+                       { text: text, minor_digits: Money.digits(root.fromCurrency) }, (r, e) => {
+            if (i >= root.stops.length || root.stops[i].amountText !== text)
+                return; // the row went, or she kept typing: a later answer is on its way
+            if (e) {
+                status.text = e.message;
+                root.updateStop(i, { amountBad: true });
+            } else {
+                status.text = r.minor > 0 ? "" : "an amount is always positive";
+                root.updateStop(i, { amountMinor: r.minor, amountOk: r.minor > 0, amountBad: r.minor <= 0 });
+            }
+        });
+    }
+    // Stop amounts were parsed at the from account's scale; a different from account means a
+    // different scale, so ask again.
+    onFromCurrencyChanged: {
+        root.stops.forEach((s, i) => {
+            if (s.amountText.trim().length > 0)
+                root.validateStopAmount(i, s.amountText);
+        });
+    }
+    // The payments to record, one per leg: the headline date and amount for the first, and then
+    // whatever each stop says about the leg leaving it, or the same again if it says nothing.
+    function chainHops() {
+        let date = dateField.text;
+        let amount = root.amountMinor;
+        const targets = root.stops.map(s => s.account).concat([root.toAccount]);
+        const hops = [];
+        for (let i = 0; i < targets.length; i++) {
+            if (i > 0) {
+                const stop = root.stops[i - 1];
+                if (stop.date.length > 0)
+                    date = stop.date;
+                if (stop.amountText.trim().length > 0)
+                    amount = stop.amountMinor;
+            }
+            hops.push({ to_account: targets[i], occurred_on: date, amount_minor: amount });
+        }
+        return hops;
+    }
 
     function reset() {
         dateField.text = root.defaultDate;
@@ -58,6 +169,12 @@ Rectangle {
         root.toOk = false;
         root.fromAccount = -1;
         root.toAccount = -1;
+        // The pickers keep their own `selected` once chosen, so clearing the ids alone left the
+        // old names on screen with a Record button that would not press.
+        fromPicker.selected = -1;
+        toPicker.selected = -1;
+        root.stops = [];
+        root.stopCount = 0;
         status.text = "";
     }
 
@@ -77,10 +194,12 @@ Rectangle {
                 amountField.invalid = true;
                 status.text = e.message;
             } else {
+                // Positive on every path. The form decides the direction from `from` and `to`, so
+                // a minus sign would be a second, contradicting way of saying which way it went.
                 root.amountMinor = r.minor;
-                root.amountOk = r.minor !== 0;
-                amountField.invalid = false;
-                status.text = "";
+                root.amountOk = r.minor > 0;
+                amountField.invalid = r.minor < 0;
+                status.text = r.minor < 0 ? "an amount is always positive — swap from and to to send it the other way" : "";
             }
         });
     }
@@ -99,9 +218,9 @@ Rectangle {
                 status.text = e.message;
             } else {
                 root.toMinor = r.minor;
-                root.toOk = r.minor !== 0;
-                toField.invalid = false;
-                status.text = "";
+                root.toOk = r.minor > 0;
+                toField.invalid = r.minor < 0;
+                status.text = r.minor < 0 ? "an amount is always positive" : "";
             }
         });
     }
@@ -125,8 +244,9 @@ Rectangle {
         });
     }
 
-    readonly property bool complete: root.amountOk && root.fromAccount >= 0
-                                     && root.toAccount >= 0 && root.fromAccount !== root.toAccount
+    readonly property bool complete: root.amountOk && root.routeChosen && root.routeMoves
+                                     && (root.stopCount > 0 || root.fromAccount !== root.toAccount)
+                                     && (root.stopCount === 0 || (root.routeOneCurrency && root.stopsFilledIn))
                                      && dateField.text.length === 10 && descField.text.length > 0
                                      && (!root.crossCurrency || root.toOk)
 
@@ -145,6 +265,24 @@ Rectangle {
     function save() {
         if (!root.complete)
             return;
+        // A chain is one core call, not one txn.create per leg from here: the core writes every
+        // leg or none, links each to the one before, and copies the description to all of them.
+        // Doing the loop in the form would leave half a chain behind on the first refusal.
+        if (root.stopCount > 0) {
+            Ledger.write("txn.create_chain", {
+                description: descField.text,
+                from_account: root.fromAccount,
+                hops: root.chainHops()
+            }, (r, e) => {
+                if (e)
+                    status.text = e.message;
+                else {
+                    root.reset();
+                    root.saved();
+                }
+            });
+            return;
+        }
         // Two currencies need conversion postings through a trading account, which is a different
         // shape of transaction entirely -- so it is a different core call, not extra postings
         // assembled here. build_conversion owns that shape and this form does not restate it.
@@ -194,7 +332,7 @@ Rectangle {
         spacing: 8
 
         Text {
-            text: "RECORD A PAYMENT"
+            text: root.stopCount > 0 ? "RECORD A CHAIN" : "RECORD A PAYMENT"
             color: Theme.textMuted
             font.family: Theme.fontFamily
             font.pixelSize: Theme.fontSize - 2
@@ -253,6 +391,103 @@ Rectangle {
             }
         }
 
+        // One row per stop the money passes through, between from and to: the stop itself, and
+        // what the leg LEAVING it looks like when it differs from the leg above. Changing the
+        // count rebuilds every row from `stops`, which is why each field is bound to the array
+        // rather than remembering anything of its own.
+        Repeater {
+            model: root.stopCount
+            delegate: Row {
+                id: stopRow
+                required property int index
+                // Read through a fallback: a row on its way out can evaluate once more against an
+                // array that no longer has its entry.
+                readonly property var stop: root.stops[stopRow.index]
+                                            ?? ({ account: -1, date: "", amountText: "", amountMinor: 0,
+                                                  amountOk: true, amountBad: false })
+                width: form.width
+                spacing: 8
+                AccountPicker {
+                    width: (stopRow.width - 24) * 0.40
+                    label: "via"
+                    accounts: root.passThroughAccounts
+                    selected: stopRow.stop.account
+                    onPicked: id => root.updateStop(stopRow.index, { account: id })
+                }
+                Field {
+                    width: (stopRow.width - 24) * 0.22
+                    label: "then on (YYYY-MM-DD)"
+                    placeholder: "same day"
+                    numeric: true
+                    text: stopRow.stop.date
+                    onEdited: value => root.updateStop(stopRow.index, { date: value })
+                }
+                Field {
+                    width: (stopRow.width - 24) * 0.22
+                    label: root.fromCurrency.length > 0 ? "then sends (" + root.fromCurrency + ")" : "then sends"
+                    placeholder: "same amount"
+                    numeric: true
+                    text: stopRow.stop.amountText
+                    onEdited: value => root.validateStopAmount(stopRow.index, value)
+                    // Field clears `invalid` itself on every keystroke, which would end a plain
+                    // binding for good; a Binding element keeps re-applying the core's verdict.
+                    Binding on invalid {
+                        value: stopRow.stop.amountBad
+                    }
+                }
+                PushButton {
+                    anchors.verticalCenter: parent.verticalCenter
+                    label: "remove"
+                    onClicked: root.removeStop(stopRow.index)
+                }
+            }
+        }
+
+        Row {
+            id: chainRow
+            width: parent.width
+            spacing: 12
+            PushButton {
+                id: addStopButton
+                label: "+ stop"
+                onClicked: root.addStop()
+            }
+            Column {
+                anchors.verticalCenter: parent.verticalCenter
+                width: chainRow.width - addStopButton.width - chainRow.spacing
+                spacing: 1
+                Text {
+                    width: parent.width
+                    elide: Text.ElideRight
+                    text: root.stopCount > 0
+                          ? root.routeText
+                          : "a chain: add each account the money passes through on the way"
+                    color: root.stopCount > 0 ? Theme.text : Theme.textFaint
+                    font.family: Theme.fontFamily
+                    font.pixelSize: root.stopCount > 0 ? Theme.fontSize - 2 : Theme.fontSize - 4
+                }
+                Text {
+                    width: parent.width
+                    elide: Text.ElideRight
+                    visible: root.stopCount > 0
+                    text: (root.stopCount + 1) + " payments, one for each leg, sharing the description"
+                          + " — a blank date or amount on a stop reuses the one above"
+                    color: Theme.textFaint
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSize - 4
+                }
+                Text {
+                    width: parent.width
+                    elide: Text.ElideRight
+                    visible: root.stopCount > 0 && root.routeChosen && root.fromAccount === root.toAccount
+                    text: "a round trip: leaves and comes back to " + root.nameOf(root.fromAccount)
+                    color: Theme.textFaint
+                    font.family: Theme.fontFamily
+                    font.pixelSize: Theme.fontSize - 4
+                }
+            }
+        }
+
         // Only when the two sides are in different currencies. The second amount is asked for
         // rather than calculated, because the rate that matters is the one the bank actually gave
         // -- spread included -- and only the two real amounts know it.
@@ -307,7 +542,7 @@ Rectangle {
         Row {
             spacing: 8
             PushButton {
-                label: "Record"
+                label: root.stopCount > 0 ? "Record " + (root.stopCount + 1) + " payments" : "Record"
                 primary: true
                 enabled: root.complete
                 onClicked: root.save()
@@ -318,8 +553,33 @@ Rectangle {
             }
             Text {
                 anchors.verticalCenter: parent.verticalCenter
-                visible: root.fromAccount >= 0 && root.fromAccount === root.toAccount
+                visible: root.stopCount === 0 && root.fromAccount >= 0
+                         && root.fromAccount === root.toAccount
                 text: "from and to must differ"
+                color: Theme.warnAmber
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 2
+            }
+            Text {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.stopCount > 0 && root.routeChosen && !root.routeMoves
+                text: "the same account twice in a row"
+                color: Theme.warnAmber
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 2
+            }
+            Text {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.stopCount > 0 && root.routeChosen && root.routeMoves && !root.routeOneCurrency
+                text: "a chain stays in one currency — record the conversion as its own payment"
+                color: Theme.warnAmber
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 2
+            }
+            Text {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.stopCount > 0 && root.routeMoves && root.routeOneCurrency && !root.stopDatesOk
+                text: "a stop's date needs YYYY-MM-DD"
                 color: Theme.warnAmber
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fontSize - 2

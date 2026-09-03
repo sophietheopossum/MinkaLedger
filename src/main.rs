@@ -117,6 +117,7 @@ impl From<entry::EntryError> for Error {
             E::NoSuchAccount(_) => "no_such_account",
             E::SystemAccount(_) => "system_account",
             E::NotFound(_) => "not_found",
+            E::Chain(_) => "bad_chain",
             E::Sql(_) => "sql",
         };
         Error { code, message: e.to_string() }
@@ -786,6 +787,16 @@ fn dispatch(
                 .map_err(|e| bad(&format!("{e}")))?;
             let id = entry::create(conn, &new)?;
             Ok(serde_json::json!({ "id": id }))
+        }
+
+        // A payment chain: one payment per hop, each linked to the one before, recorded as a
+        // whole or not at all.
+        "txn.create_chain" => {
+            let chain: entry::NewChain = serde_json::from_value(params).map_err(|e| {
+                bad(&format!("txn.create_chain takes description, from_account and hops: {e}"))
+            })?;
+            let txn_ids = entry::create_chain(conn, &chain)?;
+            Ok(serde_json::json!({ "txn_ids": txn_ids }))
         }
 
         "txn.get" => {

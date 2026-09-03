@@ -1303,3 +1303,117 @@ fn an_empty_book_offers_an_empty_description_list() {
     assert_eq!(out[1]["result"].as_array().unwrap().len(), 0);
     assert_eq!(out[2]["result"].as_array().unwrap().len(), 0);
 }
+
+/// A chain is the entry form's answer to money that passes through somewhere on the way: every
+/// hop must land as an ordinary payment with its own date and amount, sharing the description, and
+/// the hops must be threaded together so the payments panel can follow them and say where the
+/// money ended up.
+#[test]
+fn a_payment_chain_records_every_hop_as_linked_payments() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Sam","kind":"asset"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"Bookmaker","kind":"asset"}}"#,
+        r#"{"id":4,"method":"account.create","params":{"name":"Wallet","kind":"asset"}}"#,
+        // Two hops, a day apart, and Sam keeps 100 of it.
+        r#"{"id":5,"method":"txn.create_chain","params":{"description":"stake via Sam","from_account":1,
+             "hops":[{"to_account":2,"occurred_on":"2026-09-02","amount_minor":5000},
+                     {"to_account":3,"occurred_on":"2026-09-03","amount_minor":4900}]}}"#,
+        r#"{"id":6,"method":"txn.get","params":{"id":1}}"#,
+        r#"{"id":7,"method":"txn.get","params":{"id":2}}"#,
+        r#"{"id":8,"method":"link.chain","params":{"txn_id":2}}"#,
+        // Three hops straight through two stops.
+        r#"{"id":9,"method":"txn.create_chain","params":{"description":"round the houses","from_account":1,
+             "hops":[{"to_account":2,"occurred_on":"2026-09-04","amount_minor":700},
+                     {"to_account":4,"occurred_on":"2026-09-04","amount_minor":700},
+                     {"to_account":3,"occurred_on":"2026-09-04","amount_minor":700}]}}"#,
+        r#"{"id":10,"method":"link.chain","params":{"txn_id":4}}"#,
+        r#"{"id":11,"method":"account.balances"}"#,
+    ]);
+    for r in &out {
+        assert!(err_of(r).is_none(), "no step may fail: {r}");
+    }
+    assert_eq!(out[4]["result"]["txn_ids"], serde_json::json!([1, 2]));
+
+    for (hop, (on, from, to, amount)) in [(&out[5], ("2026-09-02", 1, 2, 5000)), (&out[6], ("2026-09-03", 2, 3, 4900))] {
+        let t = &hop["result"];
+        assert_eq!(t["description"], "stake via Sam", "the description is copied to every hop");
+        assert_eq!(t["occurred_on"], on, "each hop keeps its own date");
+        let p = t["postings"].as_array().unwrap();
+        assert_eq!((p[0]["account_id"].as_i64(), p[0]["amount_minor"].as_i64()), (Some(from), Some(-amount)));
+        assert_eq!((p[1]["account_id"].as_i64(), p[1]["amount_minor"].as_i64()), (Some(to), Some(amount)));
+    }
+
+    // Followed from the far end, the thread is the whole chain, drawn hop to hop.
+    let thread = &out[7]["result"];
+    assert_eq!(thread["nodes"].as_array().unwrap().len(), 2, "{thread}");
+    assert_eq!(thread["edges"], serde_json::json!([{ "from": 1, "to": 2, "note": null }]));
+    let left: Vec<(String, i64)> = thread["residual"].as_array().unwrap().iter()
+        .map(|r| (r["account"].as_str().unwrap().to_string(), r["amount_minor"].as_i64().unwrap())).collect();
+    assert!(left.contains(&("Sam".to_string(), 100)), "what Sam kept is what did not pass through: {left:?}");
+
+    // The middle payment of a three-hop chain is threaded both ways; the stops it passed
+    // straight through drop out of the residual.
+    let thread = &out[9]["result"];
+    assert_eq!(thread["nodes"].as_array().unwrap().len(), 3, "{thread}");
+    assert_eq!(thread["edges"].as_array().unwrap().len(), 2);
+    let middle = thread["nodes"].as_array().unwrap().iter().find(|n| n["id"] == 4).unwrap();
+    assert_eq!(middle["links"], 2, "the browser marks the middle hop as threaded twice");
+    let mut left: Vec<&str> = thread["residual"].as_array().unwrap().iter()
+        .map(|r| r["account"].as_str().unwrap()).collect();
+    left.sort();
+    assert_eq!(left, vec!["Bookmaker", "Current"], "{thread}");
+
+    let balance = |id: i64| out[10]["result"].as_array().unwrap().iter()
+        .find(|a| a["account_id"] == id).map(|a| a["balance_minor"].as_i64().unwrap());
+    assert_eq!((balance(1), balance(2), balance(3), balance(4)), (Some(-5700), Some(100), Some(5600), Some(0)));
+}
+
+/// Half a chain is worse than none: the money would appear to have stopped somewhere it never
+/// was. Most refusals happen before anything is written; the last case here fails on its SECOND
+/// hop, after the first is already in the transaction, and must still leave the book untouched.
+#[test]
+fn a_chain_is_refused_whole_when_any_hop_is_wrong() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Sam","kind":"asset"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"Euro wallet","kind":"asset","currency":"EUR"}}"#,
+        r#"{"id":4,"method":"account.create","params":{"name":"Groceries","kind":"expense"}}"#,
+        r#"{"id":5,"method":"txn.create_chain","params":{"description":"too short","from_account":1,
+             "hops":[{"to_account":2,"occurred_on":"2026-09-02","amount_minor":100}]}}"#,
+        r#"{"id":6,"method":"txn.create_chain","params":{"description":"self hop","from_account":1,
+             "hops":[{"to_account":2,"occurred_on":"2026-09-02","amount_minor":100},
+                     {"to_account":2,"occurred_on":"2026-09-02","amount_minor":100}]}}"#,
+        r#"{"id":7,"method":"txn.create_chain","params":{"description":"nothing moves","from_account":1,
+             "hops":[{"to_account":2,"occurred_on":"2026-09-02","amount_minor":100},
+                     {"to_account":1,"occurred_on":"2026-09-02","amount_minor":0}]}}"#,
+        r#"{"id":8,"method":"txn.create_chain","params":{"description":"crosses a currency","from_account":1,
+             "hops":[{"to_account":2,"occurred_on":"2026-09-02","amount_minor":100},
+                     {"to_account":3,"occurred_on":"2026-09-02","amount_minor":100}]}}"#,
+        r#"{"id":9,"method":"txn.create_chain","params":{"description":"unknown stop","from_account":1,
+             "hops":[{"to_account":99,"occurred_on":"2026-09-02","amount_minor":100},
+                     {"to_account":2,"occurred_on":"2026-09-02","amount_minor":100}]}}"#,
+        r#"{"id":10,"method":"txn.create_chain","params":{"description":"through the shopping","from_account":1,
+             "hops":[{"to_account":4,"occurred_on":"2026-09-02","amount_minor":100},
+                     {"to_account":2,"occurred_on":"2026-09-02","amount_minor":100}]}}"#,
+        r#"{"id":11,"method":"txn.create_chain","params":{"description":"second hop on no such day","from_account":1,
+             "hops":[{"to_account":2,"occurred_on":"2026-09-02","amount_minor":100},
+                     {"to_account":1,"occurred_on":"2026-02-30","amount_minor":100}]}}"#,
+        r#"{"id":12,"method":"txn.create_chain","params":{"description":"arrives before it left","from_account":1,
+             "hops":[{"to_account":2,"occurred_on":"2026-09-05","amount_minor":100},
+                     {"to_account":1,"occurred_on":"2026-09-01","amount_minor":100}]}}"#,
+        r#"{"id":13,"method":"txn.create_chain","params":{"description":"old shape","occurred_on":"2026-09-02",
+             "amount_minor":100,"accounts":[1,2,1]}}"#,
+        r#"{"id":14,"method":"txn.list"}"#,
+    ]);
+    for (i, reason) in [(4, "stop"), (5, "itself"), (6, "positive"), (7, "one currency"), (8, "no such account"),
+                        (9, "pass through"), (10, "no such day"), (11, "forward in time"), (12, "hops")] {
+        let msg = err_of(&out[i]).unwrap_or_else(|| panic!("step {} must be refused: {}", i + 1, out[i]));
+        assert!(msg.contains(reason), "the error must say why: {msg}");
+    }
+    let mismatch = err_of(&out[7]).unwrap();
+    assert!(mismatch.contains("Current") && mismatch.contains("Euro wallet"), "both ends of the mismatched leg are named: {mismatch}");
+    assert!(err_of(&out[9]).unwrap().contains("Groceries"), "it must name the account money cannot pass through");
+    assert!(err_of(&out[10]).unwrap().contains("hop 2"), "it must say which hop: {}", out[10]);
+    assert_eq!(out[13]["result"].as_array().unwrap().len(), 0, "nothing was written, not even the first hop");
+}
