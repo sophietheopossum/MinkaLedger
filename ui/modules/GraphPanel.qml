@@ -66,6 +66,9 @@ Rectangle {
     property var nodes: []
     property var edges: []
     property var links: []
+    // Sideways bend per edge, in world units at the midpoint; zero for a lone straight arrow.
+    // Set alongside `edges` so every reader of an arrow's shape agrees.
+    property var bends: []
     // "start:<txn>" / "end:<txn>" -> true for visits pulled out of a shared start or end node.
     property var splits: ({})
     // The arrow a right-click opened a menu on, and where.
@@ -303,6 +306,7 @@ Rectangle {
         if (root.selectedEdge >= edges.length) root.selectedEdge = -1;
         root.sim = s;
         root.nodes = nodes;
+        root.bends = root.bendsFor(edges);
         root.edges = edges;
         root.links = links;
         if (selectedKey !== null)
@@ -446,6 +450,57 @@ Rectangle {
         return { x1: s.x[i] + ux * s.r[i], y1: s.y[i] + uy * s.r[i],
                  x2: s.x[j] - ux * (s.r[j] + 2), y2: s.y[j] - uy * (s.r[j] + 2) };
     }
+
+    // ARROWS THAT SHARE A PAIR OF CIRCLES BEND APART. Money that goes from Smarkets to Open
+    // bets and comes back is two payments between the same two visits, and drawn straight
+    // they lie on top of each other and read as one two-headed line. Each arrow between the
+    // same pair takes its own sideways offset, measured on its own left-hand side, so a pair
+    // running opposite ways bows to opposite sides of the line and reads as the loop it is:
+    // out along one arc, back along the other, the intermediate visit at the far end.
+    function bendsFor(edges) {
+        const groups = {};
+        for (let k = 0; k < edges.length; k++) {
+            const e = edges[k];
+            const key = Math.min(e.from, e.to) + ":" + Math.max(e.from, e.to);
+            if (!groups[key]) groups[key] = [];
+            groups[key].push(k);
+        }
+        const bends = new Array(edges.length).fill(0);
+        for (const key in groups) {
+            const ks = groups[key];
+            if (ks.length < 2) continue;
+            for (let i = 0; i < ks.length; i++) {
+                const e = edges[ks[i]];
+                // Spread in the pair's canonical direction, then seen from the arrow's own.
+                bends[ks[i]] = (i - (ks.length - 1) / 2) * 44 * (e.from < e.to ? 1 : -1);
+            }
+        }
+        return bends;
+    }
+    // An arrow's path: rim to rim, through a control point set off sideways by its bend. The
+    // curve passes half the control offset at its middle, hence the doubling.
+    function curve(e, k) {
+        const s = root.sim, i = e.from, j = e.to;
+        const bend = root.bends[k] || 0;
+        const mx = (s.x[i] + s.x[j]) / 2, my = (s.y[i] + s.y[j]) / 2;
+        const dx = s.x[j] - s.x[i], dy = s.y[j] - s.y[i];
+        const d = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
+        const cx = mx - dy / d * 2 * bend, cy = my + dx / d * 2 * bend;
+        // Each end leaves its circle toward the control point, so the arrow meets the rim
+        // where the curve actually crosses it rather than where a straight line would.
+        const ax = cx - s.x[i], ay = cy - s.y[i];
+        const ad = Math.max(Math.sqrt(ax * ax + ay * ay), 1);
+        const bx = cx - s.x[j], by = cy - s.y[j];
+        const bd = Math.max(Math.sqrt(bx * bx + by * by), 1);
+        return { x1: s.x[i] + ax / ad * s.r[i], y1: s.y[i] + ay / ad * s.r[i],
+                 cx: cx, cy: cy,
+                 x2: s.x[j] + bx / bd * (s.r[j] + 2), y2: s.y[j] + by / bd * (s.r[j] + 2) };
+    }
+    function along(c, t) {
+        const u = 1 - t;
+        return { x: u * u * c.x1 + 2 * u * t * c.cx + t * t * c.x2,
+                 y: u * u * c.y1 + 2 * u * t * c.cy + t * t * c.y2 };
+    }
     function hitEdge(sx, sy) {
         const wx = root.toWorldX(sx), wy = root.toWorldY(sy);
         const tol = 6 / root.zoom;
@@ -453,15 +508,22 @@ Rectangle {
         for (let k = 0; k < root.edges.length; k++) {
             const e = root.edges[k];
             if (e.from === e.to) continue;
-            const p = root.ends(e.from, e.to);
-            const vx = p.x2 - p.x1, vy = p.y2 - p.y1;
-            const len2 = vx * vx + vy * vy;
-            if (len2 < 1) continue;
-            let t = ((wx - p.x1) * vx + (wy - p.y1) * vy) / len2;
-            t = Math.max(0, Math.min(1, t));
-            const dx = wx - (p.x1 + vx * t), dy = wy - (p.y1 + vy * t);
-            const d = Math.sqrt(dx * dx + dy * dy);
-            if (d < bestD) { bestD = d; best = k; }
+            const c = root.curve(e, k);
+            // Distance to the curve, taken as the nearest of a dozen straight pieces of it.
+            let prev = root.along(c, 0);
+            for (let n = 1; n <= 12; n++) {
+                const next = root.along(c, n / 12);
+                const vx = next.x - prev.x, vy = next.y - prev.y;
+                const len2 = vx * vx + vy * vy;
+                if (len2 >= 1) {
+                    let t = ((wx - prev.x) * vx + (wy - prev.y) * vy) / len2;
+                    t = Math.max(0, Math.min(1, t));
+                    const dx = wx - (prev.x + vx * t), dy = wy - (prev.y + vy * t);
+                    const d = Math.sqrt(dx * dx + dy * dy);
+                    if (d < bestD) { bestD = d; best = k; }
+                }
+                prev = next;
+            }
         }
         return best;
     }
@@ -670,7 +732,7 @@ Rectangle {
                         for (const k of order) {
                             const e = root.edges[k];
                             if (e.from === e.to) continue;
-                            const p = root.ends(e.from, e.to);
+                            const p = root.curve(e, k);
                             const isHot = k === hot;
                             const colour = canvas.edgeColour(e, isHot);
                             ctx.strokeStyle = colour;
@@ -678,10 +740,11 @@ Rectangle {
                             ctx.lineWidth = (isHot ? 2.2 : 1.2) / z;
                             ctx.beginPath();
                             ctx.moveTo(p.x1, p.y1);
-                            ctx.lineTo(p.x2, p.y2);
+                            ctx.quadraticCurveTo(p.cx, p.cy, p.x2, p.y2);
                             ctx.stroke();
-                            // The head: a small triangle on the rim of the arriving circle.
-                            const dx = p.x2 - p.x1, dy = p.y2 - p.y1;
+                            // The head: a small triangle on the rim of the arriving circle,
+                            // pointing the way the curve arrives.
+                            const dx = p.x2 - p.cx, dy = p.y2 - p.cy;
                             const d = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
                             const ux = dx / d, uy = dy / d;
                             const h = (isHot ? 9 : 7) / Math.sqrt(z);
@@ -693,13 +756,15 @@ Rectangle {
                             ctx.fill();
                             // Flow: dots travelling from where the money left toward where it
                             // arrived, brighter as they go, so the direction reads at a glance.
-                            if (isHot && d > 8) {
-                                const count = Math.max(3, Math.min(8, Math.round(d / 40)));
+                            const span = Math.sqrt(Math.pow(p.x2 - p.x1, 2) + Math.pow(p.y2 - p.y1, 2));
+                            if (isHot && span > 8) {
+                                const count = Math.max(3, Math.min(8, Math.round(span / 40)));
                                 for (let i = 0; i < count; i++) {
                                     const t = (root.flowPhase + i / count) % 1;
+                                    const at = root.along(p, t);
                                     ctx.fillStyle = Qt.alpha(Theme.purple, 0.35 + 0.65 * t);
                                     ctx.beginPath();
-                                    ctx.arc(p.x1 + dx * t, p.y1 + dy * t, (2 + 2 * t) / Math.sqrt(z), 0, Math.PI * 2);
+                                    ctx.arc(at.x, at.y, (2 + 2 * t) / Math.sqrt(z), 0, Math.PI * 2);
                                     ctx.fill();
                                 }
                             }
