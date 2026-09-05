@@ -210,6 +210,38 @@ fn conversion_account(conn: &Connection, code: &str) -> Result<i64, FxError> {
     Ok(crate::roles::conversion(conn, code)?)
 }
 
+/// The four legs of a conversion, as (account, currency, amount) in posting order: what leaves
+/// `from_account`, its offset in that currency's conversion account, what arrives at
+/// `to_account`, and its offset. Each currency balances on its own: the money leaving is offset
+/// inside its own conversion account, and likewise for the money arriving.
+///
+/// One place for the shape. `build_conversion` records a new conversion from it and
+/// `entry::update` restates an existing one's legs from it, so an edited conversion is built
+/// exactly like a fresh one.
+pub fn conversion_legs(
+    conn: &Connection,
+    from_account: i64,
+    from_minor: Minor,
+    to_account: i64,
+    to_minor: Minor,
+) -> Result<Vec<(i64, String, Minor)>, FxError> {
+    let from_cur: String =
+        conn.query_row("SELECT currency FROM account WHERE id=?1", [from_account], |r| r.get(0))?;
+    let to_cur: String =
+        conn.query_row("SELECT currency FROM account WHERE id=?1", [to_account], |r| r.get(0))?;
+    if from_cur == to_cur {
+        return Err(FxError::SameCurrency(from_cur));
+    }
+    let conv_from = conversion_account(conn, &from_cur)?;
+    let conv_to = conversion_account(conn, &to_cur)?;
+    Ok(vec![
+        (from_account, from_cur.clone(), -from_minor),
+        (conv_from, from_cur, from_minor),
+        (to_account, to_cur.clone(), to_minor),
+        (conv_to, to_cur, -to_minor),
+    ])
+}
+
 /// Build a currency conversion as one balanced transaction.
 ///
 /// `from_minor` is what leaves (positive), `to_minor` what arrives. Both are given explicitly and
@@ -225,15 +257,7 @@ pub fn build_conversion(
     to_account: i64,
     to_minor: Minor,
 ) -> Result<i64, FxError> {
-    let from_cur: String =
-        conn.query_row("SELECT currency FROM account WHERE id=?1", [from_account], |r| r.get(0))?;
-    let to_cur: String =
-        conn.query_row("SELECT currency FROM account WHERE id=?1", [to_account], |r| r.get(0))?;
-    if from_cur == to_cur {
-        return Err(FxError::SameCurrency(from_cur));
-    }
-    let conv_from = conversion_account(conn, &from_cur)?;
-    let conv_to = conversion_account(conn, &to_cur)?;
+    let legs = conversion_legs(conn, from_account, from_minor, to_account, to_minor)?;
 
     let tx = conn.transaction()?;
     tx.execute(
@@ -245,12 +269,9 @@ pub fn build_conversion(
         let mut st = tx.prepare(
             "INSERT INTO posting(txn_id, account_id, currency, amount_minor) VALUES(?1,?2,?3,?4)",
         )?;
-        // Each currency balances on its own: the money leaving is offset inside its own conversion
-        // account, and likewise for the money arriving.
-        st.execute(rusqlite::params![txn_id, from_account, from_cur, -from_minor])?;
-        st.execute(rusqlite::params![txn_id, conv_from, from_cur, from_minor])?;
-        st.execute(rusqlite::params![txn_id, to_account, to_cur, to_minor])?;
-        st.execute(rusqlite::params![txn_id, conv_to, to_cur, -to_minor])?;
+        for (account_id, currency, amount_minor) in &legs {
+            st.execute(rusqlite::params![txn_id, account_id, currency, amount_minor])?;
+        }
     }
     tx.commit()?;
     Ok(txn_id)

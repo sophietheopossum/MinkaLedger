@@ -2,11 +2,20 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import "../services"
 
-// Browse payments, rename them, and link any of them into a chain.
+// Browse payments, correct them, and link any of them into a chain.
 //
 // TWO MODES, ONE PANEL. Browsing and following a thread are the same activity a minute apart: you
 // find a payment, then you want to know what it is connected to. Splitting them across two screens
-// would mean searching twice.
+// would mean searching twice. Editing is the same again: you find the payment that is wrong, and
+// the editor opens beside the list in the place the thread would, so the list is never lost.
+//
+// THE EDITOR IS THE ENTRY FORM'S SHAPE, NOT THE WHOLE RECORD. Date, description, from, to and
+// amount, with the arriving amount when the two accounts hold different currencies -- the same
+// things the form asks for, so a payment reads the same going in and being corrected. A payment
+// with more than two legs of its own (a split written by the core or an agent) is not that shape,
+// and the editor says so and offers the date and description only rather than a form that would
+// have to invent a way of showing legs it cannot edit. The core does the rest: txn.update keeps
+// the id, so the links, the import key and the series slot that hang off it survive the edit.
 //
 // A LINK IS AN ASSERTION, NOT A CONTAINER. Ticking two payments and pressing Link writes one row
 // and changes neither payment. There is no chain to name, no order to declare and no role to pick
@@ -30,27 +39,31 @@ Rectangle {
     property int total: 0
     property var picked: []            // txn ids ticked for linking
     property int following: -1         // txn id whose chain is being shown
-    property int renaming: -1          // txn id whose description is being retyped
+    property int editing: -1           // txn id open in the editor
     property var chain: null
     property string note: ""
     property int accountFilter: -1
 
-    // A payment that was renamed OUT of the active search: { id, at, row }.
+    // One side pane at a time: the thread and the editor share the space beside the list.
+    readonly property bool sideOpen: root.following >= 0 || root.editing >= 0
+
+    // A payment that was edited OUT of the active search: { id, at, row }.
     //
-    // Renaming re-runs the browse, and the payment can then fail the search that found it — you
-    // rename "TESCO STORES 4711" to "Weekly shop" while the search box still says "tesco". Letting
-    // it drop out would make the only feedback for a successful rename its DISAPPEARANCE, which
-    // reads as a delete. So the renamed payment is kept on screen, in the place it already held,
-    // marked as outside the search, and it stays there until the search text or the account filter
-    // is changed by hand — at which point the filter is honest again because the operator, not the
-    // panel, decided what to look at. The alternative, silently clearing the search box, throws
-    // away the filter being worked in and reshuffles every other row on screen to explain one.
+    // An edit re-runs the browse, and the payment can then fail the search that found it — you
+    // rename "TESCO STORES 4711" to "Weekly shop" while the search box still says "tesco", or move
+    // it off the account the list is filtered to. Letting it drop out would make the only feedback
+    // for a successful edit its DISAPPEARANCE, which reads as a delete. So the edited payment is
+    // kept on screen, in the place it already held, marked as outside the search, and it stays
+    // there until the search text or the account filter is changed by hand — at which point the
+    // filter is honest again because the operator, not the panel, decided what to look at. The
+    // alternative, silently clearing the search box, throws away the filter being worked in and
+    // reshuffles every other row on screen to explain one.
     //
-    // One at a time: renaming a second payment retires the first, because the exemption exists to
+    // One at a time: editing a second payment retires the first, because the exemption exists to
     // show you the edit you just made, not to accumulate a private list beside the search.
     property var kept: null
 
-    // What the list actually shows: the core's answer, plus a kept renamed payment put back at the
+    // What the list actually shows: the core's answer, plus a kept edited payment put back at the
     // index it held. Whether the row needs keeping is decided by LOOKING at the new answer rather
     // than by re-implementing the core's matching (which spans description and payee) here.
     readonly property var listRows: root.withKept(root.rows, root.kept)
@@ -106,25 +119,161 @@ Rectangle {
         });
     }
 
-    // Relabelling a payment, not restating it: the date, the accounts and the amounts are what the
-    // money did and are edited elsewhere. Only the words are yours.
-    function rename(id, text) {
-        const description = text.trim();
-        if (description.length === 0) {
-            root.note = "a payment needs a description";
+    // ---- the editor's state ----
+    // Loaded from the row when the editor opens; the fields below are bound to nothing else, so a
+    // payment picked while another is half-edited simply replaces it.
+    property int editFrom: -1
+    property int editTo: -1
+    property int editAmountMinor: 0
+    property bool editAmountOk: false
+    property int editToMinor: 0
+    property bool editToOk: false
+    // Whether the payment is the form's shape -- one leg out, one leg in, plus a conversion's own
+    // legs if it has them -- and so gets the amount and account editors, or only the words.
+    property bool editSimple: true
+    property int editLegs: 0
+    property string editNote: ""
+
+    function currencyOf(id) {
+        const a = (root.accounts || []).find(x => x.account_id === id);
+        return a ? a.currency : "";
+    }
+    readonly property string editFromCurrency: root.currencyOf(root.editFrom)
+    readonly property string editToCurrency: root.currencyOf(root.editTo)
+    // Two currencies make it a conversion, whatever it was before: the core builds the legs, as
+    // the entry form has txn.convert build them for a new one.
+    readonly property bool editCross: root.editSimple
+                                      && root.editFromCurrency.length > 0
+                                      && root.editToCurrency.length > 0
+                                      && root.editFromCurrency !== root.editToCurrency
+    readonly property bool editComplete: root.editing >= 0
+                                         && editDate.text.length === 10
+                                         && editDesc.text.trim().length > 0
+                                         && (!root.editSimple
+                                             || (root.editAmountOk && root.editFrom >= 0 && root.editTo >= 0
+                                                 && root.editFrom !== root.editTo
+                                                 && (!root.editCross || root.editToOk)))
+    // Shown, never stored: the two real amounts are the rate.
+    readonly property string editRate: {
+        if (!root.editCross || !root.editAmountOk || !root.editToOk)
+            return "";
+        const f = root.editAmountMinor / Math.pow(10, Money.digits(root.editFromCurrency));
+        const t = root.editToMinor / Math.pow(10, Money.digits(root.editToCurrency));
+        return f === 0 ? "" : "1 " + root.editFromCurrency + " = " + (t / f).toFixed(4) + " " + root.editToCurrency;
+    }
+
+    // Open a payment in the editor, loaded from the row the list already holds: summarise carries
+    // the account ids for exactly this, so there is no round trip before the fields fill.
+    function edit(row) {
+        root.following = -1;
+        root.chain = null;
+        root.editing = row.id;
+        root.editNote = "";
+        editDate.text = row.occurred_on;
+        editDesc.text = row.description;
+        // A conversion's own legs sit in the conversion accounts; the real ones are the rest.
+        const real = (row.postings || []).filter(p => p.kind !== "conversion");
+        const from = real.find(p => p.amount_minor < 0);
+        const to = real.find(p => p.amount_minor > 0);
+        root.editLegs = real.length;
+        root.editSimple = real.length === 2 && from !== undefined && to !== undefined;
+        root.editFrom = root.editSimple ? from.account_id : -1;
+        root.editTo = root.editSimple ? to.account_id : -1;
+        fromEdit.selected = root.editFrom;
+        toEdit.selected = root.editTo;
+        root.editAmountMinor = root.editSimple ? -from.amount_minor : 0;
+        root.editAmountOk = root.editSimple;
+        root.editToMinor = root.editSimple ? to.amount_minor : 0;
+        root.editToOk = root.editSimple;
+        amountEdit.text = root.editSimple ? Money.format(-from.amount_minor, from.currency) : "";
+        arrivesEdit.text = root.editSimple ? Money.format(to.amount_minor, to.currency) : "";
+        amountEdit.invalid = false;
+        arrivesEdit.invalid = false;
+    }
+    function closeEditor() {
+        root.editing = -1;
+        root.editNote = "";
+    }
+
+    // The amount means what the core says it means, at the FROM account's scale -- the same rule
+    // and the same call as the entry form, so an edit cannot accept what a new payment refuses.
+    function validateEditAmount(text) {
+        if (text.trim().length === 0) {
+            root.editAmountOk = false;
+            amountEdit.invalid = false;
             return;
         }
-        Ledger.write("txn.rename", { id: id, description: description }, (r, e) => {
-            if (e) { root.note = e.message; return; }
+        Ledger.request("money.parse",
+                       { text: text, minor_digits: Money.digits(root.editFromCurrency) }, (r, e) => {
+            if (amountEdit.text !== text)
+                return; // she kept typing; a later answer is on its way
+            if (e) {
+                root.editAmountOk = false;
+                amountEdit.invalid = true;
+                root.editNote = e.message;
+            } else {
+                root.editAmountMinor = r.minor;
+                root.editAmountOk = r.minor > 0;
+                amountEdit.invalid = r.minor <= 0;
+                root.editNote = r.minor <= 0 ? "an amount is always positive — swap from and to to send it the other way" : "";
+            }
+        });
+    }
+    function validateEditArrives(text) {
+        if (text.trim().length === 0) {
+            root.editToOk = false;
+            arrivesEdit.invalid = false;
+            return;
+        }
+        Ledger.request("money.parse",
+                       { text: text, minor_digits: Money.digits(root.editToCurrency) }, (r, e) => {
+            if (arrivesEdit.text !== text)
+                return;
+            if (e) {
+                root.editToOk = false;
+                arrivesEdit.invalid = true;
+                root.editNote = e.message;
+            } else {
+                root.editToMinor = r.minor;
+                root.editToOk = r.minor > 0;
+                arrivesEdit.invalid = r.minor <= 0;
+                root.editNote = r.minor <= 0 ? "an amount is always positive" : "";
+            }
+        });
+    }
+    // The amounts were parsed at one scale; a different account may mean a different one.
+    onEditFromCurrencyChanged: if (root.editing >= 0 && amountEdit.text.trim().length > 0) root.validateEditAmount(amountEdit.text)
+    onEditToCurrencyChanged: if (root.editing >= 0 && arrivesEdit.text.trim().length > 0) root.validateEditArrives(arrivesEdit.text)
+
+    // One call, whatever changed: the core applies what is given and leaves the rest. The legs
+    // are restated the way the entry form states them -- money LEAVES from and ARRIVES at to --
+    // or, across currencies, as the two real amounts for the core to build the conversion from.
+    function saveEdit() {
+        if (!root.editComplete)
+            return;
+        const id = root.editing;
+        const params = { id: id, occurred_on: editDate.text, description: editDesc.text.trim() };
+        if (root.editSimple && root.editCross) {
+            params.conversion = { from_account: root.editFrom, from_minor: root.editAmountMinor,
+                                  to_account: root.editTo, to_minor: root.editToMinor };
+        } else if (root.editSimple) {
+            params.postings = [
+                { account_id: root.editFrom, amount_minor: -root.editAmountMinor },
+                { account_id: root.editTo, amount_minor: root.editAmountMinor }
+            ];
+        }
+        Ledger.write("txn.update", params, (r, e) => {
+            if (e) { root.editNote = e.message; return; }
+            root.closeEditor();
             root.note = "";
-            root.renaming = -1;
-            // The core trims before it writes, so what it echoes back is what is stored — the
-            // typed string is not necessarily it.
+            // The core answers with the payment as stored -- trimmed, legs rebuilt -- so the kept
+            // row shows what is in the book, not what was typed.
             const at = root.listRows.findIndex(x => x.id === id);
             root.kept = at < 0 ? null
                       : { id: id, at: at,
                           row: Object.assign({}, root.listRows[at],
-                                             { description: r.description }) };
+                                             { occurred_on: r.occurred_on, description: r.description,
+                                               postings: r.postings }) };
             root.refreshCurrent();
         });
     }
@@ -171,6 +320,7 @@ Rectangle {
     }
 
     function follow(id) {
+        root.closeEditor();
         root.following = id;
         Ledger.request("link.chain", { txn_id: id }, (r, e) => {
             root.chain = e ? null : r;
@@ -239,7 +389,7 @@ Rectangle {
             Text {
                 anchors.verticalCenter: parent.verticalCenter
                 visible: root.listRows.length > root.rows.length
-                text: "+1 renamed"
+                text: "+1 edited"
                 color: Theme.warnAmber
                 font.family: Theme.monoFamily
                 font.pixelSize: Theme.fontSize - 3
@@ -266,7 +416,7 @@ Rectangle {
 
             // ---- the ledger ----
             Rectangle {
-                width: root.following >= 0 ? parent.width * 0.56 : parent.width
+                width: root.sideOpen ? parent.width * 0.56 : parent.width
                 height: parent.height
                 color: Theme.ground
                 radius: 5
@@ -282,38 +432,28 @@ Rectangle {
                         id: prow
                         required property var modelData
                         readonly property bool held: root.isKept(prow.modelData.id)
-                        readonly property bool editing: root.renaming === prow.modelData.id
+                        readonly property bool editing: root.editing === prow.modelData.id
+                        readonly property bool marked: root.following === prow.modelData.id || prow.editing
                         width: ListView.view.width
-                        // Grows to carry the rename editor beneath the row it belongs to, so the
-                        // payment stays readable while its words are being retyped.
-                        height: prow.editing ? 86 : 34
+                        height: 34
                         radius: 3
                         color: root.isPicked(prow.modelData.id) ? Theme.purpleDim
                              : phov.containsMouse ? Theme.surface : "transparent"
-                        border.width: root.following === prow.modelData.id || prow.held ? 1 : 0
-                        border.color: root.following === prow.modelData.id
-                                      ? Theme.purple : Theme.warnAmber
+                        border.width: prow.marked || prow.held ? 1 : 0
+                        border.color: prow.marked ? Theme.purple : Theme.warnAmber
 
-                        // Top strip only: the row GROWS when the editor opens beneath it, and a
-                        // filling hit area would make a click into the editor tick the payment.
                         MouseArea {
                             id: phov
-                            anchors.top: parent.top
-                            anchors.left: parent.left
-                            anchors.right: parent.right
-                            height: 34
+                            anchors.fill: parent
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
                             onClicked: root.toggle(prow.modelData.id)
                         }
 
                         Row {
-                            anchors.top: parent.top
-                            anchors.left: parent.left
-                            anchors.right: parent.right
+                            anchors.fill: parent
                             anchors.leftMargin: 6
                             anchors.rightMargin: 6
-                            height: 34
                             spacing: 8
                             Text {
                                 width: 14
@@ -358,7 +498,7 @@ Rectangle {
                                         width: 140
                                         visible: prow.held
                                         elide: Text.ElideRight
-                                        text: "· renamed, not in this search"
+                                        text: "· edited, not in this search"
                                         color: Theme.warnAmber
                                         font.family: Theme.fontFamily
                                         font.pixelSize: Theme.fontSize - 4
@@ -381,13 +521,10 @@ Rectangle {
                                 label: "✎"
                                 primary: prow.editing
                                 onClicked: {
-                                    if (prow.editing) {
-                                        root.renaming = -1;
-                                    } else {
-                                        root.renaming = prow.modelData.id;
-                                        nameEdit.text = prow.modelData.description;
-                                        nameEdit.focusInput();
-                                    }
+                                    if (prow.editing)
+                                        root.closeEditor();
+                                    else
+                                        root.edit(prow.modelData);
                                 }
                             }
                             // The chain marker doubles as the way in: a payment that is already
@@ -415,39 +552,180 @@ Rectangle {
                                 }
                             }
                         }
+                    }
+                }
+            }
 
-                        // The rename editor, below the payment it renames.
-                        Row {
-                            visible: prow.editing
-                            anchors.left: parent.left
-                            anchors.leftMargin: 28
-                            anchors.right: parent.right
-                            anchors.rightMargin: 6
-                            anchors.bottom: parent.bottom
-                            anchors.bottomMargin: 4
-                            spacing: 6
-                            Field {
-                                id: nameEdit
-                                width: parent.width - 100
-                                label: "description"
-                                placeholder: "what this payment was"
-                                onAccepted: root.rename(prow.modelData.id, nameEdit.text)
+            // ---- editing a payment ----
+            // Always instantiated, so the fields exist for edit() to fill: hidden rather than
+            // absent, in the space the thread pane otherwise takes.
+            Rectangle {
+                visible: root.editing >= 0
+                width: parent.width * 0.44 - 10
+                height: parent.height
+                color: Theme.ground
+                radius: 5
+                border.width: 1
+                border.color: Theme.purple
+
+                Column {
+                    id: editCol
+                    anchors.fill: parent
+                    anchors.margins: 8
+                    spacing: 6
+
+                    Row {
+                        width: parent.width
+                        spacing: 6
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "EDIT PAYMENT #" + root.editing
+                            color: Theme.purple
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSize - 3
+                        }
+                        Item { width: parent.width - 190; height: 1 }
+                        PushButton {
+                            implicitHeight: 22
+                            label: "close"
+                            onClicked: root.closeEditor()
+                        }
+                    }
+
+                    Row {
+                        id: editTop
+                        width: parent.width
+                        spacing: 6
+                        Field {
+                            id: editDate
+                            width: 118
+                            label: "date"
+                            placeholder: "YYYY-MM-DD"
+                            numeric: true
+                            onAccepted: root.saveEdit()
+                        }
+                        Field {
+                            id: amountEdit
+                            visible: root.editSimple
+                            width: editTop.width - 118 - 6
+                            label: root.editFromCurrency.length > 0
+                                   ? "amount (" + root.editFromCurrency + ")" : "amount"
+                            placeholder: "0.00"
+                            numeric: true
+                            onEdited: value => root.validateEditAmount(value)
+                            onAccepted: root.saveEdit()
+                        }
+                    }
+
+                    DescriptionPicker {
+                        id: editDesc
+                        width: parent.width
+                        label: "description"
+                        placeholder: "what was it?"
+                        onAccepted: root.saveEdit()
+                    }
+
+                    Row {
+                        id: editPickers
+                        visible: root.editSimple
+                        width: parent.width
+                        spacing: 6
+                        AccountPicker {
+                            id: fromEdit
+                            width: (editPickers.width - 6) / 2
+                            label: "from"
+                            accounts: root.accounts
+                            onPicked: id => root.editFrom = id
+                        }
+                        AccountPicker {
+                            id: toEdit
+                            width: (editPickers.width - 6) / 2
+                            label: "to"
+                            accounts: root.accounts
+                            onPicked: id => root.editTo = id
+                        }
+                    }
+
+                    // Only across currencies. What arrived is asked for, not calculated: the
+                    // rate that matters is the one the bank gave, and only the two amounts know it.
+                    Row {
+                        id: editFx
+                        visible: root.editCross
+                        width: parent.width
+                        spacing: 6
+                        Field {
+                            id: arrivesEdit
+                            width: 118
+                            label: "arrives as (" + root.editToCurrency + ")"
+                            placeholder: "0.00"
+                            numeric: true
+                            onEdited: value => root.validateEditArrives(value)
+                            onAccepted: root.saveEdit()
+                        }
+                        Column {
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: editFx.width - 118 - 6
+                            spacing: 1
+                            Text {
+                                width: parent.width
+                                elide: Text.ElideRight
+                                text: root.editRate.length > 0 ? root.editRate : "enter what arrived"
+                                color: root.editRate.length > 0 ? Theme.text : Theme.textFaint
+                                font.family: Theme.monoFamily
+                                font.pixelSize: Theme.fontSize - 3
                             }
-                            PushButton {
-                                anchors.verticalCenter: parent.verticalCenter
-                                implicitWidth: 44
-                                implicitHeight: 22
-                                label: "save"
-                                primary: true
-                                onClicked: root.rename(prow.modelData.id, nameEdit.text)
+                            Text {
+                                width: parent.width
+                                elide: Text.ElideRight
+                                text: "a conversion: two real amounts, not a stored rate"
+                                color: Theme.textFaint
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 4
                             }
-                            PushButton {
-                                anchors.verticalCenter: parent.verticalCenter
-                                implicitWidth: 44
-                                implicitHeight: 22
-                                label: "cancel"
-                                onClicked: root.renaming = -1
-                            }
+                        }
+                    }
+
+                    // A split is not the form's shape, and the editor does not pretend it is.
+                    Text {
+                        visible: !root.editSimple
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        text: "This payment has " + root.editLegs + " legs of its own, so only its "
+                            + "date and description can be changed here."
+                        color: Theme.textFaint
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSize - 3
+                    }
+
+                    Text {
+                        visible: root.editNote.length > 0
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        text: root.editNote
+                        color: Theme.red
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSize - 3
+                    }
+
+                    Row {
+                        spacing: 6
+                        PushButton {
+                            label: "Save"
+                            primary: true
+                            enabled: root.editComplete
+                            onClicked: root.saveEdit()
+                        }
+                        PushButton {
+                            label: "Cancel"
+                            onClicked: root.closeEditor()
+                        }
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            visible: root.editSimple && root.editFrom >= 0 && root.editFrom === root.editTo
+                            text: "from and to must differ"
+                            color: Theme.warnAmber
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSize - 3
                         }
                     }
                 }

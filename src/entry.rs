@@ -15,6 +15,7 @@
 use rusqlite::{Connection, Transaction};
 use std::collections::BTreeMap;
 
+use crate::fx::FxError;
 use crate::link::{self, LinkError};
 use crate::money::Minor;
 
@@ -55,6 +56,46 @@ pub struct NewChain {
     pub hops: Vec<NewHop>,
 }
 
+/// A conversion's two real legs, for `update`: what left `from_account` and what arrived at
+/// `to_account`, both positive. The conversion legs that make each currency balance are built by
+/// the core, exactly as `txn.convert` builds them.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NewConversion {
+    pub from_account: i64,
+    pub from_minor: Minor,
+    pub to_account: i64,
+    pub to_minor: Minor,
+}
+
+/// What `update` may change about a payment. An absent field is left as it is, so a caller says
+/// only what it means to change and a form that was saved untouched changes nothing.
+///
+/// `payee` and `note` are optional twice over: absent leaves them alone, `null` clears them.
+/// `postings` replaces every leg with the ones given, checked like a new payment's; `conversion`
+/// does the same for a cross-currency payment, whose legs a caller cannot write by hand because
+/// two of them sit in system accounts. One or the other, never both.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct TxnPatch {
+    #[serde(default)]
+    pub occurred_on: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default, deserialize_with = "given")]
+    pub payee: Option<Option<String>>,
+    #[serde(default, deserialize_with = "given")]
+    pub note: Option<Option<String>>,
+    #[serde(default)]
+    pub postings: Option<Vec<NewPosting>>,
+    #[serde(default)]
+    pub conversion: Option<NewConversion>,
+}
+
+/// Serde folds a missing field and an explicit `null` into the same `None`; wrapping the value
+/// as it is read keeps them apart, so that `"payee": null` can mean "clear it".
+fn given<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<Option<String>>, D::Error> {
+    <Option<String> as serde::Deserialize>::deserialize(de).map(Some)
+}
+
 #[derive(Debug)]
 pub enum EntryError {
     Sql(rusqlite::Error),
@@ -70,6 +111,9 @@ pub enum EntryError {
     /// A payment chain that cannot be recorded as asked. The message says why in the operator's
     /// terms; nothing of the chain is written.
     Chain(String),
+    /// An edit that cannot be applied as asked -- a blank description, a day that does not exist,
+    /// two ways of restating the legs at once. Nothing is written.
+    Invalid(String),
 }
 
 impl std::fmt::Display for EntryError {
@@ -88,6 +132,7 @@ impl std::fmt::Display for EntryError {
             }
             EntryError::NotFound(id) => write!(f, "no such transaction: {id}"),
             EntryError::Chain(msg) => write!(f, "{msg}"),
+            EntryError::Invalid(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -107,6 +152,17 @@ impl From<LinkError> for EntryError {
 impl From<rusqlite::Error> for EntryError {
     fn from(e: rusqlite::Error) -> Self {
         EntryError::Sql(e)
+    }
+}
+
+impl From<FxError> for EntryError {
+    fn from(e: FxError) -> Self {
+        match e {
+            FxError::Sql(e) => EntryError::Sql(e),
+            // Only SameCurrency can reach here, and it is a refusal in the operator's terms: the
+            // two accounts hold the same currency, so the payment is a plain one, not a conversion.
+            other => EntryError::Invalid(other.to_string()),
+        }
     }
 }
 
@@ -299,6 +355,132 @@ pub fn create_chain(conn: &mut Connection, chain: &NewChain) -> Result<Vec<i64>,
     Ok(txn_ids)
 }
 
+/// Change a payment in place: any of its date, description, payee, note and legs, all of it or
+/// none, and answer with the payment as it now reads.
+///
+/// IN PLACE, NOT DELETE AND RE-CREATE. The id is what everything else holds on to -- the links
+/// that thread it into a chain, the journey it is a member of, the import key that stops a
+/// re-imported statement duplicating it, the slot a matched series occurrence claims -- and every
+/// one of those would be lost by recording it afresh. The postings are the exception: their ids
+/// are referenced by nothing, so replacing the legs replaces the rows, and only when the legs
+/// actually differ, so an edit that restated them unchanged leaves them untouched.
+///
+/// THE SAME RULES AS A NEW PAYMENT. Legs given here go through the checks `create` applies --
+/// two at least, balanced per currency, no system accounts -- so an edited payment is never one
+/// that could not have been recorded. That also means the legs of a conversion cannot be restated
+/// as `postings`: two of them sit in system accounts. `conversion` exists for that, and builds
+/// the four legs the way `txn.convert` does. A conversion may become a plain payment this way, and
+/// a plain payment a conversion; both are just a payment whose legs changed.
+///
+/// NOT REFUSED ON PROVENANCE, as `txn.rename` is not: an imported or generated payment is the
+/// operator's to correct. What is left alone is what the edit does not mention -- the series slot
+/// it may claim (`occurrence_on` is the slot's identity, not the day the money moved) and its
+/// source.
+pub fn update(conn: &mut Connection, id: i64, patch: &TxnPatch) -> Result<serde_json::Value, EntryError> {
+    if patch.postings.is_some() && patch.conversion.is_some() {
+        return Err(EntryError::Invalid(
+            "give the legs as postings or as a conversion, not both".to_string(),
+        ));
+    }
+    let tx = conn.transaction()?;
+    // Existence first: an empty patch on a missing payment is still "no such transaction".
+    tx.query_row("SELECT 1 FROM txn WHERE id = ?1", [id], |_| Ok(()))
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => EntryError::NotFound(id),
+            other => EntryError::Sql(other),
+        })?;
+
+    if let Some(on) = &patch.occurred_on {
+        // The schema's CHECK would refuse this too, as a constraint failure naming a column. The
+        // operator typed a date, so the refusal should name the date.
+        let canonical: Option<String> = tx.query_row("SELECT date(?1)", [on], |r| r.get(0))?;
+        if canonical.as_deref() != Some(on.as_str()) {
+            return Err(EntryError::Invalid(format!("no such day: {on}")));
+        }
+        tx.execute("UPDATE txn SET occurred_on = ?2 WHERE id = ?1", rusqlite::params![id, on])?;
+    }
+    if let Some(desc) = &patch.description {
+        // NOT NULL is happy with a blank one, and a payment with no readable label cannot be
+        // picked out of a list at all. Trimmed, as txn.rename stores it.
+        let desc = desc.trim();
+        if desc.is_empty() {
+            return Err(EntryError::Invalid("description must not be empty".to_string()));
+        }
+        tx.execute("UPDATE txn SET description = ?2 WHERE id = ?1", rusqlite::params![id, desc])?;
+    }
+    // A blank payee or note is the same as none: NULL rather than a row that reads as having one.
+    let blank_is_null = |v: &Option<String>| -> Option<String> {
+        v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    };
+    if let Some(payee) = &patch.payee {
+        tx.execute(
+            "UPDATE txn SET payee = ?2 WHERE id = ?1",
+            rusqlite::params![id, blank_is_null(payee)],
+        )?;
+    }
+    if let Some(note) = &patch.note {
+        tx.execute(
+            "UPDATE txn SET note = ?2 WHERE id = ?1",
+            rusqlite::params![id, blank_is_null(note)],
+        )?;
+    }
+
+    // The legs to write, as (account, currency, amount), from whichever form the patch gave them.
+    let legs: Option<Vec<(i64, String, Minor)>> = if let Some(postings) = &patch.postings {
+        if postings.len() < 2 {
+            return Err(EntryError::TooFewPostings);
+        }
+        let currencies = resolve_currencies(&tx, postings)?;
+        let residual = residual(postings, &currencies);
+        if !residual.is_empty() {
+            return Err(EntryError::Unbalanced(residual));
+        }
+        Some(
+            postings
+                .iter()
+                .zip(currencies)
+                .map(|(p, cur)| (p.account_id, cur, p.amount_minor))
+                .collect(),
+        )
+    } else if let Some(c) = &patch.conversion {
+        if c.from_minor <= 0 || c.to_minor <= 0 {
+            return Err(EntryError::Invalid(
+                "a conversion's amounts are what left and what arrived, both positive".to_string(),
+            ));
+        }
+        // Through the same lookup as a new payment's legs, so an unknown or system account is
+        // refused with the same words before the conversion accounts are consulted.
+        let probe = [
+            NewPosting { account_id: c.from_account, amount_minor: -c.from_minor },
+            NewPosting { account_id: c.to_account, amount_minor: c.to_minor },
+        ];
+        resolve_currencies(&tx, &probe)?;
+        Some(crate::fx::conversion_legs(&tx, c.from_account, c.from_minor, c.to_account, c.to_minor)?)
+    } else {
+        None
+    };
+    if let Some(legs) = legs {
+        let mut st = tx.prepare(
+            "SELECT account_id, currency, amount_minor FROM posting WHERE txn_id = ?1 ORDER BY id",
+        )?;
+        let current: Vec<(i64, String, Minor)> = st
+            .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        drop(st);
+        if current != legs {
+            tx.execute("DELETE FROM posting WHERE txn_id = ?1", [id])?;
+            let mut st = tx.prepare(
+                "INSERT INTO posting(txn_id, account_id, currency, amount_minor) VALUES(?1,?2,?3,?4)",
+            )?;
+            for (account_id, currency, amount_minor) in &legs {
+                st.execute(rusqlite::params![id, account_id, currency, amount_minor])?;
+            }
+        }
+    }
+    tx.commit()?;
+    get(conn, id)
+}
+
 /// Delete a transaction. Postings go with it via ON DELETE CASCADE.
 pub fn delete(conn: &Connection, id: i64) -> Result<(), EntryError> {
     let n = conn.execute("DELETE FROM txn WHERE id = ?1", [id])?;
@@ -329,8 +511,11 @@ pub fn get(conn: &Connection, id: i64) -> Result<serde_json::Value, EntryError> 
             other => EntryError::Sql(other),
         })?;
 
+    // `kind` rides along so a reader can tell a conversion's own legs from the real ones without
+    // a second lookup -- summarise carries it for the same reason, and an editor that loads a
+    // payment from either answer sees the same shape.
     let mut stmt = conn.prepare(
-        "SELECT p.id, p.account_id, a.name, p.currency, p.amount_minor
+        "SELECT p.id, p.account_id, a.name, a.kind, p.currency, p.amount_minor
            FROM posting p JOIN account a ON a.id = p.account_id
           WHERE p.txn_id = ?1 ORDER BY p.id",
     )?;
@@ -340,8 +525,9 @@ pub fn get(conn: &Connection, id: i64) -> Result<serde_json::Value, EntryError> 
                 "id": r.get::<_, i64>(0)?,
                 "account_id": r.get::<_, i64>(1)?,
                 "account": r.get::<_, String>(2)?,
-                "currency": r.get::<_, String>(3)?,
-                "amount_minor": r.get::<_, i64>(4)?,
+                "kind": r.get::<_, String>(3)?,
+                "currency": r.get::<_, String>(4)?,
+                "amount_minor": r.get::<_, i64>(5)?,
             }))
         })?
         .collect::<Result<_, _>>()?;
@@ -408,7 +594,7 @@ pub fn summarise(conn: &Connection, ids: &[i64]) -> Result<Vec<serde_json::Value
     // Postings come as a second pass rather than a join: joining would fan each transaction out
     // into one row per posting and the caller would have to regroup them.
     let mut st = conn.prepare(&format!(
-        "SELECT p.txn_id, a.name, a.kind, p.currency, p.amount_minor
+        "SELECT p.txn_id, p.account_id, a.name, a.kind, p.currency, p.amount_minor
            FROM posting p JOIN account a ON a.id = p.account_id
           WHERE p.txn_id IN ({list})
           ORDER BY p.txn_id, p.amount_minor"
@@ -418,10 +604,11 @@ pub fn summarise(conn: &Connection, ids: &[i64]) -> Result<Vec<serde_json::Value
         Ok((
             r.get::<_, i64>(0)?,
             serde_json::json!({
-                "account": r.get::<_, String>(1)?,
-                "kind": r.get::<_, String>(2)?,
-                "currency": r.get::<_, String>(3)?,
-                "amount_minor": r.get::<_, Minor>(4)?,
+                "account_id": r.get::<_, i64>(1)?,
+                "account": r.get::<_, String>(2)?,
+                "kind": r.get::<_, String>(3)?,
+                "currency": r.get::<_, String>(4)?,
+                "amount_minor": r.get::<_, Minor>(5)?,
             }),
         ))
     })? {
@@ -782,6 +969,203 @@ mod tests {
         // newest first
         let all = list(&c, None, None, 100).unwrap();
         assert_eq!(all[0]["occurred_on"], "2026-12-15");
+    }
+
+    fn ids_of(c: &Connection, txn: i64) -> Vec<i64> {
+        let mut st = c.prepare("SELECT id FROM posting WHERE txn_id = ?1 ORDER BY id").unwrap();
+        st.query_map([txn], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+    }
+
+    fn balance_of(c: &Connection, name: &str) -> i64 {
+        balances(c, None).unwrap().iter().find(|b| b["name"] == name).unwrap()["balance_minor"]
+            .as_i64()
+            .unwrap()
+    }
+
+    #[test]
+    fn update_corrects_the_record_under_the_same_id() {
+        let mut c = book();
+        // Rent paid, but typed against Salary and a tenner short, on the wrong day.
+        let id = create(&mut c, &txn(vec![p(1, -89_000), p(2, 89_000)])).unwrap();
+        let got = update(
+            &mut c,
+            id,
+            &TxnPatch {
+                occurred_on: Some("2026-09-01".into()),
+                description: Some("  Rent — flat  ".into()),
+                payee: Some(Some("Landlord".into())),
+                postings: Some(vec![p(1, -90_000), p(3, 90_000)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(got["id"], id);
+        assert_eq!(got["occurred_on"], "2026-09-01");
+        assert_eq!(got["description"], "Rent — flat", "stored trimmed");
+        assert_eq!(got["payee"], "Landlord");
+        assert_eq!(got["source"], "manual", "provenance is not the edit's to change");
+        assert_eq!(got["postings"].as_array().unwrap().len(), 2);
+        assert_eq!(balance_of(&c, "Current"), -90_000);
+        assert_eq!(balance_of(&c, "Rent"), 90_000);
+        assert_eq!(balance_of(&c, "Salary"), 0, "the leg moved off the wrong account");
+        assert_eq!(
+            crate::db::integrity(&c).unwrap()["ok"],
+            serde_json::json!(true)
+        );
+
+        // Clearing a payee is saying so explicitly; not mentioning it leaves it.
+        let got = update(&mut c, id, &TxnPatch::default()).unwrap();
+        assert_eq!(got["payee"], "Landlord");
+        let got = update(&mut c, id, &TxnPatch { payee: Some(None), ..Default::default() }).unwrap();
+        assert_eq!(got["payee"], serde_json::Value::Null);
+        let got =
+            update(&mut c, id, &TxnPatch { note: Some(Some("  ".into())), ..Default::default() })
+                .unwrap();
+        assert_eq!(got["note"], serde_json::Value::Null, "a blank note is no note");
+    }
+
+    #[test]
+    fn update_leaves_legs_alone_when_they_are_restated_unchanged() {
+        let mut c = book();
+        let id = create(&mut c, &txn(vec![p(1, -90_000), p(3, 90_000)])).unwrap();
+        // A later payment holds the highest posting ids, so rewritten legs of the first cannot
+        // get their old ids back by rowid reuse and the difference is observable.
+        create(&mut c, &txn(vec![p(1, -100), p(2, 100)])).unwrap();
+        let before = ids_of(&c, id);
+        update(
+            &mut c,
+            id,
+            &TxnPatch {
+                description: Some("still rent".into()),
+                postings: Some(vec![p(1, -90_000), p(3, 90_000)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids_of(&c, id), before, "identical legs keep their rows");
+        update(&mut c, id, &TxnPatch { postings: Some(vec![p(1, -95_000), p(3, 95_000)]), ..Default::default() })
+            .unwrap();
+        assert_ne!(ids_of(&c, id), before, "different legs are new rows");
+        assert_eq!(ids_of(&c, id).len(), 2);
+    }
+
+    #[test]
+    fn update_refuses_what_create_refuses_and_writes_nothing() {
+        let mut c = book();
+        let id = create(&mut c, &txn(vec![p(1, -90_000), p(3, 90_000)])).unwrap();
+        let before = get(&c, id).unwrap();
+        let legs = |v: Vec<NewPosting>| TxnPatch { postings: Some(v), ..Default::default() };
+
+        assert!(matches!(
+            update(&mut c, id, &legs(vec![p(1, -90_000), p(3, 89_000)])),
+            Err(EntryError::Unbalanced(_))
+        ));
+        assert!(matches!(
+            update(&mut c, id, &legs(vec![p(1, -90_000), p(9, 90_000)])),
+            Err(EntryError::SystemAccount(_))
+        ));
+        assert!(matches!(
+            update(&mut c, id, &legs(vec![p(1, -90_000), p(404, 90_000)])),
+            Err(EntryError::NoSuchAccount(404))
+        ));
+        assert!(matches!(update(&mut c, id, &legs(vec![p(1, 0)])), Err(EntryError::TooFewPostings)));
+        // Cross-currency legs are unbalanced per currency, exactly as they would be on create.
+        assert!(matches!(
+            update(&mut c, id, &legs(vec![p(1, -90_000), p(4, 90_000)])),
+            Err(EntryError::Unbalanced(_))
+        ));
+        assert!(matches!(
+            update(&mut c, id, &TxnPatch { occurred_on: Some("2026-02-30".into()), ..Default::default() }),
+            Err(EntryError::Invalid(_))
+        ));
+        assert!(matches!(
+            update(&mut c, id, &TxnPatch { description: Some("  ".into()), ..Default::default() }),
+            Err(EntryError::Invalid(_))
+        ));
+        assert!(matches!(
+            update(
+                &mut c,
+                id,
+                &TxnPatch {
+                    postings: Some(vec![p(1, -1), p(3, 1)]),
+                    conversion: Some(NewConversion { from_account: 1, from_minor: 1, to_account: 4, to_minor: 1 }),
+                    ..Default::default()
+                }
+            ),
+            Err(EntryError::Invalid(_))
+        ));
+        assert!(matches!(update(&mut c, 404, &TxnPatch::default()), Err(EntryError::NotFound(404))));
+
+        // A refusal after a field had already been updated inside the transaction must roll the
+        // whole edit back: the date here is fine, the legs are not.
+        assert!(update(
+            &mut c,
+            id,
+            &TxnPatch {
+                occurred_on: Some("2026-09-01".into()),
+                postings: Some(vec![p(1, -90_000), p(3, 89_000)]),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert_eq!(get(&c, id).unwrap(), before, "nothing of a refused edit is kept");
+    }
+
+    #[test]
+    fn update_can_make_a_conversion_and_unmake_it() {
+        let mut c = book();
+        let id = create(&mut c, &txn(vec![p(1, -10_000), p(3, 10_000)])).unwrap();
+        // Actually it was money sent to the euro pot: a conversion, which needs its own legs.
+        let got = update(
+            &mut c,
+            id,
+            &TxnPatch {
+                conversion: Some(NewConversion {
+                    from_account: 1,
+                    from_minor: 10_000,
+                    to_account: 4,
+                    to_minor: 11_500,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(got["postings"].as_array().unwrap().len(), 4, "two real legs, two conversion legs");
+        assert_eq!(balance_of(&c, "Current"), -10_000);
+        assert_eq!(balance_of(&c, "Euro pot"), 11_500);
+        assert_eq!(balance_of(&c, "Rent"), 0);
+        assert_eq!(crate::db::integrity(&c).unwrap()["ok"], serde_json::json!(true));
+
+        // Both sides in one currency is not a conversion, and says so rather than writing legs.
+        assert!(matches!(
+            update(
+                &mut c,
+                id,
+                &TxnPatch {
+                    conversion: Some(NewConversion { from_account: 1, from_minor: 1, to_account: 3, to_minor: 1 }),
+                    ..Default::default()
+                }
+            ),
+            Err(EntryError::Invalid(_))
+        ));
+        assert!(matches!(
+            update(
+                &mut c,
+                id,
+                &TxnPatch {
+                    conversion: Some(NewConversion { from_account: 1, from_minor: -1, to_account: 4, to_minor: 1 }),
+                    ..Default::default()
+                }
+            ),
+            Err(EntryError::Invalid(_))
+        ));
+
+        // And back to a plain payment: the conversion legs go with the rest.
+        let got = update(&mut c, id, &TxnPatch { postings: Some(vec![p(1, -10_000), p(3, 10_000)]), ..Default::default() })
+            .unwrap();
+        assert_eq!(got["postings"].as_array().unwrap().len(), 2);
+        assert_eq!(balance_of(&c, "Euro pot"), 0);
+        assert_eq!(crate::db::integrity(&c).unwrap()["ok"], serde_json::json!(true));
     }
 
     #[test]

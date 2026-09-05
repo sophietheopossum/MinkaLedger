@@ -118,6 +118,7 @@ impl From<entry::EntryError> for Error {
             E::SystemAccount(_) => "system_account",
             E::NotFound(_) => "not_found",
             E::Chain(_) => "bad_chain",
+            E::Invalid(_) => "bad_params",
             E::Sql(_) => "sql",
         };
         Error { code, message: e.to_string() }
@@ -882,6 +883,19 @@ fn dispatch(
                 });
             }
             Ok(serde_json::json!({ "id": id, "description": desc }))
+        }
+
+        // The rest of a payment is editable too: the date, the accounts and the amounts, which
+        // txn.rename leaves alone. A wrong amount or a payment put against the wrong account is a
+        // mistake in the record, and a record that can only be deleted and retyped loses the links,
+        // the import key and the series slot that hang off the id. Anything not mentioned stays as
+        // it is; the legs, when given, are checked exactly as a new payment's are. See
+        // entry::update for the shape.
+        "txn.update" => {
+            let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
+            let patch: entry::TxnPatch = serde_json::from_value(params)
+                .map_err(|e| bad(&format!("txn.update takes id and any of occurred_on, description, payee, note, postings or conversion: {e}")))?;
+            Ok(entry::update(conn, id, &patch)?)
         }
 
         "txn.delete" => {

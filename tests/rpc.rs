@@ -1135,6 +1135,82 @@ fn a_payment_can_be_relabelled_without_touching_what_it_records() {
     assert_eq!(out[9]["result"]["ok"], true);
 }
 
+/// A wrong amount, a wrong day or a wrong account is a mistake in the record, and the fix must not
+/// cost what hangs off the payment's id -- here, the link that threads it to the refund. Deleting
+/// and retyping would drop that; txn.update keeps it, and the browser sees the corrected payment
+/// under the same id.
+#[test]
+fn a_payment_can_be_corrected_without_losing_what_hangs_off_it() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Shop","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"Groceries","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":4,"method":"account.create","params":{"name":"Euro pot","kind":"asset","currency":"EUR"}}"#,
+        r#"{"id":5,"method":"txn.create","params":{"occurred_on":"2026-08-25","description":"TESCO run",
+             "payee":"Tesco","postings":[{"account_id":1,"amount_minor":-1000},{"account_id":2,"amount_minor":1000}]}}"#,
+        r#"{"id":6,"method":"txn.create","params":{"occurred_on":"2026-08-26","description":"refund",
+             "postings":[{"account_id":1,"amount_minor":500},{"account_id":2,"amount_minor":-500}]}}"#,
+        r#"{"id":7,"method":"link.create","params":{"from_txn":1,"to_txn":2}}"#,
+        // It was £12.50 on the 24th, and it belongs in Groceries.
+        r#"{"id":8,"method":"txn.update","params":{"id":1,"occurred_on":"2026-08-24","description":" Weekly shop ",
+             "postings":[{"account_id":1,"amount_minor":-1250},{"account_id":3,"amount_minor":1250}]}}"#,
+        r#"{"id":9,"method":"link.chain","params":{"txn_id":2}}"#,
+        r#"{"id":10,"method":"txn.browse","params":{"account_id":3}}"#,
+        r#"{"id":11,"method":"account.balances"}"#,
+        r#"{"id":12,"method":"txn.update","params":{"id":1,"description":"  "}}"#,
+        r#"{"id":13,"method":"txn.update","params":{"id":1,"occurred_on":"2026-13-01"}}"#,
+        r#"{"id":14,"method":"txn.update","params":{"id":404,"description":"Ghost"}}"#,
+        r#"{"id":15,"method":"txn.update","params":{"id":1,"postings":[{"account_id":1,"amount_minor":-1250},{"account_id":3,"amount_minor":1200}]}}"#,
+        r#"{"id":16,"method":"txn.update","params":{"id":1}}"#,
+        // The same payment turns out to have been money sent to the euro pot: a conversion.
+        r#"{"id":17,"method":"txn.update","params":{"id":1,"conversion":{"from_account":1,"from_minor":1250,"to_account":4,"to_minor":1450}}}"#,
+        r#"{"id":18,"method":"txn.get","params":{"id":1}}"#,
+        r#"{"id":19,"method":"db.check"}"#,
+    ]);
+
+    let edited = &out[7]["result"];
+    assert!(err_of(&out[7]).is_none(), "{}", out[7]);
+    assert_eq!(edited["id"], 1, "same payment, corrected");
+    assert_eq!(edited["occurred_on"], "2026-08-24");
+    assert_eq!(edited["description"], "Weekly shop", "stored trimmed");
+    assert_eq!(edited["payee"], "Tesco", "not mentioned, so not touched");
+    let legs = edited["postings"].as_array().unwrap();
+    assert_eq!(legs.len(), 2);
+    assert!(legs.iter().any(|p| p["account"] == "Groceries" && p["amount_minor"] == 1250));
+
+    // The thread survived the edit, and reads the corrected payment.
+    let chain = &out[8]["result"];
+    assert_eq!(chain["nodes"].as_array().unwrap().len(), 2, "still linked to the refund");
+    let node = chain["nodes"].as_array().unwrap().iter().find(|n| n["id"] == 1).unwrap();
+    assert_eq!(node["description"], "Weekly shop");
+    assert_eq!(node["occurred_on"], "2026-08-24");
+
+    // The browser finds it under its new account, and the balances moved with it.
+    assert_eq!(out[9]["result"]["total"], 1);
+    let bal = |name: &str| -> i64 {
+        out[10]["result"].as_array().unwrap().iter().find(|b| b["name"] == name).unwrap()
+            ["balance_minor"].as_i64().unwrap()
+    };
+    assert_eq!(bal("Groceries"), 1250);
+    assert_eq!(bal("Shop"), -500, "only the refund is left there");
+    assert_eq!(bal("Current"), -750);
+
+    assert_eq!(out[11]["error"]["code"], "bad_params", "a blank description is refused");
+    assert_eq!(out[12]["error"]["code"], "bad_params", "a day that does not exist is refused");
+    assert!(out[12]["error"]["message"].as_str().unwrap().contains("2026-13-01"), "{}", out[12]);
+    assert_eq!(out[13]["error"]["code"], "not_found");
+    assert_eq!(out[14]["error"]["code"], "unbalanced", "the same rule as recording it");
+    assert!(err_of(&out[15]).is_none(), "saving a form untouched changes nothing and is not an error");
+    assert_eq!(out[15]["result"]["occurred_on"], "2026-08-24", "the refusals wrote nothing");
+
+    assert!(err_of(&out[16]).is_none(), "{}", out[16]);
+    let after = &out[17]["result"];
+    assert_eq!(after["postings"].as_array().unwrap().len(), 4, "two real legs, two conversion legs");
+    assert!(after["postings"].as_array().unwrap().iter().any(|p| p["account"] == "Euro pot" && p["amount_minor"] == 1450));
+    assert_eq!(after["description"], "Weekly shop", "the legs changed, the words did not");
+    assert_eq!(out[18]["result"]["ok"], true, "the book balances after every edit");
+}
+
 /// The one that matters: renaming a PLAN must not rewrite HISTORY.
 ///
 /// A projected occurrence takes its description from the series row, so a transaction generated
