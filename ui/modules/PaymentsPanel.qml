@@ -918,13 +918,28 @@ Rectangle {
                                 font.family: Theme.monoFamily
                                 font.pixelSize: Theme.fontSize - 4
                             }
-                            Text {
+                            // Words, then where the money went: the same two lines a payment
+                            // gets in the list, so a member of the thread reads the same there
+                            // and here.
+                            Column {
                                 width: parent.width - 160
-                                elide: Text.ElideRight
-                                text: node.modelData.description
-                                color: node.modelData.is_root ? Theme.text : Theme.textMuted
-                                font.family: Theme.fontFamily
-                                font.pixelSize: Theme.fontSize - 3
+                                spacing: 0
+                                Text {
+                                    width: parent.width
+                                    elide: Text.ElideRight
+                                    text: node.modelData.description
+                                    color: node.modelData.is_root ? Theme.text : Theme.textMuted
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize - 3
+                                }
+                                Text {
+                                    width: parent.width
+                                    elide: Text.ElideRight
+                                    text: root.route(node.modelData)
+                                    color: Theme.textFaint
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize - 5
+                                }
                             }
                             Text {
                                 width: 62
