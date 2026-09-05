@@ -18,10 +18,10 @@ import "../services"
 // STARTS AND ENDS ARE SHARED TOO. A visit nothing arrives at is where a chain starts, and one
 // nothing leaves from is where it ends, and for the same reason those collapse: every payment
 // that simply leaves Current departs from ONE "Current" start node, and every payment that
-// simply lands there arrives at ONE "Current" end node. Without that, a year of shops is a
-// year of identical little circles hanging off Groceries. The two shared nodes for an account
-// are kept apart -- start and end -- so an unlinked arrival and an unlinked departure are
-// still not drawn as the same visit, which is the whole point of visits. This collapse is done
+// simply lands there arrives at that same node. Without that, a year of shops is a year of
+// identical little circles hanging off Groceries. One node per account for both, by choice:
+// keeping starts and ends apart was truer to visits but drew every account twice, and the
+// node's caption says how many chains start and how many end there. This collapse is done
 // here, not in the core, because it is a way of LOOKING and can be undone per payment: right-
 // click an arrow and "split start" or "split end" pulls that visit back out as its own node,
 // to see it separately or to drag it onto another visit and link it. The choice lives in
@@ -156,16 +156,13 @@ Rectangle {
     function homeX(n) {
         if (n.kind === "income" || n.kind === "equity") return canvas.width * 0.08;
         if (n.kind === "expense") return canvas.width * 0.92;
-        if (n.group === "start") return canvas.width * 0.35;
-        if (n.group === "end") return canvas.width * 0.65;
         return canvas.width * 0.5;
     }
 
     // A stable name for a node's position across reloads: shared nodes by account, visits by
     // account and any one of their payments, so a visit fused out of two keeps either's place.
     function keysOf(n) {
-        if (n.group === "start") return ["st" + n.account_id];
-        if (n.group === "end") return ["en" + n.account_id];
+        if (n.group === "ends") return ["se" + n.account_id];
         if (n.shared) return ["s" + n.account_id];
         return (n.txn_ids || []).map(t => "o" + n.account_id + ":" + t);
     }
@@ -200,9 +197,9 @@ Rectangle {
         root.rebuild(root.collapse(root.rawNodes, root.rawEdges, root.links));
     }
 
-    // The core's visits with chain starts and ends collapsed into one shared node per account
-    // and side, unless split. Returns { nodes, edges, links } indexed for drawing, each edge
-    // carrying `rawFrom`/`rawTo` back into the core's arrays.
+    // The core's visits with chain starts and ends collapsed into one shared node per account,
+    // unless split. Returns { nodes, edges, links } indexed for drawing, each edge carrying
+    // `rawFrom`/`rawTo` back into the core's arrays.
     function collapse(rawNodes, rawEdges, links) {
         const nodes = [], edges = [];
         const map = new Array(rawNodes.length);
@@ -210,8 +207,8 @@ Rectangle {
         for (let i = 0; i < rawNodes.length; i++) {
             const rn = rawNodes[i];
             let key = null, group = "visit";
-            if (root.isStart(rn) && !root.isSplit(rn, "start")) { key = "st" + rn.account_id; group = "start"; }
-            else if (root.isEnd(rn) && !root.isSplit(rn, "end")) { key = "en" + rn.account_id; group = "end"; }
+            if ((root.isStart(rn) && !root.isSplit(rn, "start"))
+                || (root.isEnd(rn) && !root.isSplit(rn, "end"))) { key = "se" + rn.account_id; group = "ends"; }
             if (key === null) {
                 map[i] = nodes.length;
                 nodes.push(Object.assign({}, rn, { id: nodes.length, group: rn.shared ? "kind" : "visit",
@@ -366,8 +363,7 @@ Rectangle {
         const cy = canvas.height / 2;
         for (let i = 0; i < n; i++) {
             const node = root.nodes[i];
-            const g = node.group === "start" || node.group === "end" ? 0.02
-                    : node.shared ? 0.12 : 0.003;
+            const g = node.group === "ends" ? 0.02 : node.shared ? 0.12 : 0.003;
             fx[i] += (root.homeX(node) - s.x[i]) * g;
             fy[i] += (cy - s.y[i]) * 0.005;
         }
@@ -524,8 +520,10 @@ Rectangle {
         return root.nodes[e.from].account + " → " + root.nodes[e.to].account;
     }
     function kindWord(n) {
-        if (n.group === "start") return "where chains start, " + n.kind + " account";
-        if (n.group === "end") return "where chains end, " + n.kind + " account";
+        if (n.group === "ends") {
+            const what = n["in"] > 0 && n["out"] > 0 ? "start and end" : n["out"] > 0 ? "start" : "end";
+            return "where chains " + what + ", " + n.kind + " account";
+        }
         return n.shared ? n.kind + " account" : "visit to " + n.kind + " account";
     }
     // The payments touching a node, as drawn: one entry per arrow in or out.
@@ -722,8 +720,8 @@ Rectangle {
                                 ctx.strokeStyle = lit ? Theme.text : colour;
                                 ctx.lineWidth = (lit ? 2 : 1.2) / z;
                             }
-                            // A collapsed start or end is a grouping, not a visit: dashed.
-                            if (n.group === "start" || n.group === "end")
+                            // Collapsed starts and ends are a grouping, not a visit: dashed.
+                            if (n.group === "ends")
                                 ctx.setLineDash([3 / z, 3 / z]);
                             ctx.stroke();
                             ctx.setLineDash([]);
@@ -743,8 +741,12 @@ Rectangle {
                             ctx.fillStyle = lit || busy ? Theme.text : Theme.textMuted;
                             ctx.fillText(n.account, s.x[i], s.y[i] + s.r[i] + 3);
                             const count = (n.txn_ids || []).length;
-                            const caption = n.group === "start" ? count + " start here"
-                                          : n.group === "end" ? count + " end here"
+                            // For a collapsed node the arrows out are the chains that start
+                            // here and the arrows in the chains that end here.
+                            const caption = n.group === "ends"
+                                          ? (n["out"] > 0 ? n["out"] + " start" : "")
+                                            + (n["in"] > 0 && n["out"] > 0 ? " · " : "")
+                                            + (n["in"] > 0 ? n["in"] + " end" : "") + " here"
                                           : !n.shared && count > 1 ? count + " payments" : "";
                             if (caption.length > 0) {
                                 ctx.font = Math.max(px - 2, 6) + "px '" + Theme.monoFamily + "'";
@@ -823,9 +825,9 @@ Rectangle {
                                         root.fuse(i, root.dropTarget);
                                     else if (root.nodes[root.dropTarget].shared || root.nodes[i].shared) {
                                         const sh = root.nodes[root.dropTarget].shared ? root.nodes[root.dropTarget] : root.nodes[i];
-                                        root.note = sh.group === "start" || sh.group === "end"
-                                            ? "that " + sh.account + " node is every chain's " + sh.group
-                                              + ": right-click the arrow and split its " + sh.group + " first"
+                                        root.note = sh.group === "ends"
+                                            ? "that " + sh.account + " node is where chains start and end: "
+                                              + "right-click the arrow and split its start or end first"
                                             : "only visits can be joined: " + sh.account + " is a shared " + sh.kind + " node";
                                     }
                                     else
