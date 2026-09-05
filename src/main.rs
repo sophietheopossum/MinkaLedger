@@ -1939,6 +1939,16 @@ fn dispatch(
             Ok(link::for_txn(conn, id)?)
         }
 
+        // Every payment in a window as one graph of account visits, for drawing: nodes are visits
+        // (shared for income, expense and equity; merged along links for everything else), edges
+        // are payments. See link::graph for the model.
+        "link.graph" => {
+            let from = params.get("from").and_then(|v| v.as_str());
+            let to = params.get("to").and_then(|v| v.as_str());
+            let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(400).clamp(1, 5000);
+            Ok(link::graph(conn, from, to, limit)?)
+        }
+
         // The whole connected component -- "follow the thread" -- from wherever you start.
         "link.chain" => {
             let id = params.get("txn_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("txn_id"))?;

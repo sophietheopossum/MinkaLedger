@@ -34,6 +34,7 @@ ShellRoot {
         property bool showDanger: false
         property bool showCurrencies: false
         property bool showPayments: false
+        property bool showGraph: false      // payments as a graph of account visits
         property var currencies: []
         property int seriesCount: 0
         // Every full-width panel is mutually exclusive, but UPCOMING sat under all of them and
@@ -43,6 +44,7 @@ ShellRoot {
                                           || win.showBrief || win.showScenarios
                                           || win.showCurrencies || win.showDanger
                                           || win.showPayments || win.showExport
+                                          || win.showGraph
         property var projection: ({ balances: [], occurrences: [] })
         property string asOf: Qt.formatDate(new Date(), "yyyy-MM-dd")
         property string horizon: Qt.formatDate(
@@ -279,7 +281,8 @@ ShellRoot {
                                  if (win.showExport) { win.showEntry = false; win.showSeries = false;
                                                        win.showImport = false; win.showBrief = false;
                                                        win.showScenarios = false; win.showDanger = false;
-                                                       win.showCurrencies = false; win.showPayments = false; } }
+                                                       win.showCurrencies = false; win.showPayments = false;
+                                                       win.showGraph = false; } }
                 }
                 PushButton {
                     label: win.showPayments ? "Close" : "payments"
@@ -287,7 +290,19 @@ ShellRoot {
                                  if (win.showPayments) { win.showEntry = false; win.showSeries = false;
                                                          win.showImport = false; win.showBrief = false;
                                                          win.showScenarios = false; win.showDanger = false;
-                                                         win.showCurrencies = false; win.showExport = false; } }
+                                                         win.showCurrencies = false; win.showExport = false;
+                                                         win.showGraph = false; } }
+                }
+                // The same payments as a picture: visits to accounts joined by the payments
+                // between them, where a chain is drawn as the shape it is.
+                PushButton {
+                    label: win.showGraph ? "Close" : "graph"
+                    onClicked: { win.showGraph = !win.showGraph;
+                                 if (win.showGraph) { win.showEntry = false; win.showSeries = false;
+                                                      win.showImport = false; win.showBrief = false;
+                                                      win.showScenarios = false; win.showDanger = false;
+                                                      win.showCurrencies = false; win.showExport = false;
+                                                      win.showPayments = false; } }
                 }
                 PushButton {
                     label: win.showScenarios ? "Close" : "what if"
@@ -677,6 +692,18 @@ ShellRoot {
                 onDone: win.showPayments = false
             }
 
+            GraphPanel {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 380
+                Layout.fillHeight: true
+                visible: win.showGraph
+                accounts: win.accounts
+                // The same look back as the chart: a year of payments is a picture, the whole
+                // book is a hairball.
+                from: win.historyFrom
+                onDone: win.showGraph = false
+            }
+
             CurrencyPanel {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 260
@@ -779,7 +806,7 @@ ShellRoot {
             Item {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                visible: win.panelOpen && !win.showPayments
+                visible: win.panelOpen && !win.showPayments && !win.showGraph
             }
 
             // ---- what is coming ----

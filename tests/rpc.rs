@@ -1211,6 +1211,97 @@ fn a_payment_can_be_corrected_without_losing_what_hangs_off_it() {
     assert_eq!(out[18]["result"]["ok"], true, "the book balances after every edit");
 }
 
+/// The graph view's model: an unlinked payment is two visits and an arrow, a link between
+/// payments that touch the same account fuses that visit, and income and expense accounts are one
+/// shared node each. The shape worth pinning down is two chains converging: both arrive at the
+/// same friend, one payment leaves, and that visit must come back as ONE node with two in and one
+/// out rather than as three visits that happen to share a name.
+#[test]
+fn the_graph_fuses_linked_visits_and_shares_the_ends() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Salary","kind":"income","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"Sam","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":4,"method":"account.create","params":{"name":"Bookmaker","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":5,"method":"account.create","params":{"name":"Wallet","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":6,"method":"account.create","params":{"name":"Groceries","kind":"expense","currency":"GBP"}}"#,
+        // chain one: salary in, then to Sam, then Sam to the bookmaker
+        r#"{"id":7,"method":"txn.create","params":{"occurred_on":"2026-08-01","description":"pay",
+             "postings":[{"account_id":1,"amount_minor":-100000},{"account_id":2,"amount_minor":100000}]}}"#,
+        r#"{"id":8,"method":"txn.create","params":{"occurred_on":"2026-08-02","description":"to Sam",
+             "postings":[{"account_id":2,"amount_minor":-5000},{"account_id":3,"amount_minor":5000}]}}"#,
+        r#"{"id":9,"method":"txn.create","params":{"occurred_on":"2026-08-03","description":"Sam bets",
+             "postings":[{"account_id":3,"amount_minor":-8000},{"account_id":4,"amount_minor":8000}]}}"#,
+        // chain two converges on the same visit to Sam
+        r#"{"id":10,"method":"txn.create","params":{"occurred_on":"2026-08-02","description":"cash to Sam",
+             "postings":[{"account_id":5,"amount_minor":-3000},{"account_id":3,"amount_minor":3000}]}}"#,
+        // two payments nobody linked: a shop, and another salary
+        r#"{"id":11,"method":"txn.create","params":{"occurred_on":"2026-08-04","description":"shop",
+             "postings":[{"account_id":2,"amount_minor":-2000},{"account_id":6,"amount_minor":2000}]}}"#,
+        r#"{"id":12,"method":"txn.create","params":{"occurred_on":"2026-09-01","description":"pay",
+             "postings":[{"account_id":1,"amount_minor":-100000},{"account_id":2,"amount_minor":100000}]}}"#,
+        r#"{"id":13,"method":"link.create","params":{"from_txn":1,"to_txn":2}}"#,
+        r#"{"id":14,"method":"link.create","params":{"from_txn":2,"to_txn":3}}"#,
+        r#"{"id":15,"method":"link.create","params":{"from_txn":4,"to_txn":3}}"#,
+        r#"{"id":16,"method":"link.graph","params":{}}"#,
+        // a link between payments with no account in common is kept, but as an assertion
+        r#"{"id":17,"method":"link.create","params":{"from_txn":5,"to_txn":4}}"#,
+        r#"{"id":18,"method":"link.graph","params":{"from":"2026-08-01","to":"2026-08-31"}}"#,
+    ]);
+    let g = &out[15]["result"];
+    assert!(err_of(&out[15]).is_none(), "{}", out[15]);
+    let nodes = g["nodes"].as_array().unwrap();
+    let edges = g["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 6, "one arrow per payment");
+    assert_eq!(g["payments"], 6);
+    assert_eq!(g["total"], 6);
+
+    // The two salaries diverge from ONE Salary node; the shop merges into ONE Groceries node.
+    let salary: Vec<_> = nodes.iter().filter(|n| n["account"] == "Salary").collect();
+    assert_eq!(salary.len(), 1);
+    assert_eq!(salary[0]["shared"], true);
+    assert_eq!(salary[0]["out"], 2);
+    assert_eq!(nodes.iter().filter(|n| n["account"] == "Groceries").count(), 1);
+
+    // Sam was visited once by three payments: the fused node carries all of them.
+    let sam: Vec<_> = nodes.iter().filter(|n| n["account"] == "Sam").collect();
+    assert_eq!(sam.len(), 1, "converging chains share the visit");
+    assert_eq!(sam[0]["txn_ids"], serde_json::json!([2, 3, 4]));
+    assert_eq!(sam[0]["in"], 2);
+    assert_eq!(sam[0]["out"], 1);
+    assert_eq!(sam[0]["shared"], false);
+
+    // Current: one visit for the linked salary-then-to-Sam pair, and one each for the unlinked
+    // shop and the unlinked second salary.
+    let current: Vec<_> = nodes.iter().filter(|n| n["account"] == "Current").collect();
+    assert_eq!(current.len(), 3, "unlinked payments do not share a visit");
+    assert!(current.iter().any(|n| n["txn_ids"] == serde_json::json!([1, 2])));
+    assert!(current.iter().any(|n| n["txn_ids"] == serde_json::json!([5])));
+
+    // Arrows run from the leaving leg to the arriving one and carry the amount.
+    let bet = edges.iter().find(|e| e["txn_id"] == 3).unwrap();
+    assert_eq!(bet["from"], sam[0]["id"]);
+    assert_eq!(bet["amount_minor"], 8000);
+    let bookie = &nodes[bet["to"].as_u64().unwrap() as usize];
+    assert_eq!(bookie["account"], "Bookmaker");
+
+    let links = g["links"].as_array().unwrap();
+    assert_eq!(links.len(), 3);
+    assert!(links.iter().all(|l| l["shared"] == true), "every link here is a fused visit");
+
+    // The window drops September's salary, and the loose link is drawn between visits rather
+    // than fusing anything: the shop and the cash to Sam touch no account in common.
+    let g = &out[17]["result"];
+    assert_eq!(g["payments"], 5);
+    let loose: Vec<_> = g["links"].as_array().unwrap().iter().filter(|l| l["shared"] == false).collect();
+    assert_eq!(loose.len(), 1);
+    assert_eq!(loose[0]["from_txn"], 5);
+    let nodes = g["nodes"].as_array().unwrap();
+    assert_eq!(nodes[loose[0]["from_node"].as_u64().unwrap() as usize]["account"], "Groceries");
+    assert_eq!(nodes[loose[0]["to_node"].as_u64().unwrap() as usize]["account"], "Wallet");
+    assert_eq!(nodes.iter().filter(|n| n["account"] == "Sam").count(), 1, "still one visit to Sam");
+}
+
 /// The one that matters: renaming a PLAN must not rewrite HISTORY.
 ///
 /// A projected occurrence takes its description from the series row, so a transaction generated
