@@ -13,14 +13,25 @@ import "../services"
 // arrow in and out and is drawn as large as its traffic. Income, expense and equity accounts
 // are one shared node each -- every salary diverges from the one Salary, every shop merges into
 // the one Groceries -- because those are where a chain begins and ends and one visit there is
-// not distinguishable from the next. The core builds all of that (link.graph); this file only
-// lays it out and lets you touch it.
+// not distinguishable from the next. The core builds all of that (link.graph).
+//
+// STARTS AND ENDS ARE SHARED TOO. A visit nothing arrives at is where a chain starts, and one
+// nothing leaves from is where it ends, and for the same reason those collapse: every payment
+// that simply leaves Current departs from ONE "Current" start node, and every payment that
+// simply lands there arrives at ONE "Current" end node. Without that, a year of shops is a
+// year of identical little circles hanging off Groceries. The two shared nodes for an account
+// are kept apart -- start and end -- so an unlinked arrival and an unlinked departure are
+// still not drawn as the same visit, which is the whole point of visits. This collapse is done
+// here, not in the core, because it is a way of LOOKING and can be undone per payment: right-
+// click an arrow and "split start" or "split end" pulls that visit back out as its own node,
+// to see it separately or to drag it onto another visit and link it. The choice lives in
+// `splits`, keyed by payment, for as long as the window is open.
 //
 // LINKING IS A GESTURE ON VISITS. Drag one visit onto another visit to the SAME account and the
 // panel links the two payments that make them one: money arrived here, then left from here. That
 // is how two chains are made to converge -- drop the arrival of the second chain onto the visit
 // the first chain already passes through. Selecting a fused node lists the links that hold it
-// together, each with an unlink.
+// together, each with an unlink. Shared nodes cannot be dropped on: split the arrow's end first.
 //
 // THE LAYOUT IS A SPRING SIMULATION with a bias, not a time axis: shared income nodes are
 // drawn leftwards and shared expense nodes rightwards, so flow reads left to right, and
@@ -46,10 +57,20 @@ Rectangle {
     border.color: Theme.line
     radius: 8
 
-    // ---- what the core said ----
+    // ---- what the core said, and what is drawn ----
+    // `rawNodes`/`rawEdges` are the core's visits; `nodes`/`edges` are those with unsplit chain
+    // starts and ends collapsed into shared nodes. Every drawn edge remembers its raw ends.
+    property var rawNodes: []
+    property var rawEdges: []
     property var nodes: []
     property var edges: []
     property var links: []
+    // "start:<txn>" / "end:<txn>" -> true for visits pulled out of a shared start or end node.
+    property var splits: ({})
+    // The arrow a right-click opened a menu on, and where.
+    property int menuEdge: -1
+    property real menuX: 0
+    property real menuY: 0
     property int shown: 0
     property int total: 0
     property string note: ""
@@ -103,7 +124,9 @@ Rectangle {
         Ledger.request("link.graph", params, (r, e) => {
             if (e) { root.note = e.message; return; }
             root.note = "";
-            root.rebuild(r.nodes || [], r.edges || [], r.links || []);
+            root.rawNodes = r.nodes || [];
+            root.rawEdges = r.edges || [];
+            root.rebuild(root.collapse(root.rawNodes, root.rawEdges, r.links || []));
             root.shown = r.payments;
             root.total = r.total;
         });
@@ -133,17 +156,99 @@ Rectangle {
     function homeX(n) {
         if (n.kind === "income" || n.kind === "equity") return canvas.width * 0.08;
         if (n.kind === "expense") return canvas.width * 0.92;
+        if (n.group === "start") return canvas.width * 0.35;
+        if (n.group === "end") return canvas.width * 0.65;
         return canvas.width * 0.5;
     }
 
     // A stable name for a node's position across reloads: shared nodes by account, visits by
     // account and any one of their payments, so a visit fused out of two keeps either's place.
     function keysOf(n) {
+        if (n.group === "start") return ["st" + n.account_id];
+        if (n.group === "end") return ["en" + n.account_id];
         if (n.shared) return ["s" + n.account_id];
         return (n.txn_ids || []).map(t => "o" + n.account_id + ":" + t);
     }
 
-    function rebuild(nodes, edges, links) {
+    // Whether a raw visit is a chain start (nothing arrives) or end (nothing leaves), and whether
+    // it has been split out of the shared node for that. A fused visit is split if any of its
+    // payments is: the link that fused it is what makes them one stop, so it comes out whole.
+    function isStart(rn) { return !rn.shared && rn["in"] === 0; }
+    function isEnd(rn) { return !rn.shared && rn["out"] === 0; }
+    function isSplit(rn, side) {
+        return (rn.txn_ids || []).some(t => root.splits[side + ":" + t] === true);
+    }
+    // What a right-click on an arrow can do to one of its ends: "kind" (a shared income,
+    // expense or equity node: never), "mid" (the visit is inside a chain, so it is its own node
+    // already), "shared" (collapsed, may be split), "split" (pulled out, may be rejoined).
+    function sideState(e, side) {
+        const rn = root.rawNodes[side === "start" ? e.rawFrom : e.rawTo];
+        if (!rn || rn.shared) return "kind";
+        if (side === "start" ? !root.isStart(rn) : !root.isEnd(rn)) return "mid";
+        return root.isSplit(rn, side) ? "split" : "shared";
+    }
+    function toggleSplit(e, side) {
+        const rn = root.rawNodes[side === "start" ? e.rawFrom : e.rawTo];
+        if (!rn) return;
+        const next = Object.assign({}, root.splits);
+        if (root.isSplit(rn, side)) {
+            for (const t of (rn.txn_ids || [])) delete next[side + ":" + t];
+        } else {
+            next[side + ":" + e.txn_id] = true;
+        }
+        root.splits = next;
+        root.rebuild(root.collapse(root.rawNodes, root.rawEdges, root.links));
+    }
+
+    // The core's visits with chain starts and ends collapsed into one shared node per account
+    // and side, unless split. Returns { nodes, edges, links } indexed for drawing, each edge
+    // carrying `rawFrom`/`rawTo` back into the core's arrays.
+    function collapse(rawNodes, rawEdges, links) {
+        const nodes = [], edges = [];
+        const map = new Array(rawNodes.length);
+        const synth = {};
+        for (let i = 0; i < rawNodes.length; i++) {
+            const rn = rawNodes[i];
+            let key = null, group = "visit";
+            if (root.isStart(rn) && !root.isSplit(rn, "start")) { key = "st" + rn.account_id; group = "start"; }
+            else if (root.isEnd(rn) && !root.isSplit(rn, "end")) { key = "en" + rn.account_id; group = "end"; }
+            if (key === null) {
+                map[i] = nodes.length;
+                nodes.push(Object.assign({}, rn, { id: nodes.length, group: rn.shared ? "kind" : "visit",
+                                                   txn_ids: (rn.txn_ids || []).slice() }));
+                continue;
+            }
+            if (synth[key] === undefined) {
+                synth[key] = nodes.length;
+                nodes.push({ id: nodes.length, account_id: rn.account_id, account: rn.account,
+                             kind: rn.kind, currency: rn.currency, shared: true, group: group,
+                             txn_ids: [], in: 0, out: 0 });
+            }
+            map[i] = synth[key];
+            for (const t of (rn.txn_ids || []))
+                if (nodes[map[i]].txn_ids.indexOf(t) < 0) nodes[map[i]].txn_ids.push(t);
+        }
+        for (const n of nodes) { n["in"] = 0; n["out"] = 0; }
+        for (const re of rawEdges) {
+            const e = Object.assign({}, re, { from: map[re.from], to: map[re.to],
+                                              rawFrom: re.from, rawTo: re.to });
+            nodes[e.from]["out"]++;
+            nodes[e.to]["in"]++;
+            edges.push(e);
+        }
+        for (const n of nodes) n.txn_ids.sort((a, b) => a - b);
+        const mapped = links.map(l => {
+            if (!root.loose(l)) return l;
+            return Object.assign({}, l, { from_node: map[l.from_node], to_node: map[l.to_node] });
+        });
+        return { nodes: nodes, edges: edges, links: mapped };
+    }
+
+    function rebuild(picture) {
+        const nodes = picture.nodes, edges = picture.edges, links = picture.links;
+        // The selection follows the node, not its index, across the rebuild.
+        const selectedKey = root.selectedNode >= 0 && root.selectedNode < root.nodes.length
+                            ? root.keysOf(root.nodes[root.selectedNode])[0] : null;
         const old = {};
         for (let i = 0; i < root.nodes.length; i++)
             for (const k of root.keysOf(root.nodes[i]))
@@ -177,8 +282,12 @@ Rectangle {
             const angle = k * 2.399963;          // the golden angle: no two on one ray
             const spread = 12 * Math.sqrt(k + 1);
             if (near >= 0) {
-                s.x[i] = s.x[near] + Math.cos(angle) * (s.r[near] + 60);
-                s.y[i] = s.y[near] + Math.sin(angle) * (s.r[near] + 60);
+                // Beside its neighbour, on the side facing the middle of the picture, so a visit
+                // split out of a node at the edge is born on screen rather than beyond it.
+                const wx = root.toWorldX(canvas.width / 2), wy = root.toWorldY(canvas.height / 2);
+                const inward = Math.atan2(wy - s.y[near], wx - s.x[near]) + (k % 2 ? 0.5 : -0.5);
+                s.x[i] = s.x[near] + Math.cos(inward) * (s.r[near] + 60);
+                s.y[i] = s.y[near] + Math.sin(inward) * (s.r[near] + 60);
             } else {
                 const hx = nodes[i].shared ? root.homeX(nodes[i]) : cx;
                 s.x[i] = hx + Math.cos(angle) * spread * (nodes[i].shared ? 0.4 : 1);
@@ -192,12 +301,15 @@ Rectangle {
         root.hoverNode = -1;
         root.hoverEdge = -1;
         root.dropTarget = -1;
-        if (root.selectedNode >= nodes.length) root.selectedNode = -1;
+        root.menuEdge = -1;
+        root.selectedNode = -1;
         if (root.selectedEdge >= edges.length) root.selectedEdge = -1;
         root.sim = s;
         root.nodes = nodes;
         root.edges = edges;
         root.links = links;
+        if (selectedKey !== null)
+            root.selectedNode = nodes.findIndex(n => root.keysOf(n).indexOf(selectedKey) >= 0);
         root.alpha = Math.max(root.alpha, 0.6);
         if (root.zoom === 1 && root.panX === 0 && root.panY === 0 && nodes.length > 0)
             settleThenFit.restart();
@@ -205,9 +317,9 @@ Rectangle {
     }
 
     function relayout() {
-        const keep = root.nodes;
+        const keep = { nodes: root.nodes, edges: root.edges, links: root.links };
         root.nodes = [];
-        root.rebuild(keep, root.edges, root.links);
+        root.rebuild(keep);
         root.alpha = 1;
     }
 
@@ -254,7 +366,8 @@ Rectangle {
         const cy = canvas.height / 2;
         for (let i = 0; i < n; i++) {
             const node = root.nodes[i];
-            const g = node.shared ? 0.12 : 0.003;
+            const g = node.group === "start" || node.group === "end" ? 0.02
+                    : node.shared ? 0.12 : 0.003;
             fx[i] += (root.homeX(node) - s.x[i]) * g;
             fy[i] += (cy - s.y[i]) * 0.005;
         }
@@ -411,6 +524,8 @@ Rectangle {
         return root.nodes[e.from].account + " → " + root.nodes[e.to].account;
     }
     function kindWord(n) {
+        if (n.group === "start") return "where chains start, " + n.kind + " account";
+        if (n.group === "end") return "where chains end, " + n.kind + " account";
         return n.shared ? n.kind + " account" : "visit to " + n.kind + " account";
     }
     // The payments touching a node, as drawn: one entry per arrow in or out.
@@ -464,7 +579,7 @@ Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
                 width: Math.max(60, parent.width - 480)
                 elide: Text.ElideRight
-                text: "drag a visit onto another visit to the same account to link them · wheel zooms · double-click fits"
+                text: "drag a visit onto another visit to the same account to link · right-click an arrow to split its start or end · wheel zooms · double-click fits"
                 color: Theme.textFaint
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fontSize - 4
@@ -607,7 +722,11 @@ Rectangle {
                                 ctx.strokeStyle = lit ? Theme.text : colour;
                                 ctx.lineWidth = (lit ? 2 : 1.2) / z;
                             }
+                            // A collapsed start or end is a grouping, not a visit: dashed.
+                            if (n.group === "start" || n.group === "end")
+                                ctx.setLineDash([3 / z, 3 / z]);
                             ctx.stroke();
+                            ctx.setLineDash([]);
                         }
 
                         // Names: always on shared and busy nodes, otherwise only when pointed at,
@@ -623,10 +742,14 @@ Rectangle {
                             ctx.font = px + "px '" + Theme.fontFamily + "'";
                             ctx.fillStyle = lit || busy ? Theme.text : Theme.textMuted;
                             ctx.fillText(n.account, s.x[i], s.y[i] + s.r[i] + 3);
-                            if (!n.shared && (n.txn_ids || []).length > 1) {
+                            const count = (n.txn_ids || []).length;
+                            const caption = n.group === "start" ? count + " start here"
+                                          : n.group === "end" ? count + " end here"
+                                          : !n.shared && count > 1 ? count + " payments" : "";
+                            if (caption.length > 0) {
                                 ctx.font = Math.max(px - 2, 6) + "px '" + Theme.monoFamily + "'";
                                 ctx.fillStyle = Theme.textFaint;
-                                ctx.fillText(n.txn_ids.length + " payments", s.x[i], s.y[i] + s.r[i] + 3 + px + 1);
+                                ctx.fillText(caption, s.x[i], s.y[i] + s.r[i] + 3 + px + 1);
                             }
                         }
                         ctx.restore();
@@ -637,13 +760,23 @@ Rectangle {
                     id: pointer
                     anchors.fill: parent
                     hoverEnabled: true
-                    acceptedButtons: Qt.LeftButton
+                    acceptedButtons: Qt.LeftButton | Qt.RightButton
                     cursorShape: root.dragNode >= 0 ? Qt.ClosedHandCursor
                                : root.hoverNode >= 0 ? Qt.OpenHandCursor
                                : root.hoverEdge >= 0 ? Qt.PointingHandCursor
                                : root.panning ? Qt.ClosedHandCursor : Qt.ArrowCursor
 
                     onPressed: mouse => {
+                        root.menuEdge = -1;
+                        if (mouse.button === Qt.RightButton) {
+                            const he = root.hitNode(mouse.x, mouse.y, -1) >= 0 ? -1 : root.hitEdge(mouse.x, mouse.y);
+                            if (he >= 0) {
+                                root.menuEdge = he;
+                                root.menuX = Math.min(mouse.x, pointer.width - 170);
+                                root.menuY = Math.min(mouse.y, pointer.height - 70);
+                            }
+                            return;
+                        }
                         root.pressX = mouse.x; root.pressY = mouse.y;
                         root.lastX = mouse.x; root.lastY = mouse.y;
                         root.moved = false;
@@ -688,9 +821,13 @@ Rectangle {
                                 if (root.dropTarget >= 0) {
                                     if (root.canFuse(i, root.dropTarget))
                                         root.fuse(i, root.dropTarget);
-                                    else if (root.nodes[root.dropTarget].shared || root.nodes[i].shared)
-                                        root.note = "only visits can be joined: " + root.nodes[root.dropTarget].account
-                                                  + " is a shared " + root.nodes[root.dropTarget].kind + " node";
+                                    else if (root.nodes[root.dropTarget].shared || root.nodes[i].shared) {
+                                        const sh = root.nodes[root.dropTarget].shared ? root.nodes[root.dropTarget] : root.nodes[i];
+                                        root.note = sh.group === "start" || sh.group === "end"
+                                            ? "that " + sh.account + " node is every chain's " + sh.group
+                                              + ": right-click the arrow and split its " + sh.group + " first"
+                                            : "only visits can be joined: " + sh.account + " is a shared " + sh.kind + " node";
+                                    }
                                     else
                                         root.note = "these are visits to different accounts ("
                                                   + root.nodes[i].account + " and "
@@ -723,7 +860,67 @@ Rectangle {
                     onWheel: wheel => {
                         root.zoomAt(wheel.x, wheel.y, wheel.angleDelta.y > 0 ? 1.15 : 1 / 1.15);
                     }
-                    onDoubleClicked: root.fit()
+                    onDoubleClicked: mouse => { if (mouse.button === Qt.LeftButton) root.fit(); }
+                }
+
+                // Right-click on an arrow: pull its start or end out of the shared node it is
+                // collapsed into, or put it back.
+                Rectangle {
+                    id: menu
+                    visible: root.menuEdge >= 0 && root.menuEdge < root.edges.length
+                    x: root.menuX
+                    y: root.menuY
+                    width: 164
+                    height: menuCol.implicitHeight + 8
+                    radius: 4
+                    color: Theme.surfaceRaised
+                    border.width: 1
+                    border.color: Theme.purple
+                    Column {
+                        id: menuCol
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: 4
+                        Repeater {
+                            model: ["start", "end"]
+                            Rectangle {
+                                id: item
+                                required property string modelData
+                                readonly property string side: menu.visible
+                                    ? root.sideState(root.edges[root.menuEdge], item.modelData) : "kind"
+                                readonly property bool can: item.side === "shared" || item.side === "split"
+                                width: parent.width
+                                height: 24
+                                radius: 3
+                                color: item.can && ihov.containsMouse ? Theme.purpleDim : "transparent"
+                                Text {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    anchors.left: parent.left
+                                    anchors.leftMargin: 6
+                                    text: (item.side === "split" ? "rejoin " : "split ") + item.modelData
+                                          + (item.side === "mid" ? "  (inside a chain)"
+                                           : item.side === "kind" ? "  (shared account)" : "")
+                                    color: item.can ? Theme.text : Theme.textFaint
+                                    opacity: item.can ? 1 : 0.6
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: Theme.fontSize - 3
+                                }
+                                MouseArea {
+                                    id: ihov
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: item.can ? Qt.PointingHandCursor : Qt.ArrowCursor
+                                    onClicked: {
+                                        if (!item.can) return;
+                                        const e = root.edges[root.menuEdge];
+                                        root.menuEdge = -1;
+                                        root.toggleSplit(e, item.modelData);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // What the pointer is over, beside it.
