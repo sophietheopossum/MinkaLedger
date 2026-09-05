@@ -475,31 +475,31 @@ Rectangle {
                  x2: s.x[j] - ux * (s.r[j] + 2), y2: s.y[j] - uy * (s.r[j] + 2) };
     }
 
-    // ARROWS THAT SHARE A PAIR OF CIRCLES MAKE A CIRCLE. Money that goes from Smarkets to Open
-    // bets and comes back is two payments between the same two visits, and drawn straight
-    // they lie on top of each other and read as one two-headed line. Instead each arrow of a
-    // pair is a semicircle on the line between the two circles, bowing to its own left, so a
-    // pair running opposite ways closes into one circle with a visit at each end of the
-    // diameter: out around one half, back around the other. Three or more between the same
-    // pair spread evenly between the two halves.
+    // MONEY THAT GOES OUT AND COMES BACK MAKES A CIRCLE. Smarkets to Open bets and back is two
+    // payments running opposite ways between the same two visits, and drawn straight they lie
+    // on top of each other and read as one two-headed line. Instead, when a pair of circles
+    // has arrows BOTH ways between them, every arrow between them becomes a semicircle bowing
+    // to its own left, so the two directions close into one circle with a visit at each end
+    // of the diameter: out around one half, back around the other. Several arrows the same
+    // way between a pair are not a loop and stay straight, one on top of the other, as they
+    // always were: the count is on the node, and a fan of curves would say "loop" about
+    // something that is not one.
     function bendsFor(edges) {
         const groups = {};
         for (let k = 0; k < edges.length; k++) {
             const e = edges[k];
+            if (e.from === e.to) continue;
             const key = Math.min(e.from, e.to) + ":" + Math.max(e.from, e.to);
-            if (!groups[key]) groups[key] = [];
-            groups[key].push(k);
+            if (!groups[key]) groups[key] = { forward: false, back: false, ks: [] };
+            groups[key].ks.push(k);
+            if (e.from < e.to) groups[key].forward = true; else groups[key].back = true;
         }
         const bends = new Array(edges.length).fill(0);
         for (const key in groups) {
-            const ks = groups[key];
-            const n = ks.length;
-            if (n < 2) continue;
-            for (let i = 0; i < n; i++) {
-                const e = edges[ks[i]];
-                // Spread in the pair's canonical direction, then seen from the arrow's own.
-                bends[ks[i]] = (-0.5 + i / (n - 1)) * (e.from < e.to ? 1 : -1);
-            }
+            const g = groups[key];
+            if (!(g.forward && g.back)) continue;
+            for (const k of g.ks)
+                bends[k] = -0.5;
         }
         return bends;
     }
