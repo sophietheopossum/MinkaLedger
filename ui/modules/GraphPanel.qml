@@ -66,8 +66,9 @@ Rectangle {
     property var nodes: []
     property var edges: []
     property var links: []
-    // Sideways bend per edge, in world units at the midpoint; zero for a lone straight arrow.
-    // Set alongside `edges` so every reader of an arrow's shape agrees.
+    // Sideways bend per edge as a fraction of the distance between its two circles: zero for
+    // a lone straight arrow, ±0.5 for a semicircle. Set alongside `edges` so every reader of an
+    // arrow's shape agrees.
     property var bends: []
     // "start:<txn>" / "end:<txn>" -> true for visits pulled out of a shared start or end node.
     property var splits: ({})
@@ -366,6 +367,29 @@ Rectangle {
             fx[i] += dx / d * pull; fy[i] += dy / d * pull;
             fx[j] -= dx / d * pull; fy[j] -= dy / d * pull;
         }
+        // A loop's circle is a shape on the picture like a node is: nothing else should sit
+        // inside it. Each pair of opposite arrows makes a disc on the line between its two
+        // circles, and every other node inside that disc is pushed out over its rim.
+        for (let k = 0; k < root.edges.length; k++) {
+            const e = root.edges[k];
+            if (Math.abs(root.bends[k] || 0) < 0.5 || e.from > e.to) continue;
+            const i = e.from, j = e.to;
+            const mx = (s.x[i] + s.x[j]) / 2, my = (s.y[i] + s.y[j]) / 2;
+            const R = Math.sqrt(Math.pow(s.x[j] - s.x[i], 2) + Math.pow(s.y[j] - s.y[i], 2)) / 2;
+            for (let q = 0; q < n; q++) {
+                if (q === i || q === j) continue;
+                const dx = s.x[q] - mx, dy = s.y[q] - my;
+                const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
+                const keep = R + s.r[q] + 14;
+                if (dist >= keep) continue;
+                const out = (keep - dist) * 0.12;
+                fx[q] += dx / dist * out; fy[q] += dy / dist * out;
+                // And the loop's own ends feel the reaction, so a crowded loop shrinks a
+                // little rather than shoving everything else off the picture.
+                fx[i] -= dx / dist * out * 0.25; fy[i] -= dy / dist * out * 0.25;
+                fx[j] -= dx / dist * out * 0.25; fy[j] -= dy / dist * out * 0.25;
+            }
+        }
         const cy = canvas.height / 2;
         for (let i = 0; i < n; i++) {
             const node = root.nodes[i];
@@ -451,12 +475,13 @@ Rectangle {
                  x2: s.x[j] - ux * (s.r[j] + 2), y2: s.y[j] - uy * (s.r[j] + 2) };
     }
 
-    // ARROWS THAT SHARE A PAIR OF CIRCLES BEND APART. Money that goes from Smarkets to Open
+    // ARROWS THAT SHARE A PAIR OF CIRCLES MAKE A CIRCLE. Money that goes from Smarkets to Open
     // bets and comes back is two payments between the same two visits, and drawn straight
-    // they lie on top of each other and read as one two-headed line. Each arrow between the
-    // same pair takes its own sideways offset, measured on its own left-hand side, so a pair
-    // running opposite ways bows to opposite sides of the line and reads as the loop it is:
-    // out along one arc, back along the other, the intermediate visit at the far end.
+    // they lie on top of each other and read as one two-headed line. Instead each arrow of a
+    // pair is a semicircle on the line between the two circles, bowing to its own left, so a
+    // pair running opposite ways closes into one circle with a visit at each end of the
+    // diameter: out around one half, back around the other. Three or more between the same
+    // pair spread evenly between the two halves.
     function bendsFor(edges) {
         const groups = {};
         for (let k = 0; k < edges.length; k++) {
@@ -468,38 +493,73 @@ Rectangle {
         const bends = new Array(edges.length).fill(0);
         for (const key in groups) {
             const ks = groups[key];
-            if (ks.length < 2) continue;
-            for (let i = 0; i < ks.length; i++) {
+            const n = ks.length;
+            if (n < 2) continue;
+            for (let i = 0; i < n; i++) {
                 const e = edges[ks[i]];
                 // Spread in the pair's canonical direction, then seen from the arrow's own.
-                bends[ks[i]] = (i - (ks.length - 1) / 2) * 44 * (e.from < e.to ? 1 : -1);
+                bends[ks[i]] = (-0.5 + i / (n - 1)) * (e.from < e.to ? 1 : -1);
             }
         }
         return bends;
     }
-    // An arrow's path: rim to rim, through a control point set off sideways by its bend. The
-    // curve passes half the control offset at its middle, hence the doubling.
+    // An arrow's path. Straight when it has no bend. Otherwise a circular arc from rim to rim
+    // whose height above the chord is the bend times the distance between the centres: a
+    // bend of a half is a semicircle. Returned as the arc's centre, radius, the angle it
+    // starts at and the signed angle it sweeps (positive is clockwise on screen, since y runs
+    // down), already trimmed so it begins and ends on the rims.
     function curve(e, k) {
         const s = root.sim, i = e.from, j = e.to;
         const bend = root.bends[k] || 0;
-        const mx = (s.x[i] + s.x[j]) / 2, my = (s.y[i] + s.y[j]) / 2;
         const dx = s.x[j] - s.x[i], dy = s.y[j] - s.y[i];
         const d = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-        const cx = mx - dy / d * 2 * bend, cy = my + dx / d * 2 * bend;
-        // Each end leaves its circle toward the control point, so the arrow meets the rim
-        // where the curve actually crosses it rather than where a straight line would.
-        const ax = cx - s.x[i], ay = cy - s.y[i];
-        const ad = Math.max(Math.sqrt(ax * ax + ay * ay), 1);
-        const bx = cx - s.x[j], by = cy - s.y[j];
-        const bd = Math.max(Math.sqrt(bx * bx + by * by), 1);
-        return { x1: s.x[i] + ax / ad * s.r[i], y1: s.y[i] + ay / ad * s.r[i],
-                 cx: cx, cy: cy,
-                 x2: s.x[j] + bx / bd * (s.r[j] + 2), y2: s.y[j] + by / bd * (s.r[j] + 2) };
+        if (bend === 0) {
+            const ux = dx / d, uy = dy / d;
+            return { straight: true,
+                     x1: s.x[i] + ux * s.r[i], y1: s.y[i] + uy * s.r[i],
+                     x2: s.x[j] - ux * (s.r[j] + 2), y2: s.y[j] - uy * (s.r[j] + 2) };
+        }
+        const h = bend * d;                      // height of the arc above the chord, signed
+        const R = Math.abs(h) / 2 + d * d / (8 * Math.abs(h));
+        const nx = -dy / d, ny = dx / d;         // the chord's left-hand normal
+        const mx = (s.x[i] + s.x[j]) / 2, my = (s.y[i] + s.y[j]) / 2;
+        const off = h - Math.sign(h) * R;        // the centre sits this far along the normal
+        const cx = mx + nx * off, cy = my + ny * off;
+        const a1 = Math.atan2(s.y[i] - cy, s.x[i] - cx);
+        const a2 = Math.atan2(s.y[j] - cy, s.x[j] - cx);
+        const aMid = Math.atan2(my + ny * h - cy, mx + nx * h - cx);
+        // Sweep the way that passes through the arc's own middle.
+        const tau = Math.PI * 2;
+        const cw = ((a2 - a1) % tau + tau) % tau;
+        const mid = ((aMid - a1) % tau + tau) % tau;
+        const sweep = mid <= cw ? cw : cw - tau;
+        // Trim each end to its circle's rim: a chord of length r on a circle of radius R
+        // subtends 2·asin(r / 2R).
+        const trim1 = 2 * Math.asin(Math.min(1, s.r[i] / (2 * R)));
+        const trim2 = 2 * Math.asin(Math.min(1, (s.r[j] + 2) / (2 * R)));
+        const dir = sweep < 0 ? -1 : 1;
+        const start = a1 + dir * trim1;
+        const span = sweep - dir * (trim1 + trim2);
+        return { straight: false, cx: cx, cy: cy, R: R, start: start, span: span,
+                 x1: cx + R * Math.cos(start), y1: cy + R * Math.sin(start),
+                 x2: cx + R * Math.cos(start + span), y2: cy + R * Math.sin(start + span) };
     }
     function along(c, t) {
-        const u = 1 - t;
-        return { x: u * u * c.x1 + 2 * u * t * c.cx + t * t * c.x2,
-                 y: u * u * c.y1 + 2 * u * t * c.cy + t * t * c.y2 };
+        if (c.straight)
+            return { x: c.x1 + (c.x2 - c.x1) * t, y: c.y1 + (c.y2 - c.y1) * t };
+        const a = c.start + c.span * t;
+        return { x: c.cx + c.R * Math.cos(a), y: c.cy + c.R * Math.sin(a) };
+    }
+    // The direction of travel where the arrow arrives, for its head.
+    function arrival(c) {
+        if (c.straight) {
+            const dx = c.x2 - c.x1, dy = c.y2 - c.y1;
+            const d = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
+            return { x: dx / d, y: dy / d };
+        }
+        const a = c.start + c.span;
+        const dir = c.span < 0 ? -1 : 1;
+        return { x: -Math.sin(a) * dir, y: Math.cos(a) * dir };
     }
     function hitEdge(sx, sy) {
         const wx = root.toWorldX(sx), wy = root.toWorldY(sy);
@@ -739,14 +799,17 @@ Rectangle {
                             ctx.fillStyle = colour;
                             ctx.lineWidth = (isHot ? 2.2 : 1.2) / z;
                             ctx.beginPath();
-                            ctx.moveTo(p.x1, p.y1);
-                            ctx.quadraticCurveTo(p.cx, p.cy, p.x2, p.y2);
+                            if (p.straight) {
+                                ctx.moveTo(p.x1, p.y1);
+                                ctx.lineTo(p.x2, p.y2);
+                            } else {
+                                ctx.arc(p.cx, p.cy, p.R, p.start, p.start + p.span, p.span < 0);
+                            }
                             ctx.stroke();
                             // The head: a small triangle on the rim of the arriving circle,
-                            // pointing the way the curve arrives.
-                            const dx = p.x2 - p.cx, dy = p.y2 - p.cy;
-                            const d = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-                            const ux = dx / d, uy = dy / d;
+                            // pointing the way the arrow arrives.
+                            const tip = root.arrival(p);
+                            const ux = tip.x, uy = tip.y;
                             const h = (isHot ? 9 : 7) / Math.sqrt(z);
                             ctx.beginPath();
                             ctx.moveTo(p.x2, p.y2);
@@ -756,9 +819,11 @@ Rectangle {
                             ctx.fill();
                             // Flow: dots travelling from where the money left toward where it
                             // arrived, brighter as they go, so the direction reads at a glance.
-                            const span = Math.sqrt(Math.pow(p.x2 - p.x1, 2) + Math.pow(p.y2 - p.y1, 2));
-                            if (isHot && span > 8) {
-                                const count = Math.max(3, Math.min(8, Math.round(span / 40)));
+                            const len = p.straight
+                                      ? Math.sqrt(Math.pow(p.x2 - p.x1, 2) + Math.pow(p.y2 - p.y1, 2))
+                                      : p.R * Math.abs(p.span);
+                            if (isHot && len > 8) {
+                                const count = Math.max(3, Math.min(10, Math.round(len / 40)));
                                 for (let i = 0; i < count; i++) {
                                     const t = (root.flowPhase + i / count) % 1;
                                     const at = root.along(p, t);
