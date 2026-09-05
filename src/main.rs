@@ -1940,8 +1940,8 @@ fn dispatch(
         }
 
         // Every payment in a window as one graph of account visits, for drawing: nodes are visits
-        // (shared for income, expense and equity; merged along links for everything else), edges
-        // are payments. See link::graph for the model.
+        // (shared for income and expense; merged along links for everything else), edges are
+        // payments; opening balances are left out. See link::graph for the model.
         "link.graph" => {
             let from = params.get("from").and_then(|v| v.as_str());
             let to = params.get("to").and_then(|v| v.as_str());

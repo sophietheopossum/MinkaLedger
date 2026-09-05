@@ -233,11 +233,14 @@ pub fn chain(conn: &Connection, txn_id: i64, max_nodes: usize) -> Result<serde_j
 
 /// Which node a payment's leg lands on, before links merge any of them.
 ///
-/// Income, expense and equity accounts are SHARED: every salary diverges from the one Salary
-/// node and every shop merges into the one Groceries node, because those are where a chain
-/// begins and ends and there is nothing to tell one visit apart from the next. Everything else --
-/// the places money sits on the way -- is a node PER PAYMENT until a link says two payments were
-/// the same visit.
+/// Income and expense accounts are SHARED: every salary diverges from the one Salary node and
+/// every shop merges into the one Groceries node, because those are where a chain begins and ends
+/// and there is nothing to tell one visit apart from the next. Everything else -- the places money
+/// sits on the way -- is a node PER PAYMENT until a link says two payments were the same visit.
+///
+/// Equity never appears: the only equity accounts are the opening-balance counterweights, and an
+/// opening balance is where the book starts counting, not money that moved. Those transactions
+/// are left out of the graph altogether rather than drawn as arrows from nowhere.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum NodeKey {
     Shared(i64),
@@ -245,7 +248,7 @@ enum NodeKey {
 }
 
 fn shared_kind(kind: &str) -> bool {
-    matches!(kind, "income" | "expense" | "equity")
+    matches!(kind, "income" | "expense")
 }
 
 /// Every payment in a window as a graph of ACCOUNT VISITS: each payment is an edge from the
@@ -274,20 +277,26 @@ pub fn graph(
     to: Option<&str>,
     limit: i64,
 ) -> Result<serde_json::Value, LinkError> {
+    // An opening balance posts against an equity account and is not a payment; the count the
+    // view shows leaves it out too, so "N of N" stays true.
     let mut st = conn.prepare(
-        "SELECT id FROM txn
-          WHERE (?1 IS NULL OR occurred_on >= ?1)
-            AND (?2 IS NULL OR occurred_on <= ?2)
-          ORDER BY occurred_on DESC, id DESC
+        "SELECT t.id FROM txn t
+          WHERE (?1 IS NULL OR t.occurred_on >= ?1)
+            AND (?2 IS NULL OR t.occurred_on <= ?2)
+            AND NOT EXISTS (SELECT 1 FROM posting p JOIN account a ON a.id = p.account_id
+                             WHERE p.txn_id = t.id AND a.kind = 'equity')
+          ORDER BY t.occurred_on DESC, t.id DESC
           LIMIT ?3",
     )?;
     let ids: Vec<i64> = st
         .query_map(rusqlite::params![from, to, limit], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
     let total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM txn
-          WHERE (?1 IS NULL OR occurred_on >= ?1)
-            AND (?2 IS NULL OR occurred_on <= ?2)",
+        "SELECT COUNT(*) FROM txn t
+          WHERE (?1 IS NULL OR t.occurred_on >= ?1)
+            AND (?2 IS NULL OR t.occurred_on <= ?2)
+            AND NOT EXISTS (SELECT 1 FROM posting p JOIN account a ON a.id = p.account_id
+                             WHERE p.txn_id = t.id AND a.kind = 'equity')",
         rusqlite::params![from, to],
         |r| r.get(0),
     )?;

@@ -1243,18 +1243,22 @@ fn the_graph_fuses_linked_visits_and_shares_the_ends() {
         r#"{"id":13,"method":"link.create","params":{"from_txn":1,"to_txn":2}}"#,
         r#"{"id":14,"method":"link.create","params":{"from_txn":2,"to_txn":3}}"#,
         r#"{"id":15,"method":"link.create","params":{"from_txn":4,"to_txn":3}}"#,
+        // An opening balance is a starting position, not a payment: it must not be in the picture.
+        r#"{"id":98,"method":"account.set_opening","params":{"id":5,"amount_minor":50000,"occurred_on":"2026-07-01"}}"#,
         r#"{"id":16,"method":"link.graph","params":{}}"#,
         // a link between payments with no account in common is kept, but as an assertion
         r#"{"id":17,"method":"link.create","params":{"from_txn":5,"to_txn":4}}"#,
         r#"{"id":18,"method":"link.graph","params":{"from":"2026-08-01","to":"2026-08-31"}}"#,
     ]);
-    let g = &out[15]["result"];
     assert!(err_of(&out[15]).is_none(), "{}", out[15]);
+    let g = &out[16]["result"];
+    assert!(err_of(&out[16]).is_none(), "{}", out[16]);
     let nodes = g["nodes"].as_array().unwrap();
     let edges = g["edges"].as_array().unwrap();
-    assert_eq!(edges.len(), 6, "one arrow per payment");
-    assert_eq!(g["payments"], 6);
+    assert_eq!(edges.len(), 6, "one arrow per payment, and none for the opening balance");
+    assert_eq!(g["payments"], 6, "the opening balance is not counted either");
     assert_eq!(g["total"], 6);
+    assert!(!nodes.iter().any(|n| n["kind"] == "equity"), "no counterweight node: {nodes:?}");
 
     // The two salaries diverge from ONE Salary node; the shop merges into ONE Groceries node.
     let salary: Vec<_> = nodes.iter().filter(|n| n["account"] == "Salary").collect();
@@ -1291,7 +1295,7 @@ fn the_graph_fuses_linked_visits_and_shares_the_ends() {
 
     // The window drops September's salary, and the loose link is drawn between visits rather
     // than fusing anything: the shop and the cash to Sam touch no account in common.
-    let g = &out[17]["result"];
+    let g = &out[18]["result"];
     assert_eq!(g["payments"], 5);
     let loose: Vec<_> = g["links"].as_array().unwrap().iter().filter(|l| l["shared"] == false).collect();
     assert_eq!(loose.len(), 1);

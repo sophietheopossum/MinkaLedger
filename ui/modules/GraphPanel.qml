@@ -10,10 +10,11 @@ import "../services"
 // any other payment's. A link between two payments that touch the same account says exactly
 // that, so the core fuses their two visits into one node, and a chain becomes its arrows joined
 // end to end. Two chains that converge on the same visit share the node, which carries every
-// arrow in and out and is drawn as large as its traffic. Income, expense and equity accounts
-// are one shared node each -- every salary diverges from the one Salary, every shop merges into
-// the one Groceries -- because those are where a chain begins and ends and one visit there is
-// not distinguishable from the next. The core builds all of that (link.graph).
+// arrow in and out and is drawn as large as its traffic. Income and expense accounts are one
+// shared node each -- every salary diverges from the one Salary, every shop merges into the one
+// Groceries -- because those are where a chain begins and ends and one visit there is not
+// distinguishable from the next. Opening balances are not payments and are not drawn at all.
+// The core builds all of that (link.graph).
 //
 // STARTS AND ENDS ARE SHARED TOO. A visit nothing arrives at is where a chain starts, and one
 // nothing leaves from is where it ends, and for the same reason those collapse: every payment
@@ -146,7 +147,6 @@ Rectangle {
         switch (n.kind) {
         case "income": return Theme.okGreen;
         case "expense": return Theme.redDim;
-        case "equity": return Theme.textMuted;
         case "liability": return Theme.warnAmber;
         default: return Theme.purple;
         }
@@ -154,7 +154,7 @@ Rectangle {
     // Where a shared node wants to sit. Beginnings left, endings right, everything else finds
     // its own place between them.
     function homeX(n) {
-        if (n.kind === "income" || n.kind === "equity") return canvas.width * 0.08;
+        if (n.kind === "income") return canvas.width * 0.08;
         if (n.kind === "expense") return canvas.width * 0.92;
         return canvas.width * 0.5;
     }
@@ -175,8 +175,8 @@ Rectangle {
     function isSplit(rn, side) {
         return (rn.txn_ids || []).some(t => root.splits[side + ":" + t] === true);
     }
-    // What a right-click on an arrow can do to one of its ends: "kind" (a shared income,
-    // expense or equity node: never), "mid" (the visit is inside a chain, so it is its own node
+    // What a right-click on an arrow can do to one of its ends: "kind" (a shared income or
+    // expense node: never), "mid" (the visit is inside a chain, so it is its own node
     // already), "shared" (collapsed, may be split), "split" (pulled out, may be rejoined).
     function sideState(e, side) {
         const rn = root.rawNodes[side === "start" ? e.rawFrom : e.rawTo];
