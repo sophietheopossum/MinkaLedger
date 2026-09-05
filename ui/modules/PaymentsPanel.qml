@@ -335,19 +335,30 @@ Rectangle {
         });
     }
 
+    // The legs that say where money went: a conversion's own legs sit in the conversion accounts
+    // and only make each currency balance, so they are left out. Sorted so the leg that left is
+    // first and the leg that arrived is last; a split's smaller arrivals sit in between.
+    function ends(t) {
+        return (t.postings || []).filter(p => p.kind !== "conversion")
+                                 .sort((a, b) => a.amount_minor - b.amount_minor);
+    }
     function money(t) {
-        // The headline is the biggest leg: for an ordinary payment that is the amount, and for a
-        // conversion it is the side that left, which is the one worth showing in a list.
-        let best = null;
-        for (const p of (t.postings || []))
-            if (!best || Math.abs(p.amount_minor) > Math.abs(best.amount_minor)) best = p;
-        return best ? Money.format(Math.abs(best.amount_minor), best.currency)
-                      + " " + best.currency : "";
+        // The headline is the side that left: for an ordinary payment that is the amount, and for
+        // a conversion it is what was sent, in the currency it was sent in. Picking the biggest leg
+        // instead used to show a GBP to EUR conversion as its EUR side, because at any rate above
+        // par the arriving number is the larger one.
+        const ps = root.ends(t);
+        if (ps.length === 0) return "";
+        return Money.format(Math.abs(ps[0].amount_minor), ps[0].currency) + " " + ps[0].currency;
     }
     function route(t) {
-        const ps = (t.postings || []).slice().sort((a, b) => a.amount_minor - b.amount_minor);
+        const ps = root.ends(t);
         if (ps.length < 2) return "";
-        return ps[0].account + " → " + ps[ps.length - 1].account;
+        const from = ps[0], to = ps[ps.length - 1];
+        const line = from.account + " → " + to.account;
+        // Across currencies the route says so: the accounts alone do not.
+        return from.currency === to.currency
+               ? line : line + " (" + from.currency + ">" + to.currency + ")";
     }
 
     Column {
