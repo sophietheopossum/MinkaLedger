@@ -1306,6 +1306,161 @@ fn the_graph_fuses_linked_visits_and_shares_the_ends() {
     assert_eq!(nodes.iter().filter(|n| n["account"] == "Sam").count(), 1, "still one visit to Sam");
 }
 
+/// The forecast has always skipped a slot a real transaction claims, but nothing ever claimed
+/// one, so a paid rent stayed upcoming and was counted twice. series.record is the missing half:
+/// it writes the payment from the template (or the amount that really moved), claims the slot,
+/// and the next projection shows the real payment on its day instead of the projection.
+#[test]
+fn recording_an_occurrence_retires_it_from_the_forecast() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Rent","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"series.create","params":{"description":"Rent","rrule":"FREQ=MONTHLY;BYMONTHDAY=1",
+             "dtstart":"2026-01-01","postings":[{"account_id":1,"amount_minor":-90000,"role":"primary"},
+                                                {"account_id":2,"amount_minor":90000,"role":"balancing"}]}}"#,
+        r#"{"id":4,"method":"forecast.project","params":{"as_of":"2026-09-05","horizon":"2026-11-30"}}"#,
+        // October's rent went out on the 2nd, and was £950 this time.
+        r#"{"id":5,"method":"series.record","params":{"series_id":1,"occurrence_on":"2026-10-01",
+             "occurred_on":"2026-10-02","amount_minor":95000}}"#,
+        r#"{"id":6,"method":"txn.get","params":{"id":1}}"#,
+        r#"{"id":7,"method":"forecast.project","params":{"as_of":"2026-09-05","horizon":"2026-11-30"}}"#,
+        r#"{"id":8,"method":"series.record","params":{"series_id":1,"occurrence_on":"2026-10-01"}}"#,
+        r#"{"id":9,"method":"series.override","params":{"series_id":1,"occurrence_on":"2026-11-01","action":"skip"}}"#,
+        r#"{"id":10,"method":"series.record","params":{"series_id":1,"occurrence_on":"2026-11-01"}}"#,
+        r#"{"id":11,"method":"series.record","params":{"series_id":404,"occurrence_on":"2026-11-01"}}"#,
+        // Editing the recorded payment keeps its claim: the date moves, the slot does not.
+        r#"{"id":12,"method":"txn.update","params":{"id":1,"occurred_on":"2026-10-03"}}"#,
+        r#"{"id":13,"method":"forecast.project","params":{"as_of":"2026-09-05","horizon":"2026-11-30"}}"#,
+        r#"{"id":14,"method":"account.balances","params":{"as_of":"2026-09-05"}}"#,
+        r#"{"id":15,"method":"db.check"}"#,
+    ]);
+    let before = out[3]["result"]["occurrences"].as_array().unwrap();
+    assert!(before.iter().any(|o| o["occurrence_on"] == "2026-10-01" && o["series_id"] == 1));
+    assert!(before.iter().all(|o| o["txn_id"].is_null()), "nothing real yet");
+
+    assert!(err_of(&out[4]).is_none(), "{}", out[4]);
+    assert_eq!(out[4]["result"]["txn_ids"], serde_json::json!([1]));
+    let t = &out[5]["result"];
+    assert_eq!(t["occurred_on"], "2026-10-02");
+    assert_eq!(t["description"], "Rent");
+    let legs = t["postings"].as_array().unwrap();
+    assert!(legs.iter().any(|p| p["account"] == "Current" && p["amount_minor"] == -95_000));
+    assert!(legs.iter().any(|p| p["account"] == "Rent" && p["amount_minor"] == 95_000));
+
+    let after = out[6]["result"]["occurrences"].as_array().unwrap();
+    assert!(!after.iter().any(|o| o["occurrence_on"] == "2026-10-01" && o["kind"] == "series"),
+            "the slot is no longer projected");
+    let real: Vec<_> = after.iter().filter(|o| o["txn_id"] == 1).collect();
+    assert_eq!(real.len(), 2, "the real payment is listed instead, both legs");
+    assert_eq!(real[0]["kind"], "real");
+    assert_eq!(real[0]["value_on"], "2026-10-02");
+    assert_eq!(real[0]["series_id"], 1, "still attributed to its series");
+    assert_eq!(real[0]["occurrence_on"], "2026-10-01", "and to its slot");
+    assert!(after.iter().any(|o| o["occurrence_on"] == "2026-11-01" && o["series_id"] == 1),
+            "November is still to come");
+
+    assert_eq!(out[7]["error"]["code"], "already_recorded");
+    assert_eq!(out[9]["error"]["code"], "bad_params", "a skipped slot is not recorded blindly");
+    assert!(out[9]["error"]["message"].as_str().unwrap().contains("skipped"));
+    assert_eq!(out[10]["error"]["code"], "bad_params");
+
+    assert!(err_of(&out[11]).is_none(), "{}", out[11]);
+    let moved = out[12]["result"]["occurrences"].as_array().unwrap();
+    assert!(!moved.iter().any(|o| o["occurrence_on"] == "2026-10-01" && o["kind"] == "series"),
+            "still claimed after the edit");
+    assert!(moved.iter().any(|o| o["txn_id"] == 1 && o["value_on"] == "2026-10-03"));
+
+    // The balance as of today does not include October's rent; the forecast does, on its day.
+    let cur = out[13]["result"].as_array().unwrap().iter().find(|b| b["name"] == "Current").unwrap();
+    assert_eq!(cur["balance_minor"], 0);
+    assert_eq!(out[14]["result"]["ok"], true);
+}
+
+/// A recurring chain is recorded as a chain: every hop of the wave, linked hop to hop, each slot
+/// claimed, all or none.
+#[test]
+fn recording_a_chain_occurrence_writes_and_links_every_hop() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Sam","kind":"asset"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"Bookmaker","kind":"asset"}}"#,
+        r#"{"id":4,"method":"series.create_chain","params":{"description":"stake via Sam",
+             "rrule":"FREQ=MONTHLY;BYMONTHDAY=1","dtstart":"2026-10-01","from_account":1,
+             "hops":[{"to_account":2,"amount_minor":10000},{"to_account":3,"amount_minor":9500}]}}"#,
+        // £110 went out instead of £100: the second hop follows as a difference, so the £5 fee
+        // taken by Sam is still £5.
+        r#"{"id":5,"method":"series.record","params":{"series_id":1,"occurrence_on":"2026-10-01",
+             "whole_chain":true,"amount_minor":11000}}"#,
+        r#"{"id":6,"method":"link.chain","params":{"txn_id":1}}"#,
+        r#"{"id":7,"method":"forecast.project","params":{"as_of":"2026-09-30","horizon":"2026-11-30"}}"#,
+        r#"{"id":8,"method":"series.record","params":{"series_id":2,"occurrence_on":"2026-10-01","whole_chain":true}}"#,
+        r#"{"id":9,"method":"db.check"}"#,
+    ]);
+    assert!(err_of(&out[4]).is_none(), "{}", out[4]);
+    assert_eq!(out[4]["result"]["txn_ids"], serde_json::json!([1, 2]));
+    let chain = &out[5]["result"];
+    assert_eq!(chain["nodes"].as_array().unwrap().len(), 2, "linked hop to hop");
+    let amount_of = |id: i64| -> i64 {
+        chain["nodes"].as_array().unwrap().iter().find(|n| n["id"] == id).unwrap()["postings"]
+            .as_array().unwrap().iter().map(|p| p["amount_minor"].as_i64().unwrap().abs()).max().unwrap()
+    };
+    assert_eq!(amount_of(1), 11_000, "the typed amount on the hop it was typed for");
+    assert_eq!(amount_of(2), 10_500, "the next hop moved by the same difference");
+    let proj = out[6]["result"]["occurrences"].as_array().unwrap();
+    assert!(!proj.iter().any(|o| o["occurrence_on"] == "2026-10-01" && o["kind"] == "series"),
+            "October's wave is claimed for every hop");
+    assert!(proj.iter().any(|o| o["occurrence_on"] == "2026-11-01" && o["series_id"] == 1), "November remains");
+    assert_eq!(proj.iter().filter(|o| !o["txn_id"].is_null()).count(), 4, "two real payments, two legs each");
+    assert_eq!(out[7]["error"]["code"], "already_recorded", "the second hop's slot is taken too");
+    assert_eq!(out[8]["result"]["ok"], true);
+}
+
+/// A what-if is a question, not a payment: its occurrences are drawn, but recording one would put
+/// hypothetical money in the book and pin the scenario there for good. And the brief must keep
+/// counting a commitment after one of its slots has been recorded: the payment is still rent.
+#[test]
+fn a_what_if_cannot_be_recorded_and_a_recorded_slot_still_counts_as_a_commitment() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Current","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"Rent","kind":"expense","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"scenario.create","params":{"name":"bigger flat"}}"#,
+        r#"{"id":4,"method":"series.create","params":{"description":"Dream rent","rrule":"FREQ=MONTHLY;BYMONTHDAY=1",
+             "dtstart":"2026-10-01","scenario_id":1,"postings":[{"account_id":1,"amount_minor":-150000,"role":"primary"},
+                                                {"account_id":2,"amount_minor":150000,"role":"balancing"}]}}"#,
+        r#"{"id":5,"method":"series.record","params":{"series_id":1,"occurrence_on":"2026-10-01"}}"#,
+        r#"{"id":6,"method":"forecast.project","params":{"as_of":"2026-09-05","horizon":"2026-10-31","scenarios":[1]}}"#,
+        r#"{"id":7,"method":"series.create","params":{"description":"Rent","rrule":"FREQ=MONTHLY;BYMONTHDAY=1",
+             "dtstart":"2026-01-01","postings":[{"account_id":1,"amount_minor":-90000,"role":"primary"},
+                                                {"account_id":2,"amount_minor":90000,"role":"balancing"}]}}"#,
+        r#"{"id":8,"method":"analysis.brief","params":{"as_of":"2026-09-05","months":3}}"#,
+        r#"{"id":9,"method":"series.record","params":{"series_id":2,"occurrence_on":"2026-10-01"}}"#,
+        r#"{"id":10,"method":"analysis.brief","params":{"as_of":"2026-09-05","months":3}}"#,
+        r#"{"id":11,"method":"txn.list"}"#,
+    ]);
+    assert_eq!(out[4]["error"]["code"], "bad_params", "{}", out[4]);
+    assert!(out[4]["error"]["message"].as_str().unwrap().contains("what-if"));
+    let occ = out[5]["result"]["occurrences"].as_array().unwrap();
+    let dream = occ.iter().find(|o| o["series_id"] == 1).expect("the what-if is still projected");
+    assert_eq!(dream["scenario_id"], 1, "and says which scenario it belongs to");
+
+    let rent_line = |brief: &serde_json::Value| -> serde_json::Value {
+        brief["commitments"]["series"].as_array().unwrap().iter()
+            .find(|c| c["description"] == "Rent").cloned().unwrap()
+    };
+    let before = rent_line(&out[7]["result"]);
+    let after = rent_line(&out[9]["result"]);
+    assert_eq!(before["occurrences_next_12m"], 12);
+    assert_eq!(after["occurrences_next_12m"], 12, "recording October's rent does not make it not rent");
+    assert_eq!(after["annual_minor"], before["annual_minor"]);
+    assert_eq!(after["next_on"], "2026-10-01", "the recorded payment is the next one");
+
+    // Today's position does not count October's rent; it is in the outlook's dip instead. The
+    // only posting on Current is that one, so as of today the account has no position at all.
+    let position = out[9]["result"]["position"]["by_account"].as_array().unwrap();
+    assert!(position.iter().all(|a| a["balance_minor"] == 0), "{position:?}");
+    assert_eq!(out[10]["result"].as_array().unwrap().len(), 1, "one real payment written");
+}
+
 /// The one that matters: renaming a PLAN must not rewrite HISTORY.
 ///
 /// A projected occurrence takes its description from the series row, so a transaction generated

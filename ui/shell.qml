@@ -95,7 +95,10 @@ ShellRoot {
         }
 
         function refresh() {
-            Ledger.request("account.balances", {}, (r, e) => {
+            // As of today, not the sum of everything ever dated: a payment typed in for next week
+            // belongs to UPCOMING and to the chart's dip on that day, not to the balance you have
+            // now. The forecast starts from the same as-of, so the two agree.
+            Ledger.request("account.balances", { as_of: win.asOf }, (r, e) => {
                 if (!e) {
                     win.accounts = r || [];
                     // An account that went away takes its selection with it. (No const inside
@@ -122,6 +125,116 @@ ShellRoot {
             target: Ledger
             function onRevisionChanged() { win.refresh(); }
         }
+        // The window stays open for days. Everything on it is "as of today", so when the date
+        // turns over the windows move with it and the book is asked again; otherwise a payment
+        // dated today would sit in UPCOMING as recorded and be missing from the balance.
+        Timer {
+            interval: 60000
+            repeat: true
+            running: true
+            onTriggered: {
+                const today = Qt.formatDate(new Date(), "yyyy-MM-dd");
+                if (today === win.asOf)
+                    return;
+                win.asOf = today;
+                win.horizon = Qt.formatDate(
+                    new Date(new Date().setMonth(new Date().getMonth() + 12)), "yyyy-MM-dd");
+                win.historyFrom = Qt.formatDate(
+                    new Date(new Date().setMonth(new Date().getMonth() - 12)), "yyyy-MM-dd");
+                win.refresh();
+            }
+        }
+
+        // UPCOMING, one row per payment rather than one per leg. The projection is per leg
+        // because the balance walk needs it that way; a person reading a list wants "rent,
+        // Current → Rent, 900" once, and a chain -- one series per hop, sharing the slot date --
+        // as one row with the whole route. Grouped by the real transaction, else by the chain
+        // and its slot date, else by what produced it and its slot date (the two rule tables
+        // share an id space, so the kind is part of the key). A row is shown when any of its
+        // legs touches an account the chart is drawing, and its amount is the net movement
+        // across those accounts: signed and coloured when money leaves or arrives, plain when
+        // it is a transfer between two of them, and both sides when it crosses a currency.
+        readonly property var upcomingRows: win.groupUpcoming(win.projection.occurrences || [],
+                                                              win.chartAccountIds)
+        function groupUpcoming(occurrences, charted) {
+            // No const inside a callback: qmllint silently stops checking a file that has one.
+            const groups = {};
+            const order = [];
+            for (const o of occurrences) {
+                const key = o.txn_id !== null && o.txn_id !== undefined ? "t" + o.txn_id
+                          : o.chain_id !== null && o.chain_id !== undefined
+                            ? "c" + o.chain_id + ":" + o.occurrence_on
+                          : o.kind + ":" + o.series_id + ":" + o.occurrence_on;
+                if (!groups[key]) {
+                    groups[key] = [];
+                    order.push(key);
+                }
+                groups[key].push(o);
+            }
+            const rows = [];
+            for (const key of order) {
+                const legs = groups[key];
+                if (!legs.some(l => charted.indexOf(l.account_id) >= 0))
+                    continue;
+                // Hops in order; a plain payment is one hop. The route reads leaving account,
+                // then each hop's arriving account.
+                const hops = {};
+                for (const l of legs) {
+                    const h = l.chain_seq === null || l.chain_seq === undefined ? 0 : l.chain_seq;
+                    if (!hops[h]) hops[h] = [];
+                    hops[h].push(l);
+                }
+                const seqs = Object.keys(hops).map(Number).sort((a, b) => a - b);
+                const route = [];
+                for (const h of seqs) {
+                    const leaving = hops[h].filter(l => l.amount_minor < 0).map(l => l.account);
+                    const arriving = hops[h].filter(l => l.amount_minor > 0).map(l => l.account);
+                    if (route.length === 0 && leaving.length > 0)
+                        route.push(leaving.join(" + "));
+                    if (arriving.length > 0)
+                        route.push(arriving.join(" + "));
+                }
+                const first = hops[seqs[0]];
+                const rep = first.find(l => l.amount_minor < 0) || first[0];
+                // Minor units only add up within one currency. Across a conversion the row
+                // shows what left and what arrived instead of a sum that means nothing.
+                const arriving = first.find(l => l.amount_minor > 0 && l.currency !== rep.currency);
+                let net = 0;
+                for (const l of legs)
+                    if (charted.indexOf(l.account_id) >= 0 && l.currency === rep.currency)
+                        net += l.amount_minor;
+                const crosses = arriving !== undefined;
+                const amountText = crosses
+                    ? Money.format(Math.abs(rep.amount_minor), rep.currency) + " " + rep.currency
+                      + " → " + Money.format(arriving.amount_minor, arriving.currency) + " " + arriving.currency
+                    : Money.format(net !== 0 ? net : Math.abs(rep.amount_minor), rep.currency);
+                const dates = legs.map(l => l.value_on).sort();
+                const recorded = rep.txn_id !== null && rep.txn_id !== undefined;
+                rows.push({
+                    key: key,
+                    value_on: dates[0],
+                    occurrence_on: rep.occurrence_on,
+                    description: rep.description,
+                    route: route.join(" → "),
+                    amountText: amountText,
+                    tone: crosses || net === 0 ? 0 : (net < 0 ? -1 : 1),
+                    chain_len: rep.chain_len ? rep.chain_len : 0,
+                    recorded: recorded,
+                    // Only an instance of a recurring payment can be altered or recorded: not a
+                    // rule's generated leg, not a payment already in the book.
+                    editable: rep.kind === "series" && rep.series_id > 0 && !recorded,
+                    moved: rep.kind === "series" && rep.value_on !== rep.occurrence_on,
+                    // Owed before today and not recorded: the weekend rule took it back past
+                    // as-of, or an override did. The forecast counts it today.
+                    due: rep.kind === "series" && rep.value_on < win.asOf,
+                    hypothetical: rep.scenario_id !== null && rep.scenario_id !== undefined,
+                    rep: rep
+                });
+            }
+            rows.sort((a, b) => a.value_on === b.value_on ? (a.key < b.key ? -1 : 1)
+                              : (a.value_on < b.value_on ? -1 : 1));
+            return rows;
+        }
 
         function pickAccount(id, extend) {
             if (!extend) {
@@ -138,10 +251,10 @@ ShellRoot {
         // so the line starts where the money was, passes through where it is, and ends where
         // the rules say it will be.
         //
-        // Today's point comes from the history, not from the sidebar's balance: the sidebar
-        // counts a post-dated payment already, while history and projection both stop at today,
-        // and mixing the two put a one-day spike on the line. When the projection has a point
-        // on today it wins, because it already includes whatever is due today.
+        // Today's point comes from the history, which is exact for the day, rather than from
+        // the sidebar's rounded-up view of the same number; sidebar, history and projection all
+        // stop at today now, so they agree. When the projection has a point on today it wins,
+        // because it already includes whatever is due today.
         function lineFor(accountId) {
             const pts = [];
             const h = win.history.find(a => a.account_id === accountId);
@@ -834,10 +947,9 @@ ShellRoot {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         clip: true
-                        // One line per occurrence on the accounts the chart is drawing, in
-                        // date order: the selection, or every asset when there is none.
-                        model: (win.projection.occurrences || []).filter(
-                            o => win.chartAccountIds.indexOf(o.account_id) >= 0)
+                        // One line per payment on the accounts the chart is drawing, in date
+                        // order: the selection, or every asset when there is none.
+                        model: win.upcomingRows
                         // An Item, not a RowLayout, because the MouseArea has to cover the whole
                         // row and a layout MANAGES its children's geometry -- anchoring inside one
                         // is undefined behaviour Qt warns about, and this is the row you click to
@@ -846,14 +958,14 @@ ShellRoot {
                             id: occRow
                             width: ListView.view.width
                             implicitHeight: occRowLayout.implicitHeight
-                            // Only a real series occurrence can be overridden. Generated interest
-                            // and payment legs carry a negative series_id and are not editable:
-                            // they are consequences of a rule, not instances of one.
-                            readonly property bool editable: modelData.series_id > 0
+                            // Only a real series occurrence can be altered or recorded. Generated
+                            // interest and payment legs carry a negative series_id and a payment
+                            // already in the book carries none: neither is an instance of a rule.
+                            readonly property bool editable: modelData.editable
                             MouseArea {
                                 anchors.fill: parent
                                 cursorShape: occRow.editable ? Qt.PointingHandCursor : Qt.ArrowCursor
-                                onClicked: if (occRow.editable) win.editing = modelData
+                                onClicked: if (occRow.editable) win.editing = modelData.rep
                             }
                             RowLayout {
                             id: occRowLayout
@@ -861,28 +973,37 @@ ShellRoot {
                             spacing: 10
                             Text {
                                 text: modelData.value_on
-                                color: Theme.textFaint
+                                color: modelData.due ? Theme.warnAmber : Theme.textFaint
                                 font.family: Theme.monoFamily
                                 font.pixelSize: Theme.fontSize - 1
                             }
                             Text {
                                 Layout.fillWidth: true
-                                // With several accounts on the chart a row has to say whose it
-                                // is: a transfer between two of them is two rows, one per side.
-                                text: (win.chartAccountIds.length > 1 ? modelData.account + ": " : "")
-                                       + modelData.description
-                                       + (modelData.chain_len
-                                          ? "  ⛓ " + (modelData.chain_seq + 1) + "/" + modelData.chain_len : "")
-                                       + (modelData.value_on !== modelData.occurrence_on
-                                          ? "  (moved from " + modelData.occurrence_on + ")" : "")
+                                text: modelData.description
+                                       + (modelData.chain_len > 1 ? "  ⛓ " + modelData.chain_len + " hops" : "")
+                                       + (modelData.due ? "  (due, not yet recorded)"
+                                          : modelData.moved ? "  (moved from " + modelData.occurrence_on + ")" : "")
+                                       + "   " + modelData.route
                                 elide: Text.ElideRight
                                 color: Theme.text
                                 font.family: Theme.fontFamily
                                 font.pixelSize: Theme.fontSize - 1
                             }
+                            // A payment already in the book, dated ahead, is shown so the list
+                            // is what is coming, and marked so it is not mistaken for a
+                            // projection; a what-if's is marked so it is not mistaken for a
+                            // commitment.
                             Text {
-                                text: Money.format(modelData.amount_minor, modelData.currency)
-                                color: modelData.amount_minor < 0 ? Theme.red : Theme.okGreen
+                                visible: modelData.recorded || modelData.hypothetical
+                                text: modelData.recorded ? "recorded" : "what-if"
+                                color: modelData.hypothetical ? Theme.purple : Theme.textFaint
+                                font.family: Theme.fontFamily
+                                font.pixelSize: Theme.fontSize - 3
+                            }
+                            Text {
+                                text: modelData.amountText
+                                color: modelData.tone < 0 ? Theme.red
+                                     : modelData.tone > 0 ? Theme.okGreen : Theme.text
                                 font.family: Theme.monoFamily
                                 font.pixelSize: Theme.fontSize - 1
                             }

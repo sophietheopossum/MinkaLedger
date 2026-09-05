@@ -34,6 +34,12 @@ pub struct NewTxn {
     #[serde(default)]
     pub note: Option<String>,
     pub postings: Vec<NewPosting>,
+    /// The recurring-payment slot this transaction fills, if any: the forecast stops projecting
+    /// that slot once a real transaction claims it. Both or neither (the schema checks).
+    #[serde(default)]
+    pub series_id: Option<i64>,
+    #[serde(default)]
+    pub occurrence_on: Option<String>,
 }
 
 /// One leg of a payment chain: where the money goes next, on what day, and how much of it.
@@ -111,6 +117,8 @@ pub enum EntryError {
     /// A payment chain that cannot be recorded as asked. The message says why in the operator's
     /// terms; nothing of the chain is written.
     Chain(String),
+    /// A recurring-payment slot already filled by a real transaction (the id it carries).
+    AlreadyRecorded(i64),
     /// An edit that cannot be applied as asked -- a blank description, a day that does not exist,
     /// two ways of restating the legs at once. Nothing is written.
     Invalid(String),
@@ -132,6 +140,9 @@ impl std::fmt::Display for EntryError {
             }
             EntryError::NotFound(id) => write!(f, "no such transaction: {id}"),
             EntryError::Chain(msg) => write!(f, "{msg}"),
+            EntryError::AlreadyRecorded(id) => {
+                write!(f, "that occurrence is already recorded as payment {id}")
+            }
             EntryError::Invalid(msg) => write!(f, "{msg}"),
         }
     }
@@ -219,9 +230,16 @@ fn create_in(tx: &Transaction, new: &NewTxn) -> Result<i64, EntryError> {
     }
 
     tx.execute(
-        "INSERT INTO txn(occurred_on, description, payee, source, note)
-         VALUES(?1, ?2, ?3, 'manual', ?4)",
-        rusqlite::params![new.occurred_on, new.description, new.payee, new.note],
+        "INSERT INTO txn(occurred_on, description, payee, source, note, series_id, occurrence_on)
+         VALUES(?1, ?2, ?3, 'manual', ?4, ?5, ?6)",
+        rusqlite::params![
+            new.occurred_on,
+            new.description,
+            new.payee,
+            new.note,
+            new.series_id,
+            new.occurrence_on
+        ],
     )?;
     let txn_id = tx.last_insert_rowid();
     {
@@ -343,6 +361,8 @@ pub fn create_chain(conn: &mut Connection, chain: &NewChain) -> Result<Vec<i64>,
                 NewPosting { account_id: from, amount_minor: -hop.amount_minor },
                 NewPosting { account_id: hop.to_account, amount_minor: hop.amount_minor },
             ],
+            series_id: None,
+            occurrence_on: None,
         };
         let txn_id = create_in(&tx, &payment)?;
         if let Some(&previous) = txn_ids.last() {
@@ -479,6 +499,196 @@ pub fn update(conn: &mut Connection, id: i64, patch: &TxnPatch) -> Result<serde_
     }
     tx.commit()?;
     get(conn, id)
+}
+
+/// What `record_occurrence` was asked to do with one slot of a recurring payment.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct RecordOccurrence {
+    pub series_id: i64,
+    pub occurrence_on: String,
+    /// The day the money actually moved; the slot date when absent.
+    #[serde(default)]
+    pub occurred_on: Option<String>,
+    /// The magnitude that actually moved on the primary leg, when it differs from the template
+    /// (and from any amend already on the slot). Signed or not: the template's direction wins.
+    #[serde(default)]
+    pub amount_minor: Option<Minor>,
+    /// For a hop of a recurring chain: record every hop of this wave, each linked to the one
+    /// before, as `txn.create_chain` would have. Ignored for a plain series.
+    #[serde(default)]
+    pub whole_chain: bool,
+}
+
+/// Turn one projected occurrence of a recurring payment into the real transaction it became, and
+/// claim the slot so the forecast stops projecting it.
+///
+/// This is the other half of `txn.series_id`/`occurrence_on`: the forecast has always skipped a
+/// claimed slot, but nothing ever claimed one, so a paid rent stayed "upcoming" and was counted
+/// again in every projection. The legs come from the series template with the slot's amend
+/// applied the way the projection applies it (the primary leg takes the amount, the balancing
+/// leg the negative of it), or from `amount_minor` when the operator says what really moved.
+///
+/// A chain is recorded as a chain: every hop of the wave, in order, linked hop to hop, all or
+/// none. The hops share the slot date by construction, and the recorded date given applies to
+/// all of them -- a hop that landed later is corrected afterwards with `txn.update`, which
+/// keeps the claim. An amount given for one hop carries through the others as a difference,
+/// exactly as an amend does, so a fee taken on the way stays the same fee.
+///
+/// Returns the transaction ids written, in hop order.
+pub fn record_occurrence(conn: &mut Connection, ask: &RecordOccurrence) -> Result<Vec<i64>, EntryError> {
+    let tx = conn.transaction()?;
+    let canonical: Option<String> =
+        tx.query_row("SELECT date(?1)", [&ask.occurrence_on], |r| r.get(0))?;
+    if canonical.as_deref() != Some(ask.occurrence_on.as_str()) {
+        return Err(EntryError::Invalid(format!("no such day: {}", ask.occurrence_on)));
+    }
+    let occurred_on = ask.occurred_on.clone().unwrap_or_else(|| ask.occurrence_on.clone());
+    let canonical: Option<String> = tx.query_row("SELECT date(?1)", [&occurred_on], |r| r.get(0))?;
+    if canonical.as_deref() != Some(occurred_on.as_str()) {
+        return Err(EntryError::Invalid(format!("no such day: {occurred_on}")));
+    }
+
+    // The series, and for a chain the whole family in hop order.
+    let mut st = tx.prepare(
+        "SELECT id, description, chain_id, scenario_id FROM series
+          WHERE id = ?1 OR (?2 AND chain_id = (SELECT chain_id FROM series WHERE id = ?1))
+          ORDER BY chain_seq, id",
+    )?;
+    let family: Vec<(i64, String, Option<i64>, Option<i64>)> = st
+        .query_map(rusqlite::params![ask.series_id, ask.whole_chain], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    drop(st);
+    if family.is_empty() {
+        return Err(EntryError::Invalid(format!("no such series: {}", ask.series_id)));
+    }
+    // A what-if is a question, not a payment. Recording one would put hypothetical money in
+    // the book and, since the transaction would reference the scenario's series, stop the
+    // scenario from ever being deleted.
+    if let Some((_, desc, _, _)) = family.iter().find(|f| f.3.is_some()) {
+        return Err(EntryError::Invalid(format!(
+            "{desc} belongs to a what-if scenario: it is not money that moves"
+        )));
+    }
+
+    // Each hop as the projection shows it: its template, its slot's amend, and whether the
+    // slot is skipped or already taken. All of it read before anything is written, because the
+    // operator's amount travels through a chain as a DIFFERENCE from the hop it was typed on --
+    // the same rule series.override applies, so a fee stays a fee -- and that needs the typed
+    // hop's own magnitude first.
+    struct Hop {
+        sid: i64,
+        desc: String,
+        template: Vec<(i64, Minor, String)>,
+        magnitude: Option<Minor>, // the amend, if any
+    }
+    let mut hops: Vec<Hop> = Vec::with_capacity(family.len());
+    for (sid, series_desc, _, _) in &family {
+        let taken: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM txn WHERE series_id = ?1 AND occurrence_on = ?2",
+                rusqlite::params![sid, ask.occurrence_on],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(id) = taken {
+            return Err(EntryError::AlreadyRecorded(id));
+        }
+        let (skipped, amended, amended_desc): (bool, Option<Minor>, Option<String>) = tx
+            .query_row(
+                "SELECT action = 'skip', amount_minor, description FROM series_override
+                  WHERE series_id = ?1 AND occurrence_on = ?2",
+                rusqlite::params![sid, ask.occurrence_on],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap_or((false, None, None));
+        if skipped {
+            return Err(EntryError::Invalid(format!(
+                "that occurrence of {series_desc} is skipped; reset the skip to record it"
+            )));
+        }
+        let mut st = tx.prepare(
+            "SELECT account_id, amount_minor, role FROM series_posting WHERE series_id = ?1 ORDER BY id",
+        )?;
+        let template: Vec<(i64, Minor, String)> = st
+            .query_map([sid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        drop(st);
+        hops.push(Hop {
+            sid: *sid,
+            desc: amended_desc.unwrap_or_else(|| series_desc.clone()),
+            template,
+            magnitude: amended.map(Minor::abs),
+        });
+    }
+    // A hop's projected magnitude: its amend, else its primary leg's template.
+    let projected = |h: &Hop| -> Minor {
+        h.magnitude.unwrap_or_else(|| {
+            h.template.iter().find(|t| t.2 == "primary").map(|t| t.1.abs()).unwrap_or(0)
+        })
+    };
+    let delta: Option<Minor> = match (ask.amount_minor, hops.iter().find(|h| h.sid == ask.series_id)) {
+        (Some(a), Some(asked)) => Some(a.abs() - projected(asked)),
+        _ => None,
+    };
+
+    let mut written: Vec<i64> = Vec::with_capacity(hops.len());
+    for (n, hop) in hops.iter().enumerate() {
+        let magnitude: Option<Minor> = match delta {
+            Some(d) => {
+                let m = projected(hop) + d;
+                if m < 0 {
+                    return Err(EntryError::Invalid(format!(
+                        "that would take leg {} of the chain below zero",
+                        n + 1
+                    )));
+                }
+                Some(m)
+            }
+            None => hop.magnitude,
+        };
+        // The primary leg takes the magnitude in its own direction, other legs are as
+        // templated, and the balancing leg absorbs whatever makes the payment sum to zero --
+        // the negative of the primary for the usual two legs, and of primary plus the rest for
+        // a template that splits the remainder. The same rule the projection applies.
+        let leg = |tmpl: Minor, role: &str| -> Minor {
+            match (magnitude, role) {
+                (Some(a), "primary") => if tmpl < 0 { -a } else { a },
+                _ => tmpl,
+            }
+        };
+        let others: Minor = hop
+            .template
+            .iter()
+            .filter(|(_, _, role)| role != "balancing")
+            .map(|(_, tmpl, role)| leg(*tmpl, role))
+            .sum();
+        let postings: Vec<NewPosting> = hop
+            .template
+            .iter()
+            .map(|(account_id, tmpl, role)| {
+                let amount_minor = if magnitude.is_some() && role == "balancing" { -others } else { leg(*tmpl, role) };
+                NewPosting { account_id: *account_id, amount_minor }
+            })
+            .collect();
+        let new = NewTxn {
+            occurred_on: occurred_on.clone(),
+            description: hop.desc.clone(),
+            payee: None,
+            note: None,
+            postings,
+            series_id: Some(hop.sid),
+            occurrence_on: Some(ask.occurrence_on.clone()),
+        };
+        let id = create_in(&tx, &new)?;
+        if let Some(&previous) = written.last() {
+            link::create(&tx, previous, id, None, &occurred_on)?;
+        }
+        written.push(id);
+    }
+    tx.commit()?;
+    Ok(written)
 }
 
 /// Delete a transaction. Postings go with it via ON DELETE CASCADE.
@@ -748,12 +958,18 @@ pub fn descriptions(
 }
 
 /// Current balance per account, from real postings only. The forecast's starting point.
+///
+/// `as_of` bounds the postings counted, inclusive. The date has to live on the POSTING join: it
+/// used to sit on a second LEFT JOIN to txn, which leaves the posting row in place with a NULL
+/// transaction beside it and sums it anyway, so every balance "as of" a date was the balance
+/// regardless of date. Nothing noticed while the only caller passed no date.
 pub fn balances(conn: &Connection, as_of: Option<&str>) -> Result<Vec<serde_json::Value>, EntryError> {
     let mut stmt = conn.prepare(
         "SELECT a.id, a.name, a.kind, a.currency, COALESCE(SUM(p.amount_minor), 0)
            FROM account a
            LEFT JOIN posting p ON p.account_id = a.id
-           LEFT JOIN txn t ON t.id = p.txn_id AND (?1 IS NULL OR t.occurred_on <= ?1)
+                AND (?1 IS NULL OR EXISTS (SELECT 1 FROM txn t
+                                            WHERE t.id = p.txn_id AND t.occurred_on <= ?1))
           WHERE a.closed = 0
           GROUP BY a.id
           ORDER BY a.kind, a.name",
@@ -870,6 +1086,8 @@ mod tests {
             payee: None,
             note: None,
             postings,
+            series_id: None,
+            occurrence_on: None,
         }
     }
 
@@ -953,6 +1171,25 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0, "postings must cascade");
         assert!(matches!(delete(&c, id), Err(EntryError::NotFound(_))));
+    }
+
+    #[test]
+    fn balances_as_of_a_date_stop_at_that_date() {
+        let mut c = book();
+        for (on, amount) in [("2026-08-01", 100), ("2026-09-01", 1_000), ("2026-10-01", 10_000)] {
+            let mut t = txn(vec![p(1, amount), p(2, -amount)]);
+            t.occurred_on = on.into();
+            create(&mut c, &t).unwrap();
+        }
+        let current = |as_of: Option<&str>| -> i64 {
+            balances(&c, as_of).unwrap().iter().find(|b| b["name"] == "Current").unwrap()["balance_minor"]
+                .as_i64()
+                .unwrap()
+        };
+        assert_eq!(current(None), 11_100);
+        assert_eq!(current(Some("2026-09-15")), 1_100, "October is still to come");
+        assert_eq!(current(Some("2026-09-01")), 1_100, "inclusive of the day");
+        assert_eq!(current(Some("2026-07-01")), 0, "and an account with nothing yet is still listed");
     }
 
     #[test]

@@ -234,6 +234,8 @@ mod tests {
                     .iter()
                     .map(|(a, m)| NewPosting { account_id: *a, amount_minor: *m })
                     .collect(),
+                series_id: None,
+                occurrence_on: None,
             },
         )
         .unwrap()

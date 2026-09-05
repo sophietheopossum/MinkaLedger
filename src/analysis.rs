@@ -111,20 +111,24 @@ impl Scales {
 
 /// Where the money is right now: per account, and netted per currency.
 ///
+/// "Right now" is as_of, the same day the outlook starts from and the account list shows: a
+/// payment typed in for next week is in the outlook's dip on that day, not in today's position.
+///
 /// Netting stops at the currency boundary on purpose. A "total net worth" across GBP and JPY is a
 /// number with no meaning, and offering one is an invitation to quote it.
-fn position(conn: &Connection, sc: &Scales) -> Result<serde_json::Value, AnalysisError> {
+fn position(conn: &Connection, sc: &Scales, as_of: NaiveDate) -> Result<serde_json::Value, AnalysisError> {
     let mut st = conn.prepare(
         "SELECT a.name, a.kind, p.currency, SUM(p.amount_minor), MAX(t.occurred_on)
            FROM posting p
            JOIN txn t     ON t.id = p.txn_id
            JOIN account a ON a.id = p.account_id
           WHERE a.kind IN ('asset','liability') AND a.system = 0
+            AND t.occurred_on <= ?1
           GROUP BY a.id, p.currency
           ORDER BY a.kind, a.name",
     )?;
     let accounts: Vec<serde_json::Value> = st
-        .query_map([], |r| {
+        .query_map([as_of.to_string()], |r| {
             let (name, kind, cur, bal, last) = (
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -147,7 +151,7 @@ fn position(conn: &Connection, sc: &Scales) -> Result<serde_json::Value, Analysi
     }
 
     Ok(serde_json::json!({
-        "derivation": "sum of every posting to date on non-system asset and liability accounts",
+        "derivation": "sum of every posting dated on or before as_of on non-system asset and liability accounts",
         "by_account": accounts,
         "net_by_currency": net.iter().map(|(c, v)| serde_json::json!({
             "currency": c, "amount_minor": v, "amount_decimal": sc.dec(*v, c),
@@ -712,7 +716,7 @@ pub fn brief(conn: &Connection, opt: &BriefOptions) -> Result<serde_json::Value,
             "complete_months_with_data": observed,
             "excludes": format!("{} onwards, the month in progress", this_month),
         },
-        "position": position(conn, &sc)?,
+        "position": position(conn, &sc, opt.as_of)?,
         "commitments": commitments(conn, &sc, opt.as_of)?,
         "months": months,
         "typical": {
@@ -940,18 +944,24 @@ mod tests {
                 description: "Salary".into(), payee: None, note: None,
                 postings: vec![NewPosting { account_id: 1, amount_minor: 250_000 },
                                NewPosting { account_id: 2, amount_minor: -250_000 }],
+                series_id: None,
+                occurrence_on: None,
             }).unwrap();
             entry::create(&mut conn, &NewTxn {
                 occurred_on: format!("2026-{month}-02"),
                 description: "Rent".into(), payee: None, note: None,
                 postings: vec![NewPosting { account_id: 1, amount_minor: -90_000 },
                                NewPosting { account_id: 4, amount_minor: 90_000 }],
+                series_id: None,
+                occurrence_on: None,
             }).unwrap();
             entry::create(&mut conn, &NewTxn {
                 occurred_on: format!("2026-{month}-15"),
                 description: "Groceries".into(), payee: None, note: None,
                 postings: vec![NewPosting { account_id: 1, amount_minor: -groceries[i] },
                                NewPosting { account_id: 3, amount_minor: groceries[i] }],
+                series_id: None,
+                occurrence_on: None,
             }).unwrap();
         }
         conn
@@ -1076,6 +1086,8 @@ mod tests {
             payee: None, note: None,
             postings: vec![NewPosting { account_id: 1, amount_minor: -100_000 },
                            NewPosting { account_id: 5, amount_minor: 100_000 }],
+            series_id: None,
+            occurrence_on: None,
         }).unwrap();
         let b = brief(&c, &opts("2026-08-15")).unwrap();
         let l = b["limits"].as_array().unwrap().iter()
@@ -1101,6 +1113,8 @@ mod tests {
             payee: None, note: None,
             postings: vec![NewPosting { account_id: 1, amount_minor: -100_000 },
                            NewPosting { account_id: 5, amount_minor: 100_000 }],
+            series_id: None,
+            occurrence_on: None,
         }).unwrap();
         // The fixture builds the book at 0001 and inserts its accounts afterwards, so run the pin
         // backfill here -- which is exactly the order a real upgrade sees it in: db::migrate runs
@@ -1133,6 +1147,8 @@ mod tests {
             occurred_on: "2026-07-15".into(), description: "Shop".into(), payee: None, note: None,
             postings: vec![NewPosting { account_id: 1, amount_minor: -1_000 },
                            NewPosting { account_id: 3, amount_minor: 1_000 }],
+            series_id: None,
+            occurrence_on: None,
         }).unwrap();
         let b = brief(&c, &opts("2026-08-15")).unwrap();
         let kinds: Vec<&str> =
@@ -1163,6 +1179,8 @@ mod tests {
             // reports JPY separately.
             postings: vec![NewPosting { account_id: 6, amount_minor: 100_000 },
                            NewPosting { account_id: 6, amount_minor: -100_000 }],
+            series_id: None,
+            occurrence_on: None,
         }).unwrap();
         let b = brief(&c, &opts("2026-08-15")).unwrap();
         let net = b["position"]["net_by_currency"].as_array().unwrap();

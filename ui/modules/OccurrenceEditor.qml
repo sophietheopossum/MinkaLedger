@@ -11,6 +11,12 @@ import "../services"
 // `moved_to` changes when the money actually moves. Keeping them apart is what stops a moved
 // payment from being projected twice, and it is why the header shows the slot even when the value
 // date differs.
+//
+// IT HAPPENED is the other thing you say while looking at the forecast. "Record as paid" writes
+// the real payment from what the fields say -- the date and the amount that actually moved --
+// and claims the slot, so the projection stops showing it and the balance walk stops counting
+// it twice. For a chain that is every hop of the wave, linked hop to hop, as the entry form
+// would have recorded them.
 Rectangle {
     id: root
 
@@ -20,6 +26,10 @@ Rectangle {
     // no payment end to end. The core fans it out; this only says so.
     readonly property bool chained: root.active && root.occurrence.chain_len !== undefined
                                     && root.occurrence.chain_len !== null
+    // A what-if's occurrence can be moved or skipped like any other, but it is a question, not
+    // money that moved, so it cannot be recorded as paid.
+    readonly property bool hypothetical: root.active && root.occurrence.scenario_id !== undefined
+                                         && root.occurrence.scenario_id !== null
 
     signal changed
     signal dismissed
@@ -89,6 +99,24 @@ Rectangle {
         });
     }
 
+    // The occurrence became a real payment: write it from the fields and claim the slot.
+    function record() {
+        Ledger.write("series.record", {
+            series_id: root.occurrence.series_id,
+            occurrence_on: root.occurrence.occurrence_on,
+            occurred_on: moveField.text,
+            amount_minor: root.signedAmount(),
+            whole_chain: root.chained
+        }, (r, e) => {
+            if (e)
+                status.text = e.message;
+            else {
+                root.occurrence = null;
+                root.changed();
+            }
+        });
+    }
+
     function clearOverride() {
         Ledger.write("series.clear_override", {
             series_id: root.occurrence.series_id,
@@ -134,7 +162,7 @@ Rectangle {
             Field {
                 id: moveField
                 width: (fields.width - 8) / 2
-                label: "move to"
+                label: "date"
                 numeric: true
                 placeholder: "YYYY-MM-DD"
             }
@@ -147,6 +175,15 @@ Rectangle {
             }
         }
 
+        Text {
+            visible: root.hypothetical
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: "a what-if: it can be moved or skipped here, but not recorded as paid"
+            color: Theme.textFaint
+            font.family: Theme.fontFamily
+            font.pixelSize: Theme.fontSize - 4
+        }
         Text {
             visible: root.chained
             width: parent.width
@@ -169,8 +206,15 @@ Rectangle {
         Row {
             spacing: 8
             PushButton {
-                label: "Apply"
+                visible: !root.hypothetical
+                label: root.chained ? "Record all " + root.occurrence.chain_len + " legs as paid"
+                                    : "Record as paid"
                 primary: true
+                enabled: root.amountOk && moveField.text.length === 10
+                onClicked: root.record()
+            }
+            PushButton {
+                label: "Apply"
                 enabled: root.amountOk
                 onClicked: root.apply("amend")
             }

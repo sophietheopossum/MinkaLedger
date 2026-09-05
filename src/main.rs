@@ -118,6 +118,7 @@ impl From<entry::EntryError> for Error {
             E::SystemAccount(_) => "system_account",
             E::NotFound(_) => "not_found",
             E::Chain(_) => "bad_chain",
+            E::AlreadyRecorded(_) => "already_recorded",
             E::Invalid(_) => "bad_params",
             E::Sql(_) => "sql",
         };
@@ -445,6 +446,8 @@ fn dispatch(
                             entry::NewPosting { account_id: id, amount_minor: amount },
                             entry::NewPosting { account_id: eq_id, amount_minor: -amount },
                         ],
+                        series_id: None,
+                        occurrence_on: None,
                     },
                 )?;
             }
@@ -795,6 +798,8 @@ fn dispatch(
                             entry::NewPosting { account_id: id, amount_minor: amount },
                             entry::NewPosting { account_id: eq_id, amount_minor: -amount },
                         ],
+                        series_id: None,
+                        occurrence_on: None,
                     })?;
                     Ok(serde_json::json!({ "txn_id": txn, "occurred_on": on,
                                            "amount_minor": amount, "updated": false }))
@@ -1234,6 +1239,16 @@ fn dispatch(
             )
             .map_err(sql_err)?;
             Ok(serde_json::json!({ "id": id, "until_on": until, "applied_to": family }))
+        }
+
+        // The projected occurrence happened: write the real payment and claim the slot, so the
+        // forecast stops showing it. See entry::record_occurrence.
+        "series.record" => {
+            let ask: entry::RecordOccurrence = serde_json::from_value(params).map_err(|e| {
+                bad(&format!("series.record takes series_id, occurrence_on and optionally occurred_on, amount_minor, whole_chain: {e}"))
+            })?;
+            let txn_ids = entry::record_occurrence(conn, &ask)?;
+            Ok(serde_json::json!({ "txn_ids": txn_ids }))
         }
 
         // req 4: alter or skip ONE occurrence

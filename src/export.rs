@@ -134,6 +134,12 @@ pub fn bundle(conn: &Connection, opt: &Options) -> Result<serde_json::Value, Exp
                 &std::collections::HashSet::new(),
             ) {
                 for o in proj.occurrences {
+                    // A transaction dated after as_of is replayed by the projection so the
+                    // balances are right, but it is already among the ledger lines above with
+                    // its own id: listing it again as a projection would count it twice.
+                    if o.txn_id.is_some() {
+                        continue;
+                    }
                     rows.push(serde_json::json!({
                         "posting_id": serde_json::Value::Null,
                         "txn_id": serde_json::Value::Null,
@@ -242,12 +248,16 @@ mod tests {
             payee: Some("Acme Ltd".into()), note: None,
             postings: vec![NewPosting { account_id: 1, amount_minor: 250_000 },
                            NewPosting { account_id: 2, amount_minor: -250_000 }],
+            series_id: None,
+            occurrence_on: None,
         }).unwrap();
         entry::create(&mut conn, &NewTxn {
             occurred_on: "2026-08-02".into(), description: "Rent".into(),
             payee: None, note: None,
             postings: vec![NewPosting { account_id: 1, amount_minor: -90_000 },
                            NewPosting { account_id: 3, amount_minor: 90_000 }],
+            series_id: None,
+            occurrence_on: None,
         }).unwrap();
         conn
     }
@@ -356,6 +366,8 @@ mod tests {
             payee: None, note: None,
             postings: vec![NewPosting { account_id: 1, amount_minor: -100 },
                            NewPosting { account_id: 3, amount_minor: 100 }],
+            series_id: None,
+            occurrence_on: None,
         }).unwrap();
         let text = csv(&c, &opts()).unwrap();
         assert!(text.starts_with("on_date,txn_id,account,"));
