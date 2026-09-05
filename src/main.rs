@@ -847,6 +847,12 @@ fn dispatch(
             Ok(entry::get(conn, id)?)
         }
 
+        // What a payment did to each account: the balance just before and just after it.
+        "txn.context" => {
+            let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
+            Ok(entry::context(conn, id)?)
+        }
+
         "txn.list" => {
             let from = params.get("from").and_then(|v| v.as_str());
             let to = params.get("to").and_then(|v| v.as_str());

@@ -342,6 +342,37 @@ Rectangle {
         return (t.postings || []).filter(p => p.kind !== "conversion")
                                  .sort((a, b) => a.amount_minor - b.amount_minor);
     }
+    // ---- the hover tooltip: what the payment did to each account ----
+    // Asked of the core per payment (txn.context) and remembered for the session, so moving the
+    // pointer up and down the list is not a request per row. Cleared whenever the book changes,
+    // since a balance either side of a payment moves with anything recorded before it.
+    property int hoverTxn: -1
+    property var contexts: ({})
+    property real tipX: 0
+    property real tipY: 0
+    readonly property var hoverContext: root.hoverTxn >= 0 ? (root.contexts[root.hoverTxn] || null) : null
+    function hoverPayment(id, x, y) {
+        root.hoverTxn = id;
+        root.tipX = x;
+        root.tipY = y;
+        if (root.contexts[id] !== undefined)
+            return;
+        Ledger.request("txn.context", { id: id }, (r, e) => {
+            if (e)
+                return;
+            // A fresh object, so the binding on `contexts` notices.
+            root.contexts = Object.assign({}, root.contexts, { [id]: r });
+        });
+    }
+    function unhoverPayment(id) {
+        if (root.hoverTxn === id)
+            root.hoverTxn = -1;
+    }
+    Connections {
+        target: Ledger
+        function onRevisionChanged() { root.contexts = ({}); }
+    }
+
     function money(t) {
         // The headline is the side that left: for an ordinary payment that is the amount, and for
         // a conversion it is what was sent, in the currency it was sent in. Picking the biggest leg
@@ -459,6 +490,14 @@ Rectangle {
                             hoverEnabled: true
                             cursorShape: Qt.PointingHandCursor
                             onClicked: root.toggle(prow.modelData.id)
+                            // The tooltip hangs below the row's left edge, in the panel's
+                            // coordinates: the list scrolls and the row is a delegate, so the
+                            // position is mapped at the moment of entering rather than bound.
+                            onEntered: {
+                                const at = prow.mapToItem(root, 28, prow.height + 2);
+                                root.hoverPayment(prow.modelData.id, at.x, at.y);
+                            }
+                            onExited: root.unhoverPayment(prow.modelData.id)
                         }
 
                         Row {
@@ -946,6 +985,68 @@ Rectangle {
             color: Theme.red
             font.family: Theme.fontFamily
             font.pixelSize: Theme.fontSize - 2
+        }
+    }
+
+    // What the hovered payment did: each account it touched, the balance before it and after.
+    // A sibling of the layout rather than a child of the row, so it is not clipped by the list
+    // and sits above the rows below the one it describes.
+    Rectangle {
+        id: tip
+        visible: root.hoverContext !== null && root.hoverTxn >= 0
+        x: Math.max(4, Math.min(root.tipX, root.width - width - 4))
+        y: root.tipY + height > root.height - 4 ? root.tipY - height - 38 : root.tipY
+        z: 10
+        width: tipCol.implicitWidth + 16
+        height: tipCol.implicitHeight + 12
+        radius: 4
+        color: Theme.surfaceRaised
+        border.width: 1
+        border.color: Theme.line
+        Column {
+            id: tipCol
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.margins: 6
+            spacing: 2
+            Text {
+                text: "BEFORE → AFTER"
+                color: Theme.textMuted
+                font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontSize - 4
+            }
+            Repeater {
+                model: root.hoverContext ? root.hoverContext.legs : []
+                Row {
+                    id: leg
+                    required property var modelData
+                    spacing: 8
+                    Text {
+                        width: 130
+                        elide: Text.ElideRight
+                        text: leg.modelData.account
+                        color: Theme.text
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSize - 3
+                    }
+                    Text {
+                        text: Money.format(leg.modelData.before_minor, leg.modelData.currency)
+                              + " → " + Money.format(leg.modelData.after_minor, leg.modelData.currency)
+                              + " " + leg.modelData.currency
+                        color: leg.modelData.after_minor < 0 && leg.modelData.kind === "asset"
+                               ? Theme.red : Theme.text
+                        font.family: Theme.monoFamily
+                        font.pixelSize: Theme.fontSize - 3
+                    }
+                    Text {
+                        text: (leg.modelData.amount_minor < 0 ? "" : "+")
+                              + Money.format(leg.modelData.amount_minor, leg.modelData.currency)
+                        color: leg.modelData.amount_minor < 0 ? Theme.redDim : Theme.okGreen
+                        font.family: Theme.monoFamily
+                        font.pixelSize: Theme.fontSize - 4
+                    }
+                }
+            }
         }
     }
 }

@@ -745,6 +745,50 @@ pub fn get(conn: &Connection, id: i64) -> Result<serde_json::Value, EntryError> 
     Ok(head)
 }
 
+/// What a payment did to each account it touched: the balance the moment before it and the
+/// moment after, for a tooltip on the payment.
+///
+/// "Before" is every posting on that account that the book orders ahead of this payment -- an
+/// earlier day, or the same day and a lower id, which is the order every list in the app shows
+/// them in -- so the numbers read the same as scrolling the ledger would. Legs on the same
+/// account are folded into one line, and a conversion's own legs are left out, as everywhere
+/// else: the conversion accounts are the book's machinery, not somewhere money is kept.
+pub fn context(conn: &Connection, id: i64) -> Result<serde_json::Value, EntryError> {
+    let occurred_on: String = conn
+        .query_row("SELECT occurred_on FROM txn WHERE id = ?1", [id], |r| r.get(0))
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => EntryError::NotFound(id),
+            other => EntryError::Sql(other),
+        })?;
+    let mut st = conn.prepare(
+        "SELECT a.id, a.name, a.kind, a.currency, SUM(p.amount_minor),
+                (SELECT COALESCE(SUM(q.amount_minor), 0)
+                   FROM posting q JOIN txn u ON u.id = q.txn_id
+                  WHERE q.account_id = a.id
+                    AND (u.occurred_on < ?2 OR (u.occurred_on = ?2 AND u.id < ?1)))
+           FROM posting p JOIN account a ON a.id = p.account_id
+          WHERE p.txn_id = ?1 AND a.kind <> 'conversion'
+          GROUP BY a.id
+          ORDER BY SUM(p.amount_minor), a.name",
+    )?;
+    let legs: Vec<serde_json::Value> = st
+        .query_map(rusqlite::params![id, occurred_on], |r| {
+            let moved: Minor = r.get(4)?;
+            let before: Minor = r.get(5)?;
+            Ok(serde_json::json!({
+                "account_id": r.get::<_, i64>(0)?,
+                "account": r.get::<_, String>(1)?,
+                "kind": r.get::<_, String>(2)?,
+                "currency": r.get::<_, String>(3)?,
+                "amount_minor": moved,
+                "before_minor": before,
+                "after_minor": before + moved,
+            }))
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(serde_json::json!({ "id": id, "occurred_on": occurred_on, "legs": legs }))
+}
+
 /// History, newest first. `from`/`to` are inclusive ISO dates; both optional.
 pub fn list(
     conn: &Connection,
@@ -1171,6 +1215,32 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0, "postings must cascade");
         assert!(matches!(delete(&c, id), Err(EntryError::NotFound(_))));
+    }
+
+    #[test]
+    fn context_gives_each_account_its_balance_either_side_of_the_payment() {
+        let mut c = book();
+        let mut opening = txn(vec![p(1, 100_000), p(2, -100_000)]);
+        opening.occurred_on = "2026-08-01".into();
+        create(&mut c, &opening).unwrap();
+        let mut rent = txn(vec![p(1, -90_000), p(3, 90_000)]);
+        rent.occurred_on = "2026-08-05".into();
+        let rent_id = create(&mut c, &rent).unwrap();
+        // Same day, later id: ordered after the rent, so not in its "before".
+        let mut later = txn(vec![p(1, -1_000), p(3, 1_000)]);
+        later.occurred_on = "2026-08-05".into();
+        create(&mut c, &later).unwrap();
+
+        let ctx = context(&c, rent_id).unwrap();
+        let legs = ctx["legs"].as_array().unwrap();
+        assert_eq!(legs.len(), 2);
+        let current = legs.iter().find(|l| l["account"] == "Current").unwrap();
+        assert_eq!(current["before_minor"], 100_000);
+        assert_eq!(current["after_minor"], 10_000);
+        let rent_acc = legs.iter().find(|l| l["account"] == "Rent").unwrap();
+        assert_eq!(rent_acc["before_minor"], 0);
+        assert_eq!(rent_acc["after_minor"], 90_000);
+        assert!(matches!(context(&c, 404), Err(EntryError::NotFound(404))));
     }
 
     #[test]
