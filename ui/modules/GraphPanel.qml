@@ -335,7 +335,9 @@ Rectangle {
                 let d2 = dx * dx + dy * dy;
                 if (d2 < 1) { dx = (i % 2 ? 1 : -1); dy = (j % 2 ? 1 : -1); d2 = 2; }
                 const d = Math.sqrt(d2);
-                const push = Math.min(2200 * (1 + (s.r[i] + s.r[j]) / 30) / d2, 60);
+                // Strong enough that unrelated nodes keep clear of each other; the springs are
+                // long to match, so a chain is not pulled taut across the gap.
+                const push = Math.min(6500 * (1 + (s.r[i] + s.r[j]) / 30) / d2, 160);
                 fx[i] -= dx / d * push; fy[i] -= dy / d * push;
                 fx[j] += dx / d * push; fy[j] += dy / d * push;
             }
@@ -345,7 +347,7 @@ Rectangle {
             if (i === j) continue;
             const dx = s.x[j] - s.x[i], dy = s.y[j] - s.y[i];
             const d = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-            const rest = 70 + s.r[i] + s.r[j];
+            const rest = 100 + s.r[i] + s.r[j];
             const pull = (d - rest) * 0.04;
             fx[i] += dx / d * pull; fy[i] += dy / d * pull;
             fx[j] -= dx / d * pull; fy[j] -= dy / d * pull;
@@ -356,7 +358,7 @@ Rectangle {
             if (i === j || i >= n || j >= n) continue;
             const dx = s.x[j] - s.x[i], dy = s.y[j] - s.y[i];
             const d = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-            const pull = (d - (110 + s.r[i] + s.r[j])) * 0.02;
+            const pull = (d - (150 + s.r[i] + s.r[j])) * 0.02;
             fx[i] += dx / d * pull; fy[i] += dy / d * pull;
             fx[j] -= dx / d * pull; fy[j] -= dy / d * pull;
         }
@@ -365,7 +367,7 @@ Rectangle {
             const node = root.nodes[i];
             const g = node.group === "ends" ? 0.02 : node.shared ? 0.12 : 0.003;
             fx[i] += (root.homeX(node) - s.x[i]) * g;
-            fy[i] += (cy - s.y[i]) * 0.005;
+            fy[i] += (cy - s.y[i]) * 0.004;
         }
         for (let i = 0; i < n; i++) {
             if (s.held[i]) { s.vx[i] = 0; s.vy[i] = 0; continue; }
