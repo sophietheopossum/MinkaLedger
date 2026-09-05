@@ -347,13 +347,18 @@ Rectangle {
                 fx[j] += dx / d * push; fy[j] += dy / d * push;
             }
         }
-        for (const e of root.edges) {
+        for (let k = 0; k < root.edges.length; k++) {
+            const e = root.edges[k];
             const i = e.from, j = e.to;
             if (i === j) continue;
             const dx = s.x[j] - s.x[i], dy = s.y[j] - s.y[i];
             const d = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-            const rest = 100 + s.r[i] + s.r[j];
-            const pull = (d - rest) * 0.04;
+            // The two ends of a loop hold each other closer, and more firmly: the circle
+            // between them is drawn on their distance, and a loose one is a large empty
+            // ring. Each of the pair's arrows pulls, so the loop is tighter still.
+            const loop = Math.abs(root.bends[k] || 0) >= 0.5;
+            const rest = (loop ? 18 : 100) + s.r[i] + s.r[j];
+            const pull = (d - rest) * (loop ? 0.14 : 0.04);
             fx[i] += dx / d * pull; fy[i] += dy / d * pull;
             fx[j] -= dx / d * pull; fy[j] -= dy / d * pull;
         }
