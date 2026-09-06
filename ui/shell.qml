@@ -35,6 +35,37 @@ ShellRoot {
         property bool showCurrencies: false
         property bool showPayments: false
         property bool showGraph: false      // payments as a graph of account visits
+        // Right-click on a row in ACCOUNTS opens a small menu of copyable forms of its balance.
+        // The account and the position live up here rather than in the row because the list
+        // clips: a menu drawn inside a 26px delegate would be cut off at the row's own edges.
+        property var copyMenuAccount: null
+        property real copyMenuX: 0
+        property real copyMenuY: 0
+        // The three forms, because they go to different places: the bare number into a
+        // spreadsheet cell, the number with its code into a chat, the named line into notes.
+        readonly property var copyMenuForms: {
+            const a = win.copyMenuAccount;
+            if (!a)
+                return [];
+            const amount = Money.format(a.balance_minor, a.currency);
+            return [amount, amount + " " + a.currency, a.name + "  " + amount + " " + a.currency];
+        }
+        // A plain click selects as before; the right button opens the copy menu instead. Both
+        // live in a function rather than inline, because a `const` inside a nested closure sends
+        // the linter silently blind over the whole file. (Nor may a comment line START with the
+        // linter's name: it is then read as a lint directive, and every following word is
+        // reported as an unknown category.)
+        function accountRowClicked(area, account, mouse) {
+            if (mouse.button === Qt.RightButton) {
+                const p = area.mapToItem(null, mouse.x, mouse.y);
+                win.copyMenuAccount = account;
+                win.copyMenuX = p.x;
+                win.copyMenuY = p.y;
+                return;
+            }
+            win.copyMenuAccount = null;
+            win.pickAccount(account.account_id, (mouse.modifiers & Qt.ShiftModifier) !== 0);
+        }
         property var currencies: []
         property int seriesCount: 0
         // Every full-width panel is mutually exclusive, but UPCOMING sat under all of them and
@@ -654,11 +685,12 @@ ShellRoot {
                                     }
                                 }
                                 MouseArea {
+                                    id: rowMouse
                                     anchors.fill: parent
+                                    acceptedButtons: Qt.LeftButton | Qt.RightButton
                                     // Shift adds to (or takes from) the selection; a plain click
-                                    // replaces it.
-                                    onClicked: mouse => win.pickAccount(modelData.account_id,
-                                                                        (mouse.modifiers & Qt.ShiftModifier) !== 0)
+                                    // replaces it. Right-click copies the balance instead.
+                                    onClicked: mouse => win.accountRowClicked(rowMouse, modelData, mouse)
                                 }
                             }
                         }
@@ -1007,6 +1039,90 @@ ShellRoot {
                                 font.family: Theme.monoFamily
                                 font.pixelSize: Theme.fontSize - 1
                             }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- copy an account's balance ----
+        // Right-click any row in ACCOUNTS. It sits at window level, above everything, because
+        // the accounts ListView clips to itself and a menu inside a 26px row would be sliced off
+        // top and bottom. Quickshell.clipboardText is the same route the brief's copy button uses.
+        Item {
+            anchors.fill: parent
+            z: 100
+            visible: win.copyMenuAccount !== null
+
+            // Clicking away dismisses. A RIGHT-click is deliberately not consumed, so it falls
+            // through to the row beneath and opens that row's menu in one action instead of two.
+            MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
+                onPressed: mouse => {
+                    win.copyMenuAccount = null;
+                    mouse.accepted = mouse.button !== Qt.RightButton;
+                }
+            }
+
+            Rectangle {
+                x: Math.max(4, Math.min(win.copyMenuX, parent.width - width - 4))
+                y: Math.max(4, Math.min(win.copyMenuY, parent.height - height - 4))
+                width: 250
+                height: copyCol.implicitHeight + 8
+                radius: 4
+                color: Theme.surfaceRaised
+                border.width: 1
+                border.color: Theme.purple
+
+                Column {
+                    id: copyCol
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: 4
+
+                    Text {
+                        leftPadding: 6
+                        bottomPadding: 2
+                        text: "COPY"
+                        color: Theme.textMuted
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSize - 4
+                    }
+                    // Each row shows the exact text it puts on the clipboard, so there is nothing
+                    // to guess at: what is read is what is pasted.
+                    Repeater {
+                        model: win.copyMenuForms
+                        Rectangle {
+                            id: copyItem
+                            required property string modelData
+                            width: parent.width
+                            height: 24
+                            radius: 3
+                            color: copyHov.containsMouse ? Theme.purpleDim : "transparent"
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.leftMargin: 6
+                                anchors.rightMargin: 6
+                                elide: Text.ElideRight
+                                text: copyItem.modelData
+                                color: Theme.text
+                                font.family: Theme.monoFamily
+                                font.pixelSize: Theme.fontSize - 2
+                            }
+                            MouseArea {
+                                id: copyHov
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    Quickshell.clipboardText = copyItem.modelData;
+                                    win.copyMenuAccount = null;
+                                }
                             }
                         }
                     }
