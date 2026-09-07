@@ -808,25 +808,33 @@ Rectangle {
                         }
                         Text {
                             anchors.verticalCenter: parent.verticalCenter
-                            visible: root.deleteArmed
-                            text: "cannot be undone"
-                                  + (root.editLinks > 0
-                                     ? "  ·  breaks the chain here (" + root.editLinks
-                                       + (root.editLinks === 1 ? " link" : " links") + ")" : "")
-                                  + "  ·  if it was recorded from a recurring payment, that"
-                                  + " occurrence returns to the forecast"
-                            color: Theme.red
-                            font.family: Theme.fontFamily
-                            font.pixelSize: Theme.fontSize - 3
-                        }
-                        Text {
-                            anchors.verticalCenter: parent.verticalCenter
                             visible: root.editSimple && root.editFrom >= 0 && root.editFrom === root.editTo
                             text: "from and to must differ"
                             color: Theme.warnAmber
                             font.family: Theme.fontFamily
                             font.pixelSize: Theme.fontSize - 3
                         }
+                    }
+
+                    // Outside the Row on purpose: a Text inside a Row has no width to wrap
+                    // against, so a long line runs off the panel edge instead of wrapping.
+                    // This pane is only 44% of the window wide, so anything wordy must wrap.
+                    Text {
+                        width: parent.width
+                        wrapMode: Text.Wrap
+                        visible: root.deleteArmed
+                        text: "Click Delete again to confirm. Cannot be undone."
+                              + (root.editLinks > 0
+                                 ? " Breaks the chain here (" + root.editLinks
+                                   + (root.editLinks === 1 ? " link" : " links") + ")." : "")
+                              + " If it was recorded from a recurring payment, that occurrence"
+                              + " returns to the forecast."
+                        // Amber, not red: red is what an actual failure uses (editNote just
+                        // below), and an armed confirmation that looks like an error message is
+                        // indistinguishable from one -- which is exactly how it was misread.
+                        color: Theme.warnAmber
+                        font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontSize - 3
                     }
                 }
             }
