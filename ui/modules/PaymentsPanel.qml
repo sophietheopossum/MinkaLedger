@@ -40,6 +40,11 @@ Rectangle {
     property var picked: []            // txn ids ticked for linking
     property int following: -1         // txn id whose chain is being shown
     property int editing: -1           // txn id open in the editor
+    // Deleting money is irreversible, so it takes two clicks: the first arms, the second does it.
+    // Disarmed by closing, saving, or opening a different payment -- an armed button must never
+    // outlive the payment it was armed for.
+    property bool deleteArmed: false
+    property int editLinks: 0          // how many chain links this payment has, for the warning
     property var chain: null
     property string note: ""
     property int accountFilter: -1
@@ -169,6 +174,8 @@ Rectangle {
         root.chain = null;
         root.editing = row.id;
         root.editNote = "";
+        root.deleteArmed = false;
+        root.editLinks = row.links || 0;
         editDate.text = row.occurred_on;
         editDesc.text = row.description;
         // A conversion's own legs sit in the conversion accounts; the real ones are the rest.
@@ -193,6 +200,24 @@ Rectangle {
     function closeEditor() {
         root.editing = -1;
         root.editNote = "";
+        root.deleteArmed = false;
+    }
+
+    // Delete the payment outright. Postings and any chain links go with it via ON DELETE CASCADE
+    // (the production connection sets foreign_keys=ON in db.rs, so the cascade is real), and the
+    // list reloads from the core rather than being patched locally.
+    function deletePayment() {
+        const id = root.editing;
+        Ledger.write("txn.delete", { id: id }, (r, e) => {
+            if (e) {
+                root.editNote = e.message;
+                root.deleteArmed = false;
+                return;
+            }
+            root.closeEditor();
+            root.following = -1;
+            root.chain = null;
+        });
     }
 
     // The amount means what the core says it means, at the FROM account's scale -- the same rule
@@ -768,6 +793,31 @@ Rectangle {
                         PushButton {
                             label: "Cancel"
                             onClicked: root.closeEditor()
+                        }
+                        // Destructive, so it is separated from Save/Cancel by the label doing the
+                        // work rather than a colour: the first click only arms it. Same discipline
+                        // as the danger zone, scaled to one payment.
+                        PushButton {
+                            label: root.deleteArmed ? "Delete permanently" : "Delete"
+                            onClicked: {
+                                if (root.deleteArmed)
+                                    root.deletePayment();
+                                else
+                                    root.deleteArmed = true;
+                            }
+                        }
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            visible: root.deleteArmed
+                            text: "cannot be undone"
+                                  + (root.editLinks > 0
+                                     ? "  ·  breaks the chain here (" + root.editLinks
+                                       + (root.editLinks === 1 ? " link" : " links") + ")" : "")
+                                  + "  ·  if it was recorded from a recurring payment, that"
+                                  + " occurrence returns to the forecast"
+                            color: Theme.red
+                            font.family: Theme.fontFamily
+                            font.pixelSize: Theme.fontSize - 3
                         }
                         Text {
                             anchors.verticalCenter: parent.verticalCenter
