@@ -31,6 +31,11 @@ Rectangle {
     readonly property bool hypothetical: root.active && root.occurrence.scenario_id !== undefined
                                          && root.occurrence.scenario_id !== null
 
+    // Both signals mean "this editor is finished"; the PARENT clears the selection, which
+    // flows back through the `occurrence: win.editing` binding. Do NOT null `occurrence` here
+    // as well: assigning to a property that the parent has bound DESTROYS that binding, so the
+    // editor opens exactly once and every later click does nothing. (Fixed 7/9/2026 — the
+    // symptom was "click an upcoming payment, close it, and it never opens again".)
     signal changed
     signal dismissed
 
@@ -93,7 +98,6 @@ Rectangle {
             if (e)
                 status.text = e.message;
             else {
-                root.occurrence = null;
                 root.changed();
             }
         });
@@ -111,7 +115,6 @@ Rectangle {
             if (e)
                 status.text = e.message;
             else {
-                root.occurrence = null;
                 root.changed();
             }
         });
@@ -125,7 +128,6 @@ Rectangle {
             if (e)
                 status.text = e.message;
             else {
-                root.occurrence = null;
                 root.changed();
             }
         });
@@ -229,7 +231,6 @@ Rectangle {
             PushButton {
                 label: "Close"
                 onClicked: {
-                    root.occurrence = null;
                     root.dismissed();
                 }
             }
