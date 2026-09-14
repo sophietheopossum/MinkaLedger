@@ -108,6 +108,187 @@ impl Recurrence for RRuleCrate {
     }
 }
 
+/// The rule in words: "monthly on the 1st", "fortnightly on Friday", "yearly on 5 March".
+///
+/// This is what tells a reader whether a rule is the one they meant, which the RRULE text does
+/// not. It only ever names what it fully understands: a rule with any part it does not recognise,
+/// or one that does not parse, comes back as its own text rather than as a phrase that drops the
+/// part it could not read (a quarterly rule must never read "monthly"). `dtstart` answers the
+/// questions a rule leaves to its start date, such as which weekday a bare WEEKLY falls on.
+pub fn describe(rrule: &str, dtstart: NaiveDate) -> String {
+    let raw = rrule.trim().to_string();
+    let mut freq: Option<String> = None;
+    let mut interval: u32 = 1;
+    let mut byday: Option<String> = None;
+    let mut bymonthday: Option<String> = None;
+    let mut bysetpos: Option<String> = None;
+    let mut bymonth: Option<String> = None;
+    for part in raw.to_uppercase().split(';').filter(|p| !p.trim().is_empty()) {
+        let Some((key, value)) = part.split_once('=') else { return raw };
+        let value = value.trim().to_string();
+        match key.trim() {
+            "FREQ" => freq = Some(value),
+            "INTERVAL" => match value.parse::<u32>() {
+                Ok(n) if n >= 1 => interval = n,
+                _ => return raw,
+            },
+            "BYDAY" => byday = Some(value),
+            "BYMONTHDAY" => bymonthday = Some(value),
+            "BYSETPOS" => bysetpos = Some(value),
+            "BYMONTH" => bymonth = Some(value),
+            "WKST" => {}
+            _ => return raw,
+        }
+    }
+    // A rule the expander refuses is not described at all: a phrase would suggest it works.
+    if RRuleCrate.expand(&raw, dtstart, None, dtstart, dtstart).is_err() {
+        return raw;
+    }
+
+    fn ordinal(n: u32) -> String {
+        let suffix = match (n % 10, n % 100) {
+            (_, 11..=13) => "th",
+            (1, _) => "st",
+            (2, _) => "nd",
+            (3, _) => "rd",
+            _ => "th",
+        };
+        format!("{n}{suffix}")
+    }
+    fn day_name(code: &str) -> Option<&'static str> {
+        Some(match code {
+            "MO" => "Monday",
+            "TU" => "Tuesday",
+            "WE" => "Wednesday",
+            "TH" => "Thursday",
+            "FR" => "Friday",
+            "SA" => "Saturday",
+            "SU" => "Sunday",
+            _ => return None,
+        })
+    }
+    fn weekday_code(d: NaiveDate) -> &'static str {
+        match d.weekday() {
+            chrono::Weekday::Mon => "MO",
+            chrono::Weekday::Tue => "TU",
+            chrono::Weekday::Wed => "WE",
+            chrono::Weekday::Thu => "TH",
+            chrono::Weekday::Fri => "FR",
+            chrono::Weekday::Sat => "SA",
+            chrono::Weekday::Sun => "SU",
+        }
+    }
+    const MONTHS: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June", "July", "August", "September",
+        "October", "November", "December",
+    ];
+    let every = |one: &str, unit: &str| {
+        if interval == 1 { one.to_string() } else { format!("every {interval} {unit}") }
+    };
+
+    match freq.as_deref() {
+        Some("DAILY") if byday.is_none() && bymonthday.is_none() && bysetpos.is_none() && bymonth.is_none() => {
+            every("daily", "days")
+        }
+        Some("WEEKLY") if bymonthday.is_none() && bysetpos.is_none() && bymonth.is_none() => {
+            let base = match interval {
+                1 => "weekly".to_string(),
+                2 => "fortnightly".to_string(),
+                n => format!("every {n} weeks"),
+            };
+            let codes: Vec<String> = match &byday {
+                Some(list) => list.split(',').map(|c| c.trim().to_string()).collect(),
+                None => vec![weekday_code(dtstart).to_string()],
+            };
+            let mut names = Vec::with_capacity(codes.len());
+            for c in &codes {
+                match day_name(c) {
+                    Some(n) => names.push(n),
+                    None => return raw,
+                }
+            }
+            format!("{base} on {}", names.join(", "))
+        }
+        Some("MONTHLY") if bymonth.is_none() => {
+            let base = every("monthly", "months");
+            // A day some months do not have is skipped in those months, not moved: "the 31st" pays
+            // seven times a year. Say so, or the phrase hides the one thing worth noticing.
+            let skips = |days: &[u32]| {
+                if days.iter().all(|d| *d >= 29) { " (skips months without one)" } else { "" }
+            };
+            let suffix = match (&bymonthday, &byday, &bysetpos) {
+                (None, None, None) => format!("the {}{}", ordinal(dtstart.day()), skips(&[dtstart.day()])),
+                (Some(days), None, None) => {
+                    if days == "-1" {
+                        "the last day".to_string()
+                    } else {
+                        let mut out = Vec::new();
+                        let mut nums = Vec::new();
+                        for d in days.split(',') {
+                            match d.trim().parse::<u32>() {
+                                Ok(n) if (1..=31).contains(&n) => {
+                                    out.push(ordinal(n));
+                                    nums.push(n);
+                                }
+                                _ => return raw,
+                            }
+                        }
+                        format!("the {}{}", out.join(" and "), skips(&nums))
+                    }
+                }
+                (None, Some(days), Some(pos)) if pos == "-1" => {
+                    if days == "MO,TU,WE,TH,FR" {
+                        "the last working day".to_string()
+                    } else if let Some(name) = day_name(days) {
+                        format!("the last {name}")
+                    } else {
+                        return raw;
+                    }
+                }
+                (None, Some(days), Some(pos)) => {
+                    let Some(name) = day_name(days) else { return raw };
+                    let nth = match pos.as_str() {
+                        "1" => "first",
+                        "2" => "second",
+                        "3" => "third",
+                        "4" => "fourth",
+                        _ => return raw,
+                    };
+                    format!("the {nth} {name}")
+                }
+                (None, Some(day), None) => {
+                    // "-1FR" is the last Friday; "2MO" is the second Monday.
+                    let (num, code) = day.split_at(day.len().saturating_sub(2));
+                    let Some(name) = day_name(code) else { return raw };
+                    match num {
+                        "-1" => format!("the last {name}"),
+                        "1" | "+1" => format!("the first {name}"),
+                        "2" | "+2" => format!("the second {name}"),
+                        "3" | "+3" => format!("the third {name}"),
+                        "4" | "+4" => format!("the fourth {name}"),
+                        _ => return raw,
+                    }
+                }
+                _ => return raw,
+            };
+            format!("{base} on {suffix}")
+        }
+        Some("YEARLY") if byday.is_none() && bysetpos.is_none() => {
+            let base = every("yearly", "years");
+            let (day, month) = match (&bymonthday, &bymonth) {
+                (None, None) => (dtstart.day(), dtstart.month()),
+                (Some(d), Some(m)) => match (d.parse::<u32>(), m.parse::<u32>()) {
+                    (Ok(d), Ok(m)) if (1..=31).contains(&d) && (1..=12).contains(&m) => (d, m),
+                    _ => return raw,
+                },
+                _ => return raw,
+            };
+            format!("{base} on {day} {}", MONTHS[(month - 1) as usize])
+        }
+        _ => raw,
+    }
+}
+
 /// Move a date off a weekend, per the series' `weekend_rule`.
 ///
 /// This is applied AFTER expansion and moves the value date only -- never the occurrence identity.
@@ -292,5 +473,43 @@ mod tests {
         let hols = [d("2026-08-31")];
         assert_eq!(business_adjust(d("2026-08-30"), "after", &hols).to_string(), "2026-09-01");
         assert_eq!(business_adjust(d("2026-08-31"), "before", &hols).to_string(), "2026-08-28");
+    }
+
+    #[test]
+    fn describe_says_what_the_rule_does() {
+        let fri = d("2026-08-07"); // a Friday
+        let say = |rule: &str, start: NaiveDate| describe(rule, start);
+        assert_eq!(say("FREQ=DAILY", fri), "daily");
+        assert_eq!(say("FREQ=DAILY;INTERVAL=3", fri), "every 3 days");
+        assert_eq!(say("FREQ=WEEKLY;BYDAY=FR", fri), "weekly on Friday");
+        assert_eq!(say("FREQ=WEEKLY", fri), "weekly on Friday", "the start date's weekday");
+        assert_eq!(say("FREQ=WEEKLY;INTERVAL=2;BYDAY=FR", fri), "fortnightly on Friday");
+        assert_eq!(say("FREQ=WEEKLY;INTERVAL=4;BYDAY=MO", fri), "every 4 weeks on Monday");
+        assert_eq!(say("FREQ=WEEKLY;BYDAY=MO,FR", fri), "weekly on Monday, Friday");
+        assert_eq!(say("FREQ=MONTHLY;BYMONTHDAY=1", fri), "monthly on the 1st");
+        for (n, word) in [(2, "2nd"), (3, "3rd"), (4, "4th"), (11, "11th"), (12, "12th"), (13, "13th"),
+                          (21, "21st"), (22, "22nd"), (23, "23rd")] {
+            assert_eq!(say(&format!("FREQ=MONTHLY;BYMONTHDAY={n}"), fri), format!("monthly on the {word}"));
+        }
+        assert_eq!(say("FREQ=MONTHLY;BYMONTHDAY=31", fri), "monthly on the 31st (skips months without one)");
+        assert_eq!(say("FREQ=MONTHLY", d("2026-01-30")), "monthly on the 30th (skips months without one)");
+        assert_eq!(say("FREQ=MONTHLY;BYMONTHDAY=15,31", fri), "monthly on the 15th and 31st",
+                   "the 15th is paid every month, so the rule as a whole does not skip one");
+        assert_eq!(say("FREQ=MONTHLY;BYMONTHDAY=1,15", fri), "monthly on the 1st and 15th");
+        assert_eq!(say("FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=1", fri), "every 3 months on the 1st",
+                   "a quarterly rule must never read monthly");
+        assert_eq!(say("FREQ=MONTHLY", fri), "monthly on the 7th");
+        assert_eq!(say("FREQ=MONTHLY;BYMONTHDAY=-1", fri), "monthly on the last day");
+        assert_eq!(say("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1", fri), "monthly on the last working day");
+        assert_eq!(say("FREQ=MONTHLY;BYDAY=FR;BYSETPOS=-1", fri), "monthly on the last Friday");
+        assert_eq!(say("FREQ=MONTHLY;BYDAY=-1FR", fri), "monthly on the last Friday");
+        assert_eq!(say("FREQ=MONTHLY;BYDAY=2MO", fri), "monthly on the second Monday");
+        assert_eq!(say("FREQ=MONTHLY;BYDAY=MO;BYSETPOS=1", fri), "monthly on the first Monday");
+        assert_eq!(say("FREQ=YEARLY", d("2026-03-05")), "yearly on 5 March");
+        assert_eq!(say("FREQ=YEARLY;BYMONTH=12;BYMONTHDAY=25", fri), "yearly on 25 December");
+        // Anything it cannot fully read comes back as itself.
+        assert_eq!(say("FREQ=MONTHLY;BYWEEKNO=3", fri), "FREQ=MONTHLY;BYWEEKNO=3");
+        assert_eq!(say("FREQ=NOPE", fri), "FREQ=NOPE");
+        assert_eq!(say("FREQ=YEARLY;BYDAY=MO", fri), "FREQ=YEARLY;BYDAY=MO");
     }
 }

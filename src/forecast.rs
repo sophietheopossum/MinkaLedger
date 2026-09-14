@@ -25,6 +25,9 @@ pub struct SeriesPosting {
 #[derive(Debug, Clone)]
 pub struct Series {
     pub id: i64,
+    /// Set on every part of a rule changed "from a date" except the first: the id of the first
+    /// part's matching hop. The rule's parts are one commitment; see `lineage_map`.
+    pub head_id: Option<i64>,
     pub description: String,
     pub rrule: String,
     pub dtstart: NaiveDate,
@@ -153,6 +156,9 @@ pub struct Occurrence {
     /// The what-if this belongs to, when it is not baseline: a hypothetical payment is drawn
     /// like any other but must not be recorded as money that moved.
     pub scenario_id: Option<i64>,
+    /// The slot's own amount was set by hand (an override carrying an amount), so a change to
+    /// the rule's price does not reach it.
+    pub amended: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -174,6 +180,31 @@ pub struct Projection {
     pub horizon: String,
 }
 
+/// How far before as_of a rule's slots are expanded: a slot just before as_of can still be owed
+/// on or after it once a weekend rule moves it. Also the horizon within which an adjustment to a
+/// slot can still change a forecast, which is what the rule editor checks against.
+pub const LOOKBACK_DAYS: i64 = 10;
+
+/// Every series id -> the id that names the whole RULE it belongs to.
+///
+/// A rule is one or more PARTS: changing a rule "from a date" ends the current part and starts a
+/// new one whose rows carry `head_id` (the first part's matching hop). A part is itself one or
+/// more hops: a recurring chain is several series tied by `chain_id`. The rule's key is therefore
+/// read off a part's FIRST hop -- `COALESCE(head_id, id)` of the hop the `chain_id` names -- so
+/// every hop of every part answers with the same number. Anything that treats a rule as one
+/// commitment (a what-if cancel, the brief's totals) must key on this, not on `series.id`.
+pub fn lineage_map(series: &[Series]) -> HashMap<i64, i64> {
+    let by_id: HashMap<i64, &Series> = series.iter().map(|s| (s.id, s)).collect();
+    series
+        .iter()
+        .map(|s| {
+            let first = s.chain_id.unwrap_or(s.id);
+            let key = by_id.get(&first).and_then(|h| h.head_id).unwrap_or(first);
+            (s.id, key)
+        })
+        .collect()
+}
+
 /// Project from `as_of` (exclusive of history already counted) to `horizon`, inclusive.
 ///
 /// `active` is the set of scenario ids to overlay. A series with `scenario_id = None` is baseline
@@ -185,23 +216,21 @@ pub fn project<R: Recurrence>(
     horizon: NaiveDate,
     active: &HashSet<i64>,
 ) -> Result<Projection, crate::recur::RecurError> {
-    // A scenario series may SUPERSEDE a baseline one. Collect the suppressed ids first so the
+    // A scenario series may SUPERSEDE a baseline one. Collect the suppressed rules first so the
     // baseline series is skipped entirely rather than netted against -- netting would leave the
     // cancelled payment visible in the occurrence list at zero.
+    //
+    // Suppression is by RULE, not by row. Cancelling any hop of a chain cancels the chain (a chain
+    // with its first hop gone would show the intermediate account paying out of its own pocket),
+    // and cancelling any part of a rule changed from a date cancels every part: "what if I cancel
+    // the rent" means the rent, not whichever stretch of it the cancel happened to be made against.
+    let lineage = lineage_map(&snap.series);
     let suppressed: HashSet<i64> = snap
         .series
         .iter()
         .filter(|s| s.scenario_id.is_some_and(|id| active.contains(&id)))
         .filter_map(|s| s.supersedes_id)
-        .collect();
-
-    // Cancelling any hop of a chain cancels the chain: the hops are one commitment, and a chain
-    // with its first hop gone would show the intermediate account paying out of its own pocket.
-    let suppressed_chains: HashSet<i64> = snap
-        .series
-        .iter()
-        .filter(|s| suppressed.contains(&s.id))
-        .filter_map(|s| s.chain_id)
+        .map(|target| lineage.get(&target).copied().unwrap_or(target))
         .collect();
     let mut chain_len: HashMap<i64, i64> = HashMap::new();
     for s in &snap.series {
@@ -217,7 +246,7 @@ pub fn project<R: Recurrence>(
             Some(id) if !active.contains(&id) => continue, // an inactive scenario's series
             _ => {}
         }
-        if suppressed.contains(&s.id) || s.chain_id.is_some_and(|c| suppressed_chains.contains(&c)) {
+        if suppressed.contains(&lineage[&s.id]) {
             continue;
         }
 
@@ -228,7 +257,7 @@ pub fn project<R: Recurrence>(
         // either it or its value date is on or after as_of; a slot before as_of whose money
         // also moved before as_of is history's business and the opening balance already has
         // it, or it was never recorded, which no forecast can tell.
-        let lookback = as_of - chrono::Duration::days(10);
+        let lookback = as_of - chrono::Duration::days(LOOKBACK_DAYS);
         let slots = recur.expand(&s.rrule, s.dtstart, s.until_on, lookback, horizon)?;
         for slot in slots {
             let ov = snap.overrides.get(&(s.id, slot));
@@ -290,6 +319,7 @@ pub fn project<R: Recurrence>(
                     chain_len: s.chain_id.map(|c| chain_len[&c]),
                     txn_id: None,
                     scenario_id: s.scenario_id,
+                    amended: amended.is_some(),
                 });
             }
         }
@@ -318,6 +348,7 @@ pub fn project<R: Recurrence>(
                 chain_len: None,
                 txn_id: Some(t.id),
                 scenario_id: None,
+                amended: false,
             });
         }
     }
@@ -440,6 +471,7 @@ pub fn project<R: Recurrence>(
                                 chain_len: None,
                                 txn_id: None,
                                 scenario_id: r.scenario_id,
+                                amended: false,
                             });
                         }
                     }
@@ -497,6 +529,7 @@ pub fn project<R: Recurrence>(
                             chain_len: None,
                             txn_id: None,
                             scenario_id: r.scenario_id,
+                            amended: false,
                         });
                     }
                 }
@@ -552,6 +585,7 @@ mod tests {
         s.opening.insert(1, 100_000); // £1,000 to start
         s.series.push(Series {
             id: 10,
+            head_id: None,
             description: "Salary".into(),
             rrule: "FREQ=MONTHLY;BYMONTHDAY=28".into(),
             dtstart: d("2026-01-28"),
@@ -568,6 +602,7 @@ mod tests {
         });
         s.series.push(Series {
             id: 11,
+            head_id: None,
             description: "Rent".into(),
             rrule: "FREQ=MONTHLY;BYMONTHDAY=1".into(),
             dtstart: d("2026-01-01"),
@@ -757,6 +792,7 @@ mod tests {
         let mut s = snap();
         s.series.push(Series {
             id: 12,
+            head_id: None,
             description: "Gym membership".into(),
             rrule: "FREQ=MONTHLY;BYMONTHDAY=10".into(),
             dtstart: d("2026-01-10"),
@@ -786,6 +822,7 @@ mod tests {
         let mut s = snap();
         s.series.push(Series {
             id: 13,
+            head_id: None,
             description: "cancel rent".into(),
             rrule: "FREQ=MONTHLY;BYMONTHDAY=1".into(),
             dtstart: d("2026-01-01"),
@@ -800,6 +837,107 @@ mod tests {
         let p = run(&s, "2026-08-01", "2026-10-31", &[2]);
         assert!(!p.occurrences.iter().any(|o| o.series_id == 11), "rent must be gone entirely");
         assert_eq!(closing(&p, 1), 100_000 + 3 * 250_000);
+    }
+
+    /// The rent changed from 1/9/2026: part 11 ends on 31/8, part 12 (head 11) runs from 1/9.
+    fn changed_rent(s: &mut Snapshot) {
+        s.series[1].until_on = Some(d("2026-08-31"));
+        let mut later = s.series[1].clone();
+        later.id = 12;
+        later.head_id = Some(11);
+        later.dtstart = d("2026-09-01");
+        later.until_on = None;
+        later.postings[0].amount_minor = -95_000;
+        later.postings[1].amount_minor = 95_000;
+        s.series.push(later);
+    }
+
+    fn cancel(s: &mut Snapshot, id: i64, target: i64) {
+        let mut row = s.series[1].clone();
+        row.id = id;
+        row.head_id = None;
+        row.until_on = None;
+        row.scenario_id = Some(2);
+        row.supersedes_id = Some(target);
+        row.postings.clear();
+        s.series.push(row);
+    }
+
+    #[test]
+    fn a_cancel_covers_every_part_of_a_rule_changed_from_a_date() {
+        let mut s = snap();
+        changed_rent(&mut s);
+        let base = run(&s, "2026-08-01", "2026-10-31", &[]);
+        assert!(base.occurrences.iter().any(|o| o.series_id == 11));
+        assert!(base.occurrences.iter().any(|o| o.series_id == 12 && o.amount_minor == -95_000));
+        cancel(&mut s, 20, 11);
+        let p = run(&s, "2026-08-01", "2026-10-31", &[2]);
+        assert!(
+            !p.occurrences.iter().any(|o| o.series_id == 11 || o.series_id == 12),
+            "cancelling the rent cancels the rent, not only the stretch the cancel was made against"
+        );
+    }
+
+    #[test]
+    fn a_cancel_of_a_later_part_covers_the_earlier_one() {
+        let mut s = snap();
+        changed_rent(&mut s);
+        cancel(&mut s, 20, 12);
+        let p = run(&s, "2026-08-01", "2026-10-31", &[2]);
+        assert!(!p.occurrences.iter().any(|o| o.series_id == 11 || o.series_id == 12));
+        assert!(p.occurrences.iter().any(|o| o.series_id == 10), "the salary is untouched");
+    }
+
+    #[test]
+    fn a_cancel_covers_every_part_of_a_changed_chain() {
+        // Chain 30 -> 31 (Current -> Rent -> Salary, standing in for any two hops), changed from
+        // 1/9 into chain 32 -> 33 with head ids 30 and 31. A cancel against the old first hop
+        // covers all four rows.
+        let mut s = snap();
+        let hop = |id: i64, head: Option<i64>, chain: i64, seq: i64, from: &str, until: Option<&str>| Series {
+            id,
+            head_id: head,
+            description: "stake".into(),
+            rrule: "FREQ=MONTHLY;BYMONTHDAY=2".into(),
+            dtstart: d(from),
+            until_on: until.map(d),
+            weekend_rule: "none".into(),
+            scenario_id: None,
+            supersedes_id: None,
+            chain_id: Some(chain),
+            chain_seq: Some(seq),
+            postings: vec![
+                SeriesPosting { account_id: 1 + seq, currency: "GBP".into(), amount_minor: -1_000, role: "primary".into() },
+                SeriesPosting { account_id: 2 + seq, currency: "GBP".into(), amount_minor: 1_000, role: "balancing".into() },
+            ],
+        };
+        s.series.push(hop(30, None, 30, 0, "2026-01-02", Some("2026-08-31")));
+        s.series.push(hop(31, None, 30, 1, "2026-01-02", Some("2026-08-31")));
+        s.series.push(hop(32, Some(30), 32, 0, "2026-09-02", None));
+        s.series.push(hop(33, Some(31), 32, 1, "2026-09-02", None));
+        let lineage = lineage_map(&s.series);
+        assert_eq!([lineage[&30], lineage[&31], lineage[&32], lineage[&33]], [30, 30, 30, 30]);
+        cancel(&mut s, 40, 30);
+        let p = run(&s, "2026-08-01", "2026-10-31", &[2]);
+        assert!(!p.occurrences.iter().any(|o| (30..=33).contains(&o.series_id)));
+    }
+
+    #[test]
+    fn an_amount_override_marks_the_occurrence_amended() {
+        let mut s = snap();
+        s.overrides.insert(
+            (11, d("2026-09-01")),
+            Override { action: "amend".into(), moved_to: None, amount_minor: Some(-80_000), description: None },
+        );
+        s.overrides.insert(
+            (11, d("2026-10-01")),
+            Override { action: "amend".into(), moved_to: Some(d("2026-10-02")), amount_minor: None, description: None },
+        );
+        let p = run(&s, "2026-08-01", "2026-10-31", &[]);
+        let rent = |on: &str| p.occurrences.iter().find(|o| o.series_id == 11 && o.occurrence_on == on).unwrap();
+        assert!(rent("2026-09-01").amended);
+        assert!(!rent("2026-10-01").amended, "a moved date alone carries no price");
+        assert!(!rent("2026-08-01").amended);
     }
 
     #[test]
@@ -1006,12 +1144,13 @@ pub mod load {
 
         let mut st = conn.prepare(
             "SELECT id, description, rrule, dtstart, until_on, weekend_rule, scenario_id,
-                    supersedes_id, chain_id, chain_seq FROM series",
+                    supersedes_id, chain_id, chain_seq, head_id FROM series",
         )?;
         let heads: Vec<Series> = st
             .query_map([], |r| {
                 Ok(Series {
                     id: r.get(0)?,
+                    head_id: r.get(10)?,
                     description: r.get(1)?,
                     rrule: r.get(2)?,
                     dtstart: date(r.get(3)?),

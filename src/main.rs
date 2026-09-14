@@ -23,6 +23,7 @@ mod journey;
 mod link;
 mod money;
 mod roles;
+mod series_edit;
 
 use std::io::{BufRead, Write};
 
@@ -194,6 +195,12 @@ impl From<link::LinkError> for Error {
             L::Sql(_) | L::Unexpected(_) => "sql",
         };
         Error { code, message: e.to_string() }
+    }
+}
+
+impl From<series_edit::EditError> for Error {
+    fn from(e: series_edit::EditError) -> Self {
+        Error { code: e.code, message: e.message }
     }
 }
 
@@ -926,11 +933,22 @@ fn dispatch(
             let until = params.get("until_on").and_then(|v| v.as_str())
                 .and_then(|u| chrono::NaiveDate::parse_from_str(u, "%Y-%m-%d").ok());
             let weekend = params.get("weekend_rule").and_then(|v| v.as_str()).unwrap_or("none");
+            // from_on: the dates a rule that keeps its start produces from a later day, which is
+            // what a change "from a date" will pay -- a fortnightly rule started on a Friday keeps
+            // its own Fridays rather than beginning a new fortnight on the day chosen.
+            let from_on = match params.get("from_on").and_then(|v| v.as_str()) {
+                Some(f) => Some(
+                    chrono::NaiveDate::parse_from_str(f, "%Y-%m-%d")
+                        .map_err(|_| bad("from_on must be YYYY-MM-DD"))?,
+                ),
+                None => None,
+            };
+            let lo = from_on.map_or(start, |f| f.max(start));
             // A generous horizon so even an annual rule yields `count` dates.
-            let horizon = start + chrono::Duration::days(366 * 12);
+            let horizon = lo + chrono::Duration::days(366 * 12);
             let holidays: Vec<chrono::NaiveDate> = Vec::new();
             let dates = recur::RRuleCrate
-                .expand(rrule, start, until, start, horizon)
+                .expand(rrule, start, until, lo, horizon)
                 .map_err(|e| Error { code: "bad_rule", message: e.to_string() })?;
             let out: Vec<serde_json::Value> = dates
                 .into_iter()
@@ -1146,6 +1164,11 @@ fn dispatch(
                         (SELECT a.name FROM series_posting sp JOIN account a ON a.id = sp.account_id
                           WHERE sp.series_id = s.id AND sp.role = 'primary'),
                         (SELECT a.name FROM series_posting sp JOIN account a ON a.id = sp.account_id
+                          WHERE sp.series_id = s.id AND sp.role = 'balancing'),
+                        s.head_id,
+                        (SELECT sp.account_id FROM series_posting sp
+                          WHERE sp.series_id = s.id AND sp.role = 'primary'),
+                        (SELECT sp.account_id FROM series_posting sp
                           WHERE sp.series_id = s.id AND sp.role = 'balancing')
                    FROM series s ORDER BY s.id",
             ).map_err(|e| Error { code: "sql", message: e.to_string() })?;
@@ -1169,8 +1192,26 @@ fn dispatch(
                     "chain_len": chain_id.map(|_| r.get::<_, i64>(14)).transpose()?,
                     "from_account": r.get::<_, Option<String>>(15)?,
                     "to_account": r.get::<_, Option<String>>(16)?,
+                    "head_id": r.get::<_, Option<i64>>(17)?,
+                    "from_account_id": r.get::<_, Option<i64>>(18)?,
+                    "to_account_id": r.get::<_, Option<i64>>(19)?,
                 }))
-            }).and_then(|m| m.collect()).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            }).and_then(|m| m.collect::<Result<Vec<_>, _>>()).map_err(|e| Error { code: "sql", message: e.to_string() })?;
+            // Which rule each row belongs to, and whether it is in that rule's newest part: a
+            // rule changed from a date is several rows, and only the newest part is the rule as
+            // it stands now.
+            let lineage = series_edit::lineage_and_latest(conn)?;
+            let rows: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|mut row| {
+                    let id = row["id"].as_i64().unwrap_or(0);
+                    if let Some((key, latest)) = lineage.get(&id) {
+                        row["lineage_id"] = serde_json::json!(key);
+                        row["latest"] = serde_json::json!(latest);
+                    }
+                    row
+                })
+                .collect();
             Ok(serde_json::Value::Array(rows))
         }
 
@@ -1196,8 +1237,9 @@ fn dispatch(
                 return Err(bad("description must not be empty"));
             }
             // A chain's hops share their description by construction, so renaming any hop
-            // renames the chain.
-            let family = series_family(conn, id)?;
+            // renames the chain -- and a rule changed from a date is still one rule with one
+            // name, so renaming any part renames every part.
+            let family = series_edit::rule_ids(conn, id)?;
             if family.is_empty() {
                 return Err(Error { code: "not_found", message: format!("no such series: {id}") });
             }
@@ -1219,26 +1261,18 @@ fn dispatch(
         "series.end" => {
             let id = params.get("id").and_then(|v| v.as_i64()).ok_or_else(|| bad("id"))?;
             let until = params.get("until_on").and_then(|v| v.as_str());
-            let dtstart: String = conn
-                .query_row("SELECT dtstart FROM series WHERE id = ?1", [id], |r| r.get(0))
-                .map_err(|_| Error { code: "not_found", message: format!("no such series: {id}") })?;
             if let Some(u) = until {
                 if chrono::NaiveDate::parse_from_str(u, "%Y-%m-%d").is_err() {
                     return Err(bad("until_on must be YYYY-MM-DD"));
                 }
-                // The schema CHECK would catch this, but "ends before it starts" is worth saying
-                // in those words rather than as a constraint name.
-                if u < dtstart.as_str() {
-                    return Err(Error {
-                        code: "bad_params",
-                        message: format!("it would end on {u}, before it starts on {dtstart}"),
-                    });
-                }
             }
-            // Every hop of a chain starts on the same day, so the check above holds for all of
-            // them, and a chain ends as one: a hop bounded alone would leave money arriving at
-            // the intermediate account with nowhere to go.
-            let family = series_family(conn, id)?;
+            // A rule ends as one. Every hop of a chain starts on the same day and a chain ends as
+            // one: a hop bounded alone would leave money arriving at the intermediate account with
+            // nowhere to go. And a rule changed from a date ends at its NEWEST part, whichever of
+            // its ids was given: the earlier parts already end where the change begins. The
+            // "ends before it starts" check (which the schema CHECK would also catch, in less
+            // useful words) is against that part's start.
+            let family = series_edit::end_target(conn, id, until)?;
             conn.execute(
                 &format!("UPDATE series SET until_on = ?1 WHERE id IN ({})", id_list(&family)),
                 rusqlite::params![until],
@@ -1342,6 +1376,11 @@ fn dispatch(
                 .map_err(sql_err)?;
             Ok(serde_json::json!({ "cleared": n, "applied_to": family }))
         }
+
+        // ---- reviewing and editing recurring payment rules: see series_edit.rs ----
+        "series.review" => Ok(series_edit::review(conn, &params)?),
+        "series.revise" => Ok(series_edit::revise(conn, &params)?),
+        "series.undo_change" => Ok(series_edit::undo_change(conn, &params)?),
 
         // ---- scenarios (req 8) ----
         "scenario.create" => {

@@ -68,7 +68,7 @@ fn month_start(d: NaiveDate) -> NaiveDate {
 }
 
 /// Shift by whole months, clamping the day. Only ever called with day 1, so the clamp is belt.
-fn shift_months(d: NaiveDate, delta: i32) -> NaiveDate {
+pub(crate) fn shift_months(d: NaiveDate, delta: i32) -> NaiveDate {
     let total = d.year() * 12 + (d.month() as i32 - 1) + delta;
     let (y, m) = (total.div_euclid(12), total.rem_euclid(12) as u32 + 1);
     NaiveDate::from_ymd_opt(y, m, d.day())
@@ -159,6 +159,97 @@ fn position(conn: &Connection, sc: &Scales, as_of: NaiveDate) -> Result<serde_js
     }))
 }
 
+/// One recurring commitment's next twelve months, as the brief counts it.
+pub(crate) struct Agg {
+    pub annual: i128,
+    pub count: i64,
+    pub currency: String,
+    pub account: String,
+    pub next_on: Option<String>,
+    /// The first-hop series ids of every part of the rule, oldest first.
+    pub parts: Vec<i64>,
+    /// From the newest part: a rule changed from a date is called what it is called now.
+    pub description: String,
+    pub rrule: String,
+}
+
+/// Sum a projection's occurrences per RULE (`forecast::lineage_map`), primary leg only.
+///
+/// Shared by the brief and the rule review, so the figure a rule shows beside itself is the
+/// figure the brief counts for it -- two places computing "what this costs a month" separately
+/// would eventually disagree, and a reader has no way to know which one is right.
+pub(crate) fn commitment_aggregates(snap: &forecast::Snapshot, occ: &[forecast::Occurrence]) -> BTreeMap<i64, Agg> {
+    let lineage = forecast::lineage_map(&snap.series);
+    // Only the PRIMARY leg counts: the balancing leg is the same money seen from the other side,
+    // and summing both would net every commitment to exactly zero.
+    let mut primary: HashMap<i64, i64> = HashMap::new();
+    // Every first hop per rule, to order the parts and to describe the rule as it stands now.
+    type First = (NaiveDate, i64, String, String, Option<(i64, String)>);
+    let mut firsts: BTreeMap<i64, Vec<First>> = BTreeMap::new();
+    for s in &snap.series {
+        // A recurring chain is one commitment spread over several series; the money leaves the
+        // household once, on the first hop. Counting every hop would report a £100 stake routed
+        // through a friend as £200 of outgoings.
+        if s.chain_seq.is_some_and(|q| q > 0) {
+            continue;
+        }
+        if let Some(p) = s.postings.iter().find(|p| p.role == "primary") {
+            primary.insert(s.id, p.account_id);
+        }
+        if s.scenario_id.is_none() {
+            let paying = s.postings.iter().find(|p| p.role == "primary").map(|p| (p.account_id, p.currency.clone()));
+            firsts
+                .entry(lineage[&s.id])
+                .or_default()
+                .push((s.dtstart, s.id, s.description.clone(), s.rrule.clone(), paying));
+        }
+    }
+
+    let mut by_rule: BTreeMap<i64, Agg> = BTreeMap::new();
+    for o in occ {
+        if primary.get(&o.series_id) != Some(&o.account_id) {
+            continue;
+        }
+        let key = lineage.get(&o.series_id).copied().unwrap_or(o.series_id);
+        let e = by_rule.entry(key).or_insert_with(|| Agg {
+            annual: 0,
+            count: 0,
+            currency: o.currency.clone(),
+            account: o.account.clone(),
+            next_on: None,
+            parts: Vec::new(),
+            description: String::new(),
+            rrule: String::new(),
+        });
+        e.annual += o.amount_minor as i128;
+        e.count += 1;
+        if e.next_on.is_none() {
+            e.next_on = Some(o.value_on.clone());
+        }
+    }
+    for (key, agg) in by_rule.iter_mut() {
+        if let Some(parts) = firsts.get_mut(key) {
+            parts.sort();
+            agg.parts = parts.iter().map(|p| p.1).collect();
+            if let Some(newest) = parts.last() {
+                agg.description = newest.2.clone();
+                agg.rrule = newest.3.clone();
+                // Named after the account the rule pays from NOW: a change from a date that moved
+                // the rent to another account is that account's commitment from here on.
+                if let Some((account, currency)) = &newest.4 {
+                    agg.account = snap.account_name.get(account).cloned().unwrap_or_default();
+                    agg.currency = currency.clone();
+                }
+            }
+        } else if let Some(s) = snap.series.iter().find(|s| s.id == *key) {
+            agg.parts = vec![s.id];
+            agg.description = s.description.clone();
+            agg.rrule = s.rrule.clone();
+        }
+    }
+    by_rule
+}
+
 /// What recurs, and what it really costs per month.
 ///
 /// The monthly figure is the reason this is not a table of `series_posting.amount_minor`. Twelve
@@ -175,64 +266,19 @@ fn commitments(
     let proj = forecast::project(&RRuleCrate, &snap, as_of, year_end, &HashSet::new())
         .map_err(|e| AnalysisError::Bad(e.to_string()))?;
 
-    // Only the PRIMARY leg counts: the balancing leg is the same money seen from the other side,
-    // and summing both would net every commitment to exactly zero.
-    let mut primary: HashMap<i64, i64> = HashMap::new();
-    for s in &snap.series {
-        // A recurring chain is one commitment spread over several series; the money leaves the
-        // household once, on the first hop. Counting every hop would report a £100 stake routed
-        // through a friend as £200 of outgoings.
-        if s.chain_seq.is_some_and(|q| q > 0) {
-            continue;
-        }
-        if let Some(p) = s.postings.iter().find(|p| p.role == "primary") {
-            primary.insert(s.id, p.account_id);
-        }
-    }
-
-    struct Agg {
-        annual: i128,
-        count: i64,
-        currency: String,
-        account: String,
-        next_on: Option<String>,
-    }
-    let mut by_series: BTreeMap<i64, Agg> = BTreeMap::new();
-    for o in &proj.occurrences {
-        if primary.get(&o.series_id) != Some(&o.account_id) {
-            continue;
-        }
-        let e = by_series.entry(o.series_id).or_insert_with(|| Agg {
-            annual: 0,
-            count: 0,
-            currency: o.currency.clone(),
-            account: o.account.clone(),
-            next_on: None,
-        });
-        e.annual += o.amount_minor as i128;
-        e.count += 1;
-        if e.next_on.is_none() {
-            e.next_on = Some(o.value_on.clone());
-        }
-    }
-
-    let described: HashMap<i64, (String, String)> = snap
-        .series
-        .iter()
-        .map(|s| (s.id, (s.description.clone(), s.rrule.clone())))
-        .collect();
+    let by_rule = commitment_aggregates(&snap, &proj.occurrences);
 
     let mut rows = Vec::new();
     let mut monthly_by_currency: BTreeMap<String, i128> = BTreeMap::new();
-    for (sid, a) in &by_series {
+    for (sid, a) in &by_rule {
         let monthly = money::round_half_away(a.annual, 12).unwrap_or(0);
         *monthly_by_currency.entry(a.currency.clone()).or_insert(0) += monthly as i128;
-        let (desc, rrule) = described.get(sid).cloned().unwrap_or_default();
         let annual = i64::try_from(a.annual).unwrap_or(i64::MAX);
         rows.push(serde_json::json!({
             "series_id": sid,
-            "description": desc,
-            "rrule": rrule,
+            "parts": a.parts,
+            "description": a.description,
+            "rrule": a.rrule,
             "account": a.account,
             "currency": a.currency,
             "next_on": a.next_on,
@@ -249,7 +295,8 @@ fn commitments(
     Ok(serde_json::json!({
         "derivation": format!(
             "every non-scenario series expanded from {as_of} to {year_end} through the projection \
-             engine, primary leg only, a chain counted once by its first hop, summed and divided by 12"),
+             engine, primary leg only, a chain counted once by its first hop, a rule changed from a \
+             date counted once, summed and divided by 12"),
         "window": { "from": as_of.to_string(), "to": year_end.to_string() },
         "series": rows,
         "monthly_equivalent_by_currency": monthly_by_currency.iter().map(|(c, v)| {
@@ -856,6 +903,9 @@ pub fn schema(conn: &Connection) -> Result<serde_json::Value, AnalysisError> {
             "A recurring chain is several series rows sharing chain_id, one per leg; when summing \
              commitments count only chain_seq = 0 (or NULL), or the same money is counted once \
              per leg.",
+            "A recurring payment changed from a date is several series rows whose first legs \
+             share COALESCE(head_id, id); group commitments by that, or the payment is counted \
+             once per part.",
         ],
         "objects": objects,
     }))
@@ -1058,6 +1108,30 @@ mod tests {
         assert_eq!(rows.len(), 1, "both legs of one series would net to zero and show as two rows");
         assert_eq!(rows[0]["monthly_equivalent_minor"], -90_000);
         assert_eq!(b["commitments"]["monthly_equivalent_by_currency"][0]["amount_minor"], -90_000);
+    }
+
+    #[test]
+    fn parts_of_a_changed_rule_are_one_commitment() {
+        let c = book();
+        with_rent_series(&c);
+        // The rent changed from 2/1/2027: part 1 ends the day before, part 2 carries head_id 1.
+        c.execute_batch(
+            "UPDATE series SET until_on = '2027-01-01' WHERE id = 1;
+             INSERT INTO series(id,head_id,description,rrule,dtstart) VALUES
+               (2,1,'Flat rent','FREQ=MONTHLY;BYMONTHDAY=2','2027-01-02');
+             INSERT INTO series_posting(series_id,account_id,currency,amount_minor,role)
+               VALUES(2,1,'GBP',-95000,'primary'),(2,4,'GBP',95000,'balancing');",
+        )
+        .unwrap();
+        let b = brief(&c, &opts("2026-08-15")).unwrap();
+        let rows = b["commitments"]["series"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "one rule, not one row per part: {rows:?}");
+        assert_eq!(rows[0]["series_id"], 1);
+        assert_eq!(rows[0]["parts"], serde_json::json!([1, 2]));
+        assert_eq!(rows[0]["description"], "Flat rent", "called what it is called now");
+        // 2/9..2/12 at 900.00 (4: the first part ends on 1/1), then 2/1..2/8 at 950.00 (8).
+        assert_eq!(rows[0]["occurrences_next_12m"], 12);
+        assert_eq!(rows[0]["annual_minor"], -(4 * 90_000 + 8 * 95_000));
     }
 
     #[test]

@@ -38,6 +38,9 @@ Rectangle {
     // symptom was "click an upcoming payment, close it, and it never opens again".)
     signal changed
     signal dismissed
+    // Open the RULE this occurrence comes from, as a change from this occurrence's date: the
+    // parent opens the rules panel and clears the selection; this editor never does either itself.
+    signal ruleRequested(int seriesId, string occurrenceOn)
 
     visible: active
     color: Theme.surfaceRaised
@@ -227,6 +230,10 @@ Rectangle {
             PushButton {
                 label: "Reset"
                 onClicked: root.clearOverride()
+            }
+            PushButton {
+                label: "Edit rule…"
+                onClicked: root.ruleRequested(root.occurrence.series_id, root.occurrence.occurrence_on)
             }
             PushButton {
                 label: "Close"

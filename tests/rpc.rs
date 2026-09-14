@@ -1968,3 +1968,1007 @@ fn balance_history_starts_from_what_the_window_inherited() {
     assert_eq!(only_sam.len(), 1);
     assert_eq!(only_sam[0]["points"].as_array().unwrap().len(), 2, "{only_sam:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Reviewing and editing recurring payment rules (series.review, series.revise, series.undo_change)
+// ---------------------------------------------------------------------------------------------
+
+use serde_json::{json, Value};
+
+/// A script of calls against one fresh book, numbered in order.
+struct Script {
+    lines: Vec<String>,
+    next: i64,
+}
+
+impl Script {
+    fn new() -> Self {
+        Script { lines: Vec::new(), next: 1 }
+    }
+    fn call(&mut self, method: &str, params: Value) -> i64 {
+        let id = self.next;
+        self.next += 1;
+        self.lines.push(json!({ "id": id, "method": method, "params": params }).to_string());
+        id
+    }
+    fn account(&mut self, name: &str, kind: &str) -> i64 {
+        self.call("account.create", json!({ "name": name, "kind": kind }))
+    }
+    fn run(&self) -> Replies {
+        let refs: Vec<&str> = self.lines.iter().map(String::as_str).collect();
+        Replies(run(&refs))
+    }
+}
+
+struct Replies(Vec<Value>);
+
+impl Replies {
+    fn get(&self, id: i64) -> &Value {
+        self.0.iter().find(|r| r["id"] == id).unwrap_or_else(|| panic!("no reply for {id}"))
+    }
+    #[track_caller]
+    fn ok(&self, id: i64) -> &Value {
+        let r = self.get(id);
+        assert!(err_of(r).is_none(), "call {id} failed: {r}");
+        &r["result"]
+    }
+    #[track_caller]
+    fn err(&self, id: i64) -> (String, String) {
+        let r = self.get(id);
+        let e = r.get("error").unwrap_or_else(|| panic!("call {id} should have failed: {r}"));
+        (e["code"].as_str().unwrap_or("").to_string(), e["message"].as_str().unwrap_or("").to_string())
+    }
+}
+
+fn plain(desc: &str, from: i64, to: i64, amount: i64, rrule: &str, start: &str) -> Value {
+    json!({
+        "description": desc, "rrule": rrule, "dtstart": start,
+        "postings": [
+            { "account_id": from, "amount_minor": -amount, "role": "primary" },
+            { "account_id": to, "amount_minor": amount, "role": "balancing" },
+        ],
+    })
+}
+
+/// (series_id, occurrence_on, value_on, amount) of every series occurrence on `account`.
+fn legs(projection: &Value, account: i64) -> Vec<(i64, String, String, i64)> {
+    projection["occurrences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|o| o["kind"] == "series" && o["account_id"] == account)
+        .map(|o| {
+            (
+                o["series_id"].as_i64().unwrap(),
+                o["occurrence_on"].as_str().unwrap().to_string(),
+                o["value_on"].as_str().unwrap().to_string(),
+                o["amount_minor"].as_i64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn rule<'a>(review: &'a Value, desc: &str) -> &'a Value {
+    review["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["description"] == desc)
+        .unwrap_or_else(|| panic!("no rule {desc} in {review}"))
+}
+
+const AS_OF: &str = "2026-09-14";
+
+#[test]
+fn the_review_lists_every_rule_with_what_hangs_off_it() {
+    let mut s = Script::new();
+    let current = s.account("Current", "asset");
+    let rent = s.account("Rent", "expense");
+    let gym = s.account("Gym", "expense");
+    let sam = s.account("Sam", "asset");
+    let bookie = s.account("Bookmaker", "asset");
+    let old_bank = s.account("Old bank", "asset");
+    let card = s.account("Card", "liability");
+    let interest = s.account("Interest", "expense");
+    let fees = s.account("Fees", "expense");
+    let phone = s.account("Phone", "expense");
+    s.call("series.create", plain("Rent", current, rent, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    s.call("series.create_chain", json!({
+        "description": "stake via Sam", "rrule": "FREQ=MONTHLY;BYMONTHDAY=1", "dtstart": "2026-10-01",
+        "from_account": current, "hops": [{ "to_account": sam, "amount_minor": 10000 }, { "to_account": bookie, "amount_minor": 9500 }],
+    }));
+    let mut gym_rule = plain("Gym", old_bank, gym, 3000, "FREQ=MONTHLY;BYMONTHDAY=10", "2026-01-10");
+    gym_rule["until_on"] = json!("2026-06-10");
+    s.call("series.create", gym_rule);
+    s.call("series.create", json!({
+        "description": "Phone", "rrule": "FREQ=MONTHLY;BYMONTHDAY=20", "dtstart": "2026-01-20",
+        "postings": [
+            { "account_id": current, "amount_minor": -5000, "role": "primary" },
+            { "account_id": phone, "amount_minor": 4000, "role": "balancing" },
+            { "account_id": fees, "amount_minor": 1000, "role": "other" },
+        ],
+    }));
+    s.call("series.record", json!({ "series_id": 1, "occurrence_on": "2026-09-01" }));
+    s.call("series.override", json!({ "series_id": 1, "occurrence_on": "2026-10-01", "action": "skip" }));
+    let change = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2027-01-01", "amounts": [95000] }));
+    s.call("scenario.create", json!({ "name": "move out" }));
+    let mut dream = plain("Dream rent", current, rent, 150000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-11-01");
+    dream["scenario_id"] = json!(1);
+    s.call("series.create", dream);
+    s.call("series.create", json!({
+        "description": "cancel Gym", "rrule": "FREQ=MONTHLY;BYMONTHDAY=10", "dtstart": "2026-01-10",
+        "scenario_id": 1, "supersedes_id": 4, "postings": [],
+    }));
+    s.call("account.close", json!({ "id": old_bank }));
+    s.call("interest.create_rule", json!({
+        "account_id": card, "counter_account_id": interest, "shape": "revolving", "quoted_rate": "24.9",
+        "accrual_freq": "daily", "capitalise_dtstart": "2026-01-01", "grace_period": true,
+    }));
+    s.call("payment.create_rule", json!({
+        "account_id": card, "from_account_id": current, "amount_kind": "pct_of_statement", "pct": "1.0",
+        "floor_minor": 500, "rrule": "FREQ=MONTHLY;BYMONTHDAY=15", "dtstart": "2026-01-15",
+        "interest_rule_id": 1, "due_offset_days": 21,
+    }));
+    let review = s.call("series.review", json!({ "as_of": AS_OF }));
+    let check = s.call("db.check", json!({}));
+    let out = s.run();
+    for r in &out.0 {
+        assert!(err_of(r).is_none(), "no step may fail: {r}");
+    }
+    assert_eq!(out.ok(change)["mode"], "split");
+    let v = out.ok(review);
+    assert_eq!(v["rules"].as_array().unwrap().len(), 4, "{v}");
+
+    let r = rule(v, "Rent");
+    assert_eq!(r["lineage_id"], 1);
+    assert_eq!(r["parts"].as_array().unwrap().len(), 2);
+    assert_eq!(r["parts"][0]["until_on"], "2026-12-31");
+    assert_eq!(r["current"]["ids"], json!([6]));
+    assert_eq!(r["recorded"]["count"], 1);
+    assert_eq!(r["recorded"]["last"]["occurrence_on"], "2026-09-01");
+    assert_eq!(r["recorded"]["last"]["amount_minor"], -90000);
+    assert!(r["overrides"].as_array().unwrap().iter().any(|o| o["occurrence_on"] == "2026-10-01" && o["action"] == "skip"));
+    assert_eq!(r["next"][0]["occurrence_on"], "2026-11-01", "October is skipped");
+    assert_eq!(r["next_12m"]["count"], 11);
+    assert_eq!(r["next_12m"]["total_minor"], -(2 * 90000 + 9 * 95000));
+    assert_eq!(r["group"], "running");
+    assert_eq!(r["direction"], "out");
+    assert_eq!(r["current"]["phrase"], "monthly on the 1st");
+    assert_eq!((r["editable"]["from"].as_bool(), r["editable"]["money"].as_bool()), (Some(true), Some(true)));
+
+    let chain = rule(v, "stake via Sam");
+    assert_eq!(chain["chain_len"], 2);
+    let route: Vec<i64> = chain["current"]["route"].as_array().unwrap().iter().map(|a| a["account_id"].as_i64().unwrap()).collect();
+    assert_eq!(route, vec![current, sam, bookie]);
+    let amounts: Vec<i64> = chain["current"]["hops"].as_array().unwrap().iter().map(|h| h["amount_minor"].as_i64().unwrap()).collect();
+    assert_eq!(amounts, vec![10000, 9500]);
+    assert_eq!(chain["group"], "not_started");
+    assert_eq!(chain["direction"], "transfer");
+
+    let g = rule(v, "Gym");
+    assert_eq!(g["group"], "ended");
+    assert_eq!(g["current"]["route"][0]["closed"], true);
+    assert_eq!(g["cancelled_in"][0]["scenario"], "move out");
+
+    let p = rule(v, "Phone");
+    assert_eq!(p["shape"], "custom");
+    assert_eq!(p["editable"]["money"], false);
+    assert!(p["editable"]["reason"].as_str().unwrap().contains("3 legs"), "{}", p["editable"]);
+
+    assert_eq!(v["what_if"][0]["rules"][0]["description"], "Dream rent");
+    assert_eq!(v["what_if"][0]["rules"][0]["editable"]["from"], false);
+    assert_eq!(v["what_if"][0]["cancels"][0]["target"], "Gym");
+    assert_eq!(v["card_rules"].as_array().unwrap().len(), 1);
+    assert_eq!(v["card_rules"][0]["amount_kind"], "pct_of_statement");
+    assert_eq!(v["card_rules"][0]["pct"], "1");
+    assert_eq!(v["interest_rules"][0]["shape"], "revolving");
+    assert_eq!(v["interest_rules"][0]["rate_in_force"]["quoted"], "24.9");
+    let t = &v["totals"];
+    assert_eq!((t["running"].as_i64(), t["not_started"].as_i64(), t["ended"].as_i64(), t["what_if"].as_i64(), t["cancels"].as_i64(), t["changed"].as_i64()),
+               (Some(2), Some(1), Some(1), Some(1), Some(1), Some(1)));
+    assert_eq!(out.ok(check)["ok"], true);
+}
+
+#[test]
+fn a_rule_can_be_repriced_in_place_without_touching_what_it_already_paid() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    s.call("series.record", json!({ "series_id": 1, "occurrence_on": "2026-09-01", "amount_minor": 88000 }));
+    s.call("series.override", json!({ "series_id": 1, "occurrence_on": "2026-11-01", "moved_to": "2026-11-03", "amount_minor": -90000 }));
+    s.call("series.override", json!({ "series_id": 1, "occurrence_on": "2026-12-01", "amount_minor": -120000 }));
+    s.call("series.override", json!({ "series_id": 1, "occurrence_on": "2027-02-01", "amount_minor": -90000 }));
+    let window = json!({ "as_of": AS_OF, "horizon": "2027-02-28" });
+    let p0 = s.call("forecast.project", window.clone());
+    let edit = json!({ "id": 1, "as_of": AS_OF, "mode": "whole", "amounts": [95000], "amends": "follow" });
+    let mut dry = edit.clone();
+    dry["dry_run"] = json!(true);
+    let d = s.call("series.revise", dry);
+    let p1 = s.call("forecast.project", window.clone());
+    let real = s.call("series.revise", edit);
+    let txn = s.call("txn.get", json!({ "id": 1 }));
+    let p2 = s.call("forecast.project", window);
+    let review = s.call("series.review", json!({ "as_of": AS_OF }));
+    let list = s.call("series.list", json!({}));
+    let check = s.call("db.check", json!({}));
+    let out = s.run();
+
+    let d = out.ok(d);
+    assert_eq!((d["written"].as_bool(), d["mode"].as_str()), (Some(false), Some("in_place")));
+    assert_eq!(d["changed"], json!(["amounts"]));
+    assert_eq!(d["amends"]["follow"], json!([
+        { "occurrence_on": "2026-11-01", "removed": false },
+        { "occurrence_on": "2027-02-01", "removed": true },
+    ]), "only amounts saved at the old price follow the new one");
+    assert_eq!(d["amends"]["keep"], json!([{ "occurrence_on": "2026-12-01", "amounts": [120000] }]));
+    assert_eq!(out.ok(p0), out.ok(p1), "a dry run writes nothing");
+    let r = out.ok(real);
+    assert_eq!(r["written"], true);
+    assert_eq!(r["impact"], d["impact"], "the save does exactly what the dry run said");
+    assert_eq!(r["amends"]["follow"], d["amends"]["follow"]);
+
+    let t = out.ok(txn);
+    assert_eq!(t["description"], "Rent");
+    let legs_of_txn: Vec<(i64, i64)> = t["postings"].as_array().unwrap().iter().map(|p| (p["account_id"].as_i64().unwrap(), p["amount_minor"].as_i64().unwrap())).collect();
+    assert!(legs_of_txn.contains(&(1, -88000)) && legs_of_txn.contains(&(2, 88000)), "the recorded payment keeps what it recorded: {t}");
+
+    let rent: Vec<(String, String, i64)> = legs(out.ok(p2), 1).into_iter().filter(|l| l.0 == 1).map(|l| (l.1, l.2, l.3)).collect();
+    let day = |a: &str, b: &str, m: i64| (a.to_string(), b.to_string(), m);
+    assert_eq!(rent, vec![
+        day("2026-10-01", "2026-10-01", -95000),
+        day("2026-11-01", "2026-11-03", -95000),
+        day("2026-12-01", "2026-12-01", -120000),
+        day("2027-01-01", "2027-01-01", -95000),
+        day("2027-02-01", "2027-02-01", -95000),
+    ]);
+    let ov = rule(out.ok(review), "Rent")["overrides"].as_array().unwrap().clone();
+    let nov = ov.iter().find(|o| o["occurrence_on"] == "2026-11-01").unwrap();
+    assert_eq!((nov["amounts"].clone(), nov["moved_to"].clone()), (json!([null]), json!("2026-11-03")));
+    assert!(!ov.iter().any(|o| o["occurrence_on"] == "2027-02-01"), "an amend left with nothing is removed");
+    let rows = out.ok(list).as_array().unwrap().clone();
+    assert_eq!((rows.len(), rows[0]["amount_minor"].as_i64()), (1, Some(-95000)));
+    assert_eq!(out.ok(check)["ok"], true);
+}
+
+#[test]
+fn moving_a_rules_accounts_keeps_its_currency_and_its_records() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.account("Savings", "asset");
+    s.call("account.create", json!({ "name": "Euro", "kind": "asset", "currency": "EUR" }));
+    s.account("Old", "asset");
+    s.call("account.close", json!({ "id": 5 }));
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    s.call("series.record", json!({ "series_id": 1, "occurrence_on": "2026-09-01" }));
+    let revise = |s: &mut Script, route: Value, amounts: Option<Value>| {
+        let mut p = json!({ "id": 1, "as_of": AS_OF, "mode": "whole", "route": route });
+        if let Some(a) = amounts {
+            p["amounts"] = a;
+        }
+        s.call("series.revise", p)
+    };
+    let moved = revise(&mut s, json!([3, 2]), None);
+    let fc = s.call("forecast.project", json!({ "as_of": AS_OF, "horizon": "2026-10-31" }));
+    let txn = s.call("txn.get", json!({ "id": 1 }));
+    let euro = revise(&mut s, json!([4, 2]), None);
+    let itself = revise(&mut s, json!([3, 3]), None);
+    let closed = revise(&mut s, json!([5, 2]), None);
+    let stops = revise(&mut s, json!([1, 2, 3]), None);
+    let zero = revise(&mut s, json!([3, 2]), Some(json!([0])));
+    let again = revise(&mut s, json!([3, 2]), None);
+    let list = s.call("series.list", json!({}));
+    let check = s.call("db.check", json!({}));
+    let out = s.run();
+
+    assert_eq!(out.ok(moved)["mode"], "in_place");
+    let oct: Vec<(i64, i64)> = out.ok(fc)["occurrences"].as_array().unwrap().iter()
+        .filter(|o| o["kind"] == "series" && o["occurrence_on"] == "2026-10-01")
+        .map(|o| (o["account_id"].as_i64().unwrap(), o["amount_minor"].as_i64().unwrap())).collect();
+    assert_eq!(oct, vec![(2, 90000), (3, -90000)]);
+    assert!(out.ok(txn)["postings"].as_array().unwrap().iter().any(|p| p["account_id"] == 1), "the record stays on Current");
+    let (code, msg) = out.err(euro);
+    assert_eq!(code, "currency_change");
+    assert!(msg.contains("GBP") && msg.contains("EUR"), "{msg}");
+    let (code, msg) = out.err(itself);
+    assert!(code == "bad_params" && msg.contains("itself"), "{code}: {msg}");
+    assert_eq!(out.err(closed).0, "closed_account");
+    let (code, msg) = out.err(stops);
+    assert!(code == "bad_chain" && msg.contains("stops"), "{code}: {msg}");
+    let (code, msg) = out.err(zero);
+    assert!(code == "bad_params" && msg.contains("positive"), "{code}: {msg}");
+    assert_eq!((out.ok(again)["mode"].as_str(), out.ok(again)["written"].as_bool()), (Some("unchanged"), Some(false)));
+    assert_eq!(out.ok(list)[0]["from_account"], "Savings");
+    assert_eq!(out.ok(check)["ok"], true);
+}
+
+#[test]
+fn a_schedule_change_for_the_whole_rule_is_refused_while_a_date_hangs_off_it() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    s.call("series.record", json!({ "series_id": 1, "occurrence_on": "2026-09-01" }));
+    s.call("series.override", json!({ "series_id": 1, "occurrence_on": "2026-11-01", "action": "skip" }));
+    s.call("series.override", json!({ "series_id": 1, "occurrence_on": "2026-06-01", "action": "skip" }));
+    let window = json!({ "as_of": AS_OF, "horizon": "2026-12-31" });
+    let p0 = s.call("forecast.project", window.clone());
+    let fifth = json!({ "id": 1, "as_of": AS_OF, "mode": "whole", "rrule": "FREQ=MONTHLY;BYMONTHDAY=5" });
+    let mut dry = fifth.clone();
+    dry["dry_run"] = json!(true);
+    let d = s.call("series.revise", dry);
+    let real = s.call("series.revise", fifth);
+    let list = s.call("series.list", json!({}));
+    let p1 = s.call("forecast.project", window.clone());
+    let split = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2026-09-02", "rrule": "FREQ=MONTHLY;BYMONTHDAY=5" }));
+    let p2 = s.call("forecast.project", window);
+    let review = s.call("series.review", json!({ "as_of": AS_OF }));
+    let check = s.call("db.check", json!({}));
+    let out = s.run();
+
+    let d = out.ok(d);
+    assert_eq!((d["ok"].as_bool(), d["refusal"]["code"].as_str()), (Some(false), Some("slots_detached")));
+    let blockers: Vec<(String, String, bool)> = d["blockers"].as_array().unwrap().iter()
+        .map(|b| (b["kind"].as_str().unwrap().to_string(), b["occurrence_on"].as_str().unwrap().to_string(), b["droppable"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(blockers, vec![("recorded".into(), "2026-09-01".into(), false), ("override".into(), "2026-11-01".into(), true)],
+               "a skip older than the lookback changes no forecast and blocks nothing");
+    assert_eq!(d["suggest_from"], "2026-09-02");
+    let (code, msg) = out.err(real);
+    assert_eq!(code, "slots_detached");
+    assert!(msg.contains("1/9/2026") && msg.contains("2/9/2026"), "{msg}");
+    assert_eq!(out.ok(list)[0]["rrule"], "FREQ=MONTHLY;BYMONTHDAY=1");
+    assert_eq!(out.ok(p0), out.ok(p1), "a refused save writes nothing");
+
+    let sp = out.ok(split);
+    assert_eq!(sp["mode"], "split");
+    assert_eq!(sp["ended"], json!({ "ids": [1], "until_on": "2026-09-01" }));
+    assert_eq!(sp["created"]["ids"], json!([2]));
+    assert_eq!(sp["created"]["dtstart"], "2026-09-05");
+    assert_eq!(sp["created"]["head_ids"], json!([1]));
+    assert_eq!(sp["left_behind"][0]["occurrence_on"], "2026-11-01");
+    assert_eq!(sp["anchor"]["rrule_unchanged"], false);
+    let rent: Vec<(i64, String)> = legs(out.ok(p2), 1).into_iter().map(|l| (l.0, l.1)).collect();
+    assert_eq!(rent, vec![(2, "2026-10-05".into()), (2, "2026-11-05".into()), (2, "2026-12-05".into())]);
+    let r = rule(out.ok(review), "Rent");
+    assert_eq!(r["parts"].as_array().unwrap().len(), 2);
+    assert_eq!(r["parts"][0]["left_behind"][0]["occurrence_on"], "2026-11-01");
+    assert_eq!(out.ok(check)["ok"], true);
+}
+
+#[test]
+fn a_schedule_change_in_place_goes_through_when_every_date_survives_and_drops_only_when_confirmed() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Gym", "expense");
+    s.call("series.create", plain("Gym", 1, 2, 1000, "FREQ=WEEKLY;BYDAY=FR", "2026-08-07"));
+    s.call("series.override", json!({ "series_id": 1, "occurrence_on": "2026-09-18", "action": "skip" }));
+    s.call("series.override", json!({ "series_id": 1, "occurrence_on": "2026-09-25", "amount_minor": -1500 }));
+    let fortnightly = json!({ "id": 1, "as_of": AS_OF, "mode": "whole", "rrule": "FREQ=WEEKLY;INTERVAL=2;BYDAY=FR" });
+    let mut dry = fortnightly.clone();
+    dry["dry_run"] = json!(true);
+    let d = s.call("series.revise", dry);
+    let refused = s.call("series.revise", fortnightly.clone());
+    let mut confirmed = fortnightly;
+    confirmed["drop_overrides"] = json!(true);
+    let saved = s.call("series.revise", confirmed);
+    let fc = s.call("forecast.project", json!({ "as_of": AS_OF, "horizon": "2026-10-31" }));
+    let review = s.call("series.review", json!({ "as_of": AS_OF }));
+    let bad_rule = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "rrule": "FREQ=NOPE" }));
+    let count = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "rrule": "FREQ=MONTHLY;COUNT=3" }));
+    let hourly = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "rrule": "FREQ=HOURLY" }));
+    let empty = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "rrule": "FREQ=MONTHLY;BYMONTHDAY=31", "until_on": "2026-08-20" }));
+    let still = s.call("forecast.project", json!({ "as_of": AS_OF, "horizon": "2026-10-31" }));
+    let check = s.call("db.check", json!({}));
+    let out = s.run();
+
+    let d = out.ok(d);
+    let blockers = d["blockers"].as_array().unwrap();
+    assert_eq!(blockers.len(), 1, "{d}");
+    assert_eq!((blockers[0]["occurrence_on"].as_str(), blockers[0]["droppable"].as_bool()), (Some("2026-09-25"), Some(true)));
+    assert_eq!(d["refusal"]["code"], "would_drop");
+    let (code, msg) = out.err(refused);
+    assert!(code == "would_drop" && msg.contains("25/9/2026"), "{code}: {msg}");
+    let saved = out.ok(saved);
+    assert_eq!(saved["mode"], "in_place");
+    assert_eq!(saved["dropped"][0]["occurrence_on"], "2026-09-25");
+    let dates: Vec<String> = legs(out.ok(fc), 1).into_iter().map(|l| l.1).collect();
+    assert_eq!(dates, vec!["2026-10-02", "2026-10-16", "2026-10-30"]);
+    let ov = &rule(out.ok(review), "Gym")["overrides"];
+    assert_eq!(ov.as_array().unwrap().len(), 1);
+    assert_eq!((ov[0]["occurrence_on"].as_str(), ov[0]["action"].as_str()), (Some("2026-09-18"), Some("skip")));
+    assert_eq!(out.err(bad_rule).0, "bad_rule");
+    let (code, msg) = out.err(count);
+    assert!(code == "bad_params" && msg.contains("COUNT"), "{code}: {msg}");
+    assert_eq!(out.err(hourly).0, "bad_params");
+    let (code, msg) = out.err(empty);
+    assert!(code == "bad_rule" && msg.contains("no payments"), "{code}: {msg}");
+    out.ok(still);
+    assert_eq!(out.ok(check)["ok"], true);
+}
+
+#[test]
+fn changing_a_rule_from_a_date_keeps_its_history_its_adjustments_and_its_rhythm() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.account("Club", "expense");
+    s.account("Insurance", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    s.call("series.record", json!({ "series_id": 1, "occurrence_on": "2026-09-01" }));
+    s.call("series.override", json!({ "series_id": 1, "occurrence_on": "2026-12-01", "action": "skip" }));
+    s.call("series.override", json!({ "series_id": 1, "occurrence_on": "2027-01-01", "moved_to": "2027-01-04", "amount_minor": -90000 }));
+    s.call("series.override", json!({ "series_id": 1, "occurrence_on": "2027-02-01", "amount_minor": -99900 }));
+    s.call("series.create", plain("Club", 1, 3, 2000, "FREQ=WEEKLY;INTERVAL=2;BYDAY=FR", "2026-08-07"));
+    s.call("series.create", plain("Insurance", 1, 4, 30000, "FREQ=YEARLY", "2026-03-05"));
+    let rent = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2027-01-01", "amounts": [95000], "amends": "follow" }));
+    let club = s.call("series.revise", json!({ "id": 2, "as_of": AS_OF, "mode": "from", "from_on": "2027-01-01", "amounts": [2500] }));
+    let insurance = s.call("series.revise", json!({ "id": 3, "as_of": AS_OF, "mode": "from", "from_on": "2027-01-01", "amounts": [32000] }));
+    let fc = s.call("forecast.project", json!({ "as_of": AS_OF, "horizon": "2027-03-31" }));
+    let txn = s.call("txn.get", json!({ "id": 1 }));
+    let brief = s.call("analysis.brief", json!({ "as_of": AS_OF }));
+    let review = s.call("series.review", json!({ "as_of": AS_OF }));
+    let check = s.call("db.check", json!({}));
+    let out = s.run();
+
+    let r = out.ok(rent);
+    assert_eq!(r["mode"], "split");
+    assert_eq!(r["ended"]["until_on"], "2026-12-31");
+    assert_eq!((r["created"]["ids"].clone(), r["created"]["dtstart"].clone()), (json!([4]), json!("2027-01-01")));
+    let carried: Vec<&str> = r["carried"].as_array().unwrap().iter().map(|c| c["occurrence_on"].as_str().unwrap()).collect();
+    assert_eq!(carried, vec!["2027-01-01", "2027-02-01"]);
+    assert_eq!(r["amends"]["follow"], json!([{ "occurrence_on": "2027-01-01", "removed": false }]));
+    assert_eq!(r["amends"]["keep"], json!([{ "occurrence_on": "2027-02-01", "amounts": [99900] }]));
+    assert_eq!(out.ok(club)["created"]["dtstart"], "2027-01-08", "a fortnightly rule keeps its own Fridays");
+    assert_eq!(out.ok(insurance)["created"]["dtstart"], "2027-03-05", "a yearly rule keeps its anniversary");
+
+    let current = legs(out.ok(fc), 1);
+    let at = |sid: i64, on: &str| current.iter().find(|l| l.0 == sid && l.1 == on).map(|l| (l.2.clone(), l.3));
+    assert_eq!(at(1, "2026-10-01"), Some(("2026-10-01".into(), -90000)));
+    assert_eq!(at(1, "2026-11-01"), Some(("2026-11-01".into(), -90000)));
+    assert!(!current.iter().any(|l| l.1 == "2026-12-01"), "December is still skipped");
+    assert_eq!(at(4, "2027-01-01"), Some(("2027-01-04".into(), -95000)), "the moved date takes the new price");
+    assert_eq!(at(4, "2027-02-01"), Some(("2027-02-01".into(), -99900)), "a price of its own is kept");
+    assert_eq!(at(4, "2027-03-01"), Some(("2027-03-01".into(), -95000)));
+    assert_eq!(at(2, "2026-12-25").map(|x| x.1), Some(-2000));
+    assert_eq!(at(5, "2027-01-08").map(|x| x.1), Some(-2500));
+    assert_eq!(at(5, "2027-01-22").map(|x| x.1), Some(-2500));
+    assert_eq!(at(6, "2027-03-05").map(|x| x.1), Some(-32000));
+    assert!(!current.iter().any(|l| l.0 == 3), "the old insurance part has nothing in the window");
+    assert!(out.ok(txn)["postings"].as_array().unwrap().iter().any(|p| p["account_id"] == 1 && p["amount_minor"] == -90000));
+
+    let commitments = out.ok(brief)["commitments"]["series"].as_array().unwrap().clone();
+    let rents: Vec<&Value> = commitments.iter().filter(|c| c["description"] == "Rent").collect();
+    assert_eq!(rents.len(), 1, "one rule, counted once: {commitments:?}");
+    assert_eq!(rents[0]["series_id"], 1);
+    assert_eq!(rents[0]["parts"], json!([1, 4]));
+    assert_eq!(rents[0]["occurrences_next_12m"], 11);
+    assert_eq!(rents[0]["annual_minor"], -1039900);
+    let rr = rule(out.ok(review), "Rent");
+    assert_eq!((rr["next_12m"]["count"].as_i64(), rr["next_12m"]["total_minor"].as_i64()), (Some(11), Some(-1039900)),
+               "the review's figure is the brief's figure");
+    assert_eq!(out.ok(check)["ok"], true);
+}
+
+#[test]
+fn a_change_from_a_date_is_refused_while_a_payment_is_recorded_on_or_after_it() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    s.call("series.record", json!({ "series_id": 1, "occurrence_on": "2027-01-01", "occurred_on": "2026-12-30" }));
+    let change = json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2027-01-01", "amounts": [95000] });
+    let mut dry = change.clone();
+    dry["dry_run"] = json!(true);
+    let d = s.call("series.revise", dry);
+    let real = s.call("series.revise", change);
+    let list = s.call("series.list", json!({}));
+    let later = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2027-01-02", "amounts": [95000] }));
+    let fc = s.call("forecast.project", json!({ "as_of": AS_OF, "horizon": "2027-03-31" }));
+    let review = s.call("series.review", json!({ "as_of": AS_OF }));
+    let check = s.call("db.check", json!({}));
+    let out = s.run();
+
+    let d = out.ok(d);
+    assert_eq!(d["refusal"]["code"], "recorded_after");
+    assert_eq!((d["blockers"][0]["kind"].as_str(), d["blockers"][0]["occurrence_on"].as_str(), d["blockers"][0]["occurred_on"].as_str()),
+               (Some("recorded"), Some("2027-01-01"), Some("2026-12-30")));
+    assert_eq!(d["suggest_from"], "2027-01-02");
+    let (code, msg) = out.err(real);
+    assert_eq!(code, "recorded_after");
+    assert!(msg.contains("1/1/2027") && msg.contains("30/12/2026") && msg.contains("2/1/2027"), "{msg}");
+    let rows = out.ok(list).as_array().unwrap().clone();
+    assert_eq!((rows.len(), rows[0]["until_on"].clone()), (1, Value::Null));
+    let l = out.ok(later);
+    assert_eq!((l["mode"].as_str(), l["ended"]["until_on"].as_str(), l["created"]["dtstart"].as_str()),
+               (Some("split"), Some("2027-01-01"), Some("2027-02-01")));
+    let occ = out.ok(fc)["occurrences"].as_array().unwrap().clone();
+    assert!(!occ.iter().any(|o| o["kind"] == "series" && o["occurrence_on"] == "2027-01-01"), "January is recorded, not projected");
+    assert!(occ.iter().any(|o| o["kind"] == "real" && o["value_on"] == "2026-12-30"));
+    assert!(occ.iter().any(|o| o["series_id"] == 2 && o["occurrence_on"] == "2027-02-01" && o["account_id"] == 1 && o["amount_minor"] == -95000));
+    assert_eq!(rule(out.ok(review), "Rent")["recorded"]["ahead"][0]["occurrence_on"], "2027-01-01");
+    assert_eq!(out.ok(check)["ok"], true);
+}
+
+#[test]
+fn a_rule_not_yet_started_is_corrected_in_place_even_from_a_date() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-10-01"));
+    let a = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2026-10-01", "amounts": [95000] }));
+    let b = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2026-09-20", "amounts": [96000] }));
+    let c = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2026-10-01", "rrule": "FREQ=MONTHLY;BYMONTHDAY=15" }));
+    let list = s.call("series.list", json!({}));
+    let out = s.run();
+    assert_eq!((out.ok(a)["mode"].as_str(), out.ok(a)["applied_to"].clone()), (Some("in_place"), json!([1])));
+    assert_eq!(out.ok(b)["mode"], "in_place");
+    assert_eq!(out.ok(c)["mode"], "in_place");
+    let rows = out.ok(list).as_array().unwrap().clone();
+    assert_eq!(rows.len(), 1, "nothing of it had happened, so there was no history to keep apart");
+    assert_eq!(rows[0]["dtstart"], "2026-10-15");
+    assert_eq!(rows[0]["amount_minor"], -96000);
+}
+
+#[test]
+fn a_change_that_makes_a_past_date_due_needs_acknowledging() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    let mut rent = plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01");
+    rent["weekend_rule"] = json!("after");
+    s.call("series.create", rent);
+    let twelfth = json!({ "id": 1, "as_of": AS_OF, "mode": "whole", "rrule": "FREQ=MONTHLY;BYMONTHDAY=12" });
+    let mut dry = twelfth.clone();
+    dry["dry_run"] = json!(true);
+    let d = s.call("series.revise", dry);
+    let refused = s.call("series.revise", twelfth.clone());
+    let mut ack = twelfth;
+    ack["acknowledge_due"] = json!(true);
+    let saved = s.call("series.revise", ack);
+    let fc = s.call("forecast.project", json!({ "as_of": AS_OF, "horizon": "2026-10-31" }));
+    let out = s.run();
+    let (code, msg) = out.err(refused);
+    assert_eq!(code, "would_fall_due");
+    assert!(msg.contains("12/9/2026") && msg.contains("14/9/2026"), "{msg}");
+    let b: Vec<(String, String, String)> = out.ok(d)["blockers"].as_array().unwrap().iter()
+        .map(|b| (b["kind"].as_str().unwrap().into(), b["occurrence_on"].as_str().unwrap().into(), b["value_on"].as_str().unwrap().into()))
+        .collect();
+    assert_eq!(b, vec![("due".into(), "2026-09-12".into(), "2026-09-14".into())]);
+    out.ok(saved);
+    assert!(legs(out.ok(fc), 1).iter().any(|l| l.1 == "2026-09-12" && l.2 == "2026-09-14"));
+}
+
+#[test]
+fn a_scenario_cancel_still_covers_a_rule_after_it_changes_from_a_date() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    s.call("scenario.create", json!({ "name": "move out" }));
+    s.call("series.create", json!({ "description": "cancel", "rrule": "FREQ=MONTHLY;BYMONTHDAY=1", "dtstart": "2026-01-01", "scenario_id": 1, "supersedes_id": 1, "postings": [] }));
+    let change = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2027-01-01", "amounts": [95000] }));
+    s.call("scenario.create", json!({ "name": "move later" }));
+    s.call("series.create", json!({ "description": "cancel", "rrule": "FREQ=MONTHLY;BYMONTHDAY=1", "dtstart": "2027-01-01", "scenario_id": 2, "supersedes_id": 3, "postings": [] }));
+    let window = |sc: Value| json!({ "as_of": AS_OF, "horizon": "2027-03-31", "scenarios": sc });
+    let one = s.call("forecast.project", window(json!([1])));
+    let two = s.call("forecast.project", window(json!([2])));
+    let none = s.call("forecast.project", window(json!([])));
+    let scenarios = s.call("scenario.list", json!({}));
+    let out = s.run();
+    assert_eq!(out.ok(change)["created"]["ids"], json!([3]));
+    let has = |v: &Value, sid: i64| v["occurrences"].as_array().unwrap().iter().any(|o| o["series_id"] == sid);
+    for p in [out.ok(one), out.ok(two)] {
+        assert!(!has(p, 1) && !has(p, 3), "a cancel of either part covers the whole rent");
+    }
+    assert!(has(out.ok(none), 1) && has(out.ok(none), 3));
+    for sc in out.ok(scenarios).as_array().unwrap() {
+        assert_eq!(sc["supersedes_count"], 1, "{sc}");
+    }
+}
+
+#[test]
+fn a_recurring_chain_is_edited_as_one_commitment() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Sam", "asset");
+    s.account("Bookmaker", "asset");
+    s.account("Wallet", "asset");
+    s.account("Groceries", "expense");
+    s.call("account.create", json!({ "name": "Euro", "kind": "asset", "currency": "EUR" }));
+    s.call("series.create_chain", json!({
+        "description": "stake via Sam", "rrule": "FREQ=MONTHLY;BYMONTHDAY=1", "dtstart": "2026-10-01",
+        "from_account": 1, "hops": [{ "to_account": 2, "amount_minor": 10000 }, { "to_account": 3, "amount_minor": 9500 }],
+    }));
+    s.call("series.override", json!({ "series_id": 1, "occurrence_on": "2026-12-01", "moved_to": "2026-12-02", "amount_minor": -10000 }));
+    let as_of = "2026-09-30";
+    let priced = s.call("series.revise", json!({ "id": 2, "as_of": as_of, "mode": "whole", "amounts": [11000, 10500], "amends": "follow" }));
+    let fc1 = s.call("forecast.project", json!({ "as_of": as_of, "horizon": "2026-12-31" }));
+    let rerouted = s.call("series.revise", json!({ "id": 1, "as_of": as_of, "route": [1, 4, 3] }));
+    let fc2 = s.call("forecast.project", json!({ "as_of": as_of, "horizon": "2026-11-30" }));
+    let expense_stop = s.call("series.revise", json!({ "id": 1, "as_of": as_of, "route": [1, 5, 3] }));
+    let extra_stop = s.call("series.revise", json!({ "id": 1, "as_of": as_of, "route": [1, 2, 4, 3] }));
+    let euro_stop = s.call("series.revise", json!({ "id": 1, "as_of": as_of, "route": [1, 6, 3] }));
+    s.call("series.record", json!({ "series_id": 1, "occurrence_on": "2026-10-01", "whole_chain": true }));
+    let reschedule = s.call("series.revise", json!({ "id": 1, "as_of": as_of, "rrule": "FREQ=MONTHLY;BYMONTHDAY=2" }));
+    let split = s.call("series.revise", json!({ "id": 1, "as_of": as_of, "mode": "from", "from_on": "2026-11-01", "amounts": [12000, 11500] }));
+    let fc3 = s.call("forecast.project", json!({ "as_of": as_of, "horizon": "2026-11-30" }));
+    let brief = s.call("analysis.brief", json!({ "as_of": as_of }));
+    let record = s.call("series.record", json!({ "series_id": 3, "occurrence_on": "2026-11-01", "whole_chain": true }));
+    let check = s.call("db.check", json!({}));
+    let out = s.run();
+
+    let p = out.ok(priced);
+    assert_eq!(p["applied_to"], json!([1, 2]));
+    assert_eq!(p["amends"]["follow"], json!([{ "occurrence_on": "2026-12-01", "removed": false }]));
+    let first_legs = |v: &Value, on: &str| -> Vec<(i64, i64, i64, String)> {
+        v["occurrences"].as_array().unwrap().iter()
+            .filter(|o| o["kind"] == "series" && o["occurrence_on"] == on && o["amount_minor"].as_i64().unwrap() < 0)
+            .map(|o| (o["series_id"].as_i64().unwrap(), o["account_id"].as_i64().unwrap(), o["amount_minor"].as_i64().unwrap(), o["value_on"].as_str().unwrap().to_string()))
+            .collect()
+    };
+    assert_eq!(first_legs(out.ok(fc1), "2026-10-01"), vec![(1, 1, -11000, "2026-10-01".into()), (2, 2, -10500, "2026-10-01".into())]);
+    assert_eq!(first_legs(out.ok(fc1), "2026-12-01"), vec![(1, 1, -11000, "2026-12-02".into()), (2, 2, -10500, "2026-12-02".into())],
+               "the moved date follows the new price on every hop");
+    out.ok(rerouted);
+    let mut nov = first_legs(out.ok(fc2), "2026-11-01");
+    nov.sort();
+    assert_eq!(nov, vec![(1, 1, -11000, "2026-11-01".into()), (2, 4, -10500, "2026-11-01".into())]);
+    let (code, msg) = out.err(expense_stop);
+    assert!(code == "bad_chain" && msg.contains("pass through"), "{code}: {msg}");
+    let (code, msg) = out.err(extra_stop);
+    assert!(code == "bad_chain" && msg.contains("stops"), "{code}: {msg}");
+    assert_eq!(out.err(euro_stop).0, "currency_change");
+    assert_eq!(out.err(reschedule).0, "slots_detached");
+    let sp = out.ok(split);
+    assert_eq!(sp["ended"], json!({ "ids": [1, 2], "until_on": "2026-10-31" }));
+    assert_eq!(sp["created"]["ids"], json!([3, 4]));
+    assert_eq!(sp["created"]["chain_id"], 3);
+    assert_eq!(sp["created"]["head_ids"], json!([1, 2]));
+    let mut nov = first_legs(out.ok(fc3), "2026-11-01");
+    nov.sort();
+    assert_eq!(nov, vec![(3, 1, -12000, "2026-11-01".into()), (4, 4, -11500, "2026-11-01".into())]);
+    let stakes: Vec<Value> = out.ok(brief)["commitments"]["series"].as_array().unwrap().iter().filter(|c| c["description"] == "stake via Sam").cloned().collect();
+    assert_eq!(stakes.len(), 1);
+    assert_eq!(stakes[0]["parts"], json!([1, 3]));
+    assert_eq!(out.ok(record)["txn_ids"].as_array().unwrap().len(), 2);
+    assert_eq!(out.ok(check)["ok"], true);
+}
+
+#[test]
+fn a_what_if_rule_is_edited_in_place_and_its_cancel_is_not() {
+    let mut s = Script::new();
+    s.call("scenario.create", json!({ "name": "move out" }));
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    let mut dream = plain("Dream rent", 1, 2, 150000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-10-01");
+    dream["scenario_id"] = json!(1);
+    s.call("series.create", dream);
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    s.call("series.create", json!({ "description": "cancel", "rrule": "FREQ=MONTHLY;BYMONTHDAY=1", "dtstart": "2026-01-01", "scenario_id": 1, "supersedes_id": 2, "postings": [] }));
+    let priced = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "amounts": [160000] }));
+    let with = s.call("forecast.project", json!({ "as_of": AS_OF, "horizon": "2026-12-31", "scenarios": [1] }));
+    let base = s.call("forecast.project", json!({ "as_of": AS_OF, "horizon": "2026-12-31" }));
+    let from = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2026-11-01", "amounts": [170000] }));
+    let cancel = s.call("series.revise", json!({ "id": 3, "as_of": AS_OF, "description": "x" }));
+    let txns = s.call("analysis.query", json!({ "sql": "SELECT COUNT(*) FROM txn" }));
+    let out = s.run();
+    assert_eq!(out.ok(priced)["mode"], "in_place");
+    assert!(legs(out.ok(with), 1).iter().any(|l| l.0 == 1 && l.3 == -160000));
+    assert!(!legs(out.ok(base), 1).iter().any(|l| l.0 == 1));
+    assert_eq!(out.err(from).0, "not_editable");
+    assert_eq!(out.err(cancel).0, "not_editable");
+    assert_eq!(out.ok(txns)["rows"][0][0], 0, "a what-if is never money that moved");
+}
+
+#[test]
+fn a_custom_template_can_be_rescheduled_but_not_repriced() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Phone", "expense");
+    s.account("Fees", "expense");
+    s.call("series.create", json!({
+        "description": "Phone", "rrule": "FREQ=MONTHLY;BYMONTHDAY=20", "dtstart": "2026-01-20",
+        "postings": [
+            { "account_id": 1, "amount_minor": -5000, "role": "primary" },
+            { "account_id": 2, "amount_minor": 4000, "role": "balancing" },
+            { "account_id": 3, "amount_minor": 1000, "role": "other" },
+        ],
+    }));
+    let amounts = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "amounts": [4000] }));
+    let route = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "route": [1, 2] }));
+    let weekend = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "weekend_rule": "after" }));
+    let review = s.call("series.review", json!({ "as_of": AS_OF }));
+    let out = s.run();
+    assert_eq!(out.err(amounts).0, "custom_template");
+    assert_eq!(out.err(route).0, "custom_template");
+    assert_eq!(out.ok(weekend)["mode"], "in_place");
+    assert_eq!(rule(out.ok(review), "Phone")["shape"], "custom");
+}
+
+#[test]
+fn a_route_edit_keeps_each_hops_direction() {
+    // A template written the other way round: the primary leg is the account money ARRIVES in.
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Salary", "income");
+    s.account("Savings", "asset");
+    s.call("series.create", json!({
+        "description": "Pay", "rrule": "FREQ=MONTHLY;BYMONTHDAY=28", "dtstart": "2026-01-28",
+        "postings": [
+            { "account_id": 1, "amount_minor": 250000, "role": "primary" },
+            { "account_id": 2, "amount_minor": -250000, "role": "balancing" },
+        ],
+    }));
+    let review = s.call("series.review", json!({ "as_of": AS_OF }));
+    let moved = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "route": [2, 3], "amounts": [260000] }));
+    let fc = s.call("forecast.project", json!({ "as_of": AS_OF, "horizon": "2026-09-30" }));
+    let out = s.run();
+    let r = rule(out.ok(review), "Pay");
+    let route: Vec<i64> = r["current"]["route"].as_array().unwrap().iter().map(|a| a["account_id"].as_i64().unwrap()).collect();
+    assert_eq!(route, vec![2, 1], "money comes from Salary into Current");
+    assert_eq!(r["direction"], "in");
+    out.ok(moved);
+    let pay: Vec<(i64, i64)> = out.ok(fc)["occurrences"].as_array().unwrap().iter()
+        .filter(|o| o["kind"] == "series").map(|o| (o["account_id"].as_i64().unwrap(), o["amount_minor"].as_i64().unwrap())).collect();
+    assert!(pay.contains(&(3, 260000)) && pay.contains(&(2, -260000)), "still income, now into Savings: {pay:?}");
+}
+
+#[test]
+fn a_stored_rule_that_does_not_expand_is_reported_and_can_be_fixed() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.account("Gym", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=NOPE", "2026-01-01"));
+    s.call("series.create", plain("Gym", 1, 3, 3000, "FREQ=MONTHLY;BYMONTHDAY=10", "2026-01-10"));
+    let review = s.call("series.review", json!({ "as_of": AS_OF }));
+    let fixed = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "rrule": "FREQ=MONTHLY;BYMONTHDAY=1" }));
+    let fc = s.call("forecast.project", json!({ "as_of": AS_OF, "horizon": "2026-10-31" }));
+    let out = s.run();
+    let v = out.ok(review);
+    assert!(rule(v, "Rent")["rule_error"].is_string(), "{}", rule(v, "Rent"));
+    assert_eq!(rule(v, "Gym")["next"][0]["occurrence_on"], "2026-10-10", "one broken rule hides nothing else");
+    let f = out.ok(fixed);
+    assert!(f["impact"]["before_error"].is_string());
+    assert!(f["impact"]["after_error"].is_null());
+    out.ok(fc);
+}
+
+#[test]
+fn a_claim_cut_off_by_an_end_date_still_blocks_a_schedule_change() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    s.call("series.record", json!({ "series_id": 1, "occurrence_on": "2026-12-01", "occurred_on": "2026-09-10" }));
+    s.call("series.end", json!({ "id": 1, "until_on": "2026-11-30" }));
+    let edit = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "until_on": null, "rrule": "FREQ=MONTHLY;BYMONTHDAY=5" }));
+    let out = s.run();
+    assert_eq!(out.err(edit).0, "slots_detached", "December is recorded, even though the end date cut it off");
+}
+
+#[test]
+fn undoing_a_change_puts_the_rule_back() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    let window = json!({ "as_of": AS_OF, "horizon": "2027-06-30" });
+    let p0 = s.call("forecast.project", window.clone());
+    let change = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2027-01-01", "amounts": [95000] }));
+    s.call("series.override", json!({ "series_id": 2, "occurrence_on": "2027-02-01", "action": "skip" }));
+    let dry = s.call("series.undo_change", json!({ "id": 2, "as_of": AS_OF, "dry_run": true }));
+    let older = s.call("series.undo_change", json!({ "id": 1, "as_of": AS_OF }));
+    let undo = s.call("series.undo_change", json!({ "id": 2, "as_of": AS_OF }));
+    let list = s.call("series.list", json!({}));
+    let p1 = s.call("forecast.project", window);
+    let nothing = s.call("series.undo_change", json!({ "id": 1, "as_of": AS_OF }));
+    let again = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2027-01-01", "amounts": [95000] }));
+    let out_first = s.run();
+    let new_id = out_first.ok(again)["created"]["ids"][0].as_i64().unwrap();
+
+    s.call("series.record", json!({ "series_id": new_id, "occurrence_on": "2027-01-01" }));
+    let blocked = s.call("series.undo_change", json!({ "id": new_id, "as_of": AS_OF }));
+    let list2 = s.call("series.list", json!({}));
+    let check = s.call("db.check", json!({}));
+    let out = s.run();
+
+    assert_eq!(out.ok(change)["created"]["ids"], json!([2]));
+    let d = out.ok(dry);
+    assert_eq!(d["removed"], json!([2]));
+    assert_eq!(d["restored"], json!({ "ids": [1], "until_on": null }));
+    assert_eq!(d["carried_back"][0]["occurrence_on"], "2027-02-01");
+    assert_eq!(out.err(older).0, "not_latest");
+    out.ok(undo);
+    let rows = out.ok(list).as_array().unwrap().clone();
+    assert_eq!((rows.len(), rows[0]["until_on"].clone()), (1, Value::Null));
+    let without_feb: Vec<Value> = out.ok(p0)["occurrences"].as_array().unwrap().iter().filter(|o| o["occurrence_on"] != "2027-02-01").cloned().collect();
+    assert_eq!(out.ok(p1)["occurrences"], Value::Array(without_feb), "the rule is back as it was, with the skip it gained");
+    assert_eq!(out.err(nothing).0, "not_a_change");
+    assert_eq!(out.err(blocked).0, "change_has_payments");
+    assert_eq!(out.ok(list2).as_array().unwrap().len(), 2);
+    assert_eq!(out.ok(check)["ok"], true);
+}
+
+#[test]
+fn ending_and_renaming_a_changed_rule_act_on_the_whole_rule() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    s.call("series.record", json!({ "series_id": 1, "occurrence_on": "2026-09-01" }));
+    s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2027-01-01", "amounts": [95000] }));
+    let early = s.call("series.end", json!({ "id": 1, "until_on": "2026-11-30" }));
+    let end = s.call("series.end", json!({ "id": 1, "until_on": "2027-06-01" }));
+    let list1 = s.call("series.list", json!({}));
+    let unbound = s.call("series.end", json!({ "id": 2 }));
+    let rename = s.call("series.rename", json!({ "id": 2, "description": "Flat rent" }));
+    let txn = s.call("txn.get", json!({ "id": 1 }));
+    let stale = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "amounts": [99000] }));
+    let list2 = s.call("series.list", json!({}));
+    let out = s.run();
+    let (code, msg) = out.err(early);
+    assert!(code == "overlaps_part" && msg.contains("1/1/2027"), "{code}: {msg}");
+    assert_eq!(out.ok(end)["applied_to"], json!([2]));
+    let until: Vec<Value> = out.ok(list1).as_array().unwrap().iter().map(|r| r["until_on"].clone()).collect();
+    assert_eq!(until, vec![json!("2026-12-31"), json!("2027-06-01")]);
+    assert_eq!(out.ok(unbound)["until_on"], Value::Null);
+    assert_eq!(out.ok(rename)["applied_to"], json!([1, 2]));
+    assert_eq!(out.ok(txn)["description"], "Rent", "a rename is not retrospective");
+    assert_eq!(out.err(stale).0, "not_latest");
+    let rows = out.ok(list2).as_array().unwrap().clone();
+    assert_eq!((rows[0]["description"].as_str(), rows[1]["description"].as_str()), (Some("Flat rent"), Some("Flat rent")));
+    assert_eq!((rows[0]["latest"].as_bool(), rows[0]["lineage_id"].as_i64(), rows[0]["head_id"].clone()), (Some(false), Some(1), Value::Null));
+    assert_eq!((rows[1]["latest"].as_bool(), rows[1]["head_id"].as_i64()), (Some(true), Some(1)));
+    assert_eq!((rows[1]["from_account_id"].as_i64(), rows[1]["to_account_id"].as_i64()), (Some(1), Some(2)));
+}
+
+#[test]
+fn an_unchanged_save_writes_nothing() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    let before = s.call("series.list", json!({}));
+    let same = json!({ "id": 1, "as_of": AS_OF, "description": "Rent", "rrule": "FREQ=MONTHLY;BYMONTHDAY=1", "dtstart": "2026-01-01",
+                        "weekend_rule": "none", "until_on": null, "route": [1, 2], "amounts": [90000] });
+    let whole = s.call("series.revise", same.clone());
+    let mut from = same;
+    from["mode"] = json!("from");
+    from["from_on"] = json!("2026-11-01");
+    let from = s.call("series.revise", from);
+    let after = s.call("series.list", json!({}));
+    let out = s.run();
+    for id in [whole, from] {
+        assert_eq!((out.ok(id)["mode"].as_str(), out.ok(id)["written"].as_bool()), (Some("unchanged"), Some(false)));
+    }
+    assert_eq!(out.ok(before), out.ok(after));
+}
+
+#[test]
+fn a_preview_can_start_from_a_date_and_keep_the_rhythm() {
+    let out = run(&[r#"{"id":1,"method":"series.preview","params":{"rrule":"FREQ=WEEKLY;INTERVAL=2;BYDAY=FR","dtstart":"2026-08-07","from_on":"2027-01-01","count":2}}"#]);
+    let dates: Vec<&str> = out[0]["result"]["dates"].as_array().unwrap().iter().map(|d| d["occurrence_on"].as_str().unwrap()).collect();
+    assert_eq!(dates, vec!["2027-01-08", "2027-01-22"]);
+}
+
+#[test]
+fn a_new_schedule_for_a_changed_rule_starts_the_day_after_the_earlier_terms_end() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=15", "2026-01-15"));
+    s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2027-01-01", "amounts": [95000] }));
+    let fifth = s.call("series.revise", json!({ "id": 2, "as_of": AS_OF, "mode": "whole", "rrule": "FREQ=MONTHLY;BYMONTHDAY=5" }));
+    let list = s.call("series.list", json!({}));
+    let fc = s.call("forecast.project", json!({ "as_of": AS_OF, "horizon": "2027-03-31" }));
+    let out = s.run();
+    assert_eq!(out.ok(fifth)["mode"], "in_place");
+    let rows = out.ok(list).as_array().unwrap().clone();
+    assert_eq!((rows[0]["until_on"].as_str(), rows[1]["dtstart"].as_str()), (Some("2026-12-31"), Some("2027-01-05")),
+               "not the 15/1/2027 the old schedule started on, which would lose 5/1/2027 between the parts");
+    let dates: Vec<(i64, String)> = legs(out.ok(fc), 1).into_iter().map(|l| (l.0, l.1)).collect();
+    assert_eq!(dates, vec![(1, "2026-09-15".into()), (1, "2026-10-15".into()), (1, "2026-11-15".into()), (1, "2026-12-15".into()),
+                           (2, "2027-01-05".into()), (2, "2027-02-05".into()), (2, "2027-03-05".into())]);
+}
+
+#[test]
+fn a_flag_that_is_not_true_or_false_is_refused_rather_than_read_as_false() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    let quoted = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "amounts": [95000], "dry_run": "true" }));
+    let number = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "amounts": [95000], "acknowledge_due": 1 }));
+    s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2027-01-01", "amounts": [95000] }));
+    let undo = s.call("series.undo_change", json!({ "id": 2, "as_of": AS_OF, "dry_run": "yes" }));
+    let list = s.call("series.list", json!({}));
+    let out = s.run();
+    let (code, msg) = out.err(quoted);
+    assert!(code == "bad_params" && msg.contains("dry_run"), "{code}: {msg}");
+    assert_eq!(out.err(number).0, "bad_params");
+    assert_eq!(out.err(undo).0, "bad_params");
+    assert_eq!(out.ok(list).as_array().unwrap().len(), 2, "the change was not undone");
+}
+
+#[test]
+fn a_change_from_a_date_that_moves_no_payment_applies_to_the_current_terms_whatever_the_date() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.account("Gym", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2027-01-01", "amounts": [95000] }));
+    let mut gym = plain("Gym", 1, 3, 3000, "FREQ=MONTHLY;BYMONTHDAY=10", "2026-01-10");
+    gym["until_on"] = json!("2026-06-10");
+    s.call("series.create", gym);
+    let rename = s.call("series.revise", json!({ "id": 2, "as_of": AS_OF, "mode": "from", "from_on": "2026-11-01", "description": "Flat rent" }));
+    let reprice = s.call("series.revise", json!({ "id": 2, "as_of": AS_OF, "mode": "from", "from_on": "2026-11-01", "amounts": [99000] }));
+    let weekend = s.call("series.revise", json!({ "id": 3, "as_of": AS_OF, "mode": "from", "from_on": AS_OF, "weekend_rule": "before" }));
+    let reprice_ended = s.call("series.revise", json!({ "id": 3, "as_of": AS_OF, "mode": "from", "from_on": AS_OF, "amounts": [3500] }));
+    let out = s.run();
+    assert_eq!(out.ok(rename)["mode"], "in_place");
+    let (code, msg) = out.err(reprice);
+    assert!(code == "overlaps_part" && msg.contains("change it from 1/1/2027 or later"), "{code}: {msg}");
+    assert_eq!(out.ok(weekend)["mode"], "in_place", "an ended rule's weekend rule is not a change from a date");
+    assert_eq!(out.err(reprice_ended).0, "already_ended");
+}
+
+#[test]
+fn the_review_counts_a_payment_as_due_by_when_its_money_moves() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Gym", "expense");
+    let mut gym = plain("Gym", 1, 2, 3000, "FREQ=MONTHLY;BYMONTHDAY=12", "2026-09-12");
+    gym["weekend_rule"] = json!("after");
+    s.call("series.create", gym);
+    let review = s.call("series.review", json!({ "as_of": AS_OF }));
+    let out = s.run();
+    let g = rule(out.ok(review), "Gym");
+    assert_eq!(g["due"], json!([]), "12/9/2026 is a Saturday paid on Monday 14/9, which is today: {g}");
+    assert_eq!((g["next"][0]["occurrence_on"].as_str(), g["next"][0]["value_on"].as_str()), (Some("2026-09-12"), Some("2026-09-14")));
+}
+
+#[test]
+fn an_adjustment_left_after_a_rule_ends_is_not_listed_as_ahead() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    s.call("series.override", json!({ "series_id": 1, "occurrence_on": "2026-11-01", "amount_minor": -91000 }));
+    s.call("series.override", json!({ "series_id": 1, "occurrence_on": "2027-02-01", "action": "skip" }));
+    let end = s.call("series.end", json!({ "id": 1, "until_on": "2026-12-31" }));
+    let review = s.call("series.review", json!({ "as_of": AS_OF }));
+    let out = s.run();
+    out.ok(end);
+    let on: Vec<&str> = rule(out.ok(review), "Rent")["overrides"].as_array().unwrap().iter()
+        .map(|o| o["occurrence_on"].as_str().unwrap()).collect();
+    assert_eq!(on, vec!["2026-11-01"]);
+}
+
+#[test]
+fn the_brief_names_the_account_a_changed_rule_pays_from_now() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Rent", "expense");
+    s.account("Joint", "asset");
+    s.call("series.create", plain("Rent", 1, 2, 90000, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-01-01"));
+    let moved = s.call("series.revise", json!({ "id": 1, "as_of": AS_OF, "mode": "from", "from_on": "2026-11-01",
+                                                "route": [3, 2] }));
+    let early = s.call("series.end", json!({ "id": 2, "until_on": "2026-10-15" }));
+    let before_start = s.call("series.create", plain("Gym", 1, 2, 3000, "FREQ=MONTHLY;BYMONTHDAY=10", "2026-01-10"));
+    let gym_end = s.call("series.end", json!({ "id": 3, "until_on": "2025-12-31" }));
+    let brief = s.call("analysis.brief", json!({ "as_of": AS_OF }));
+    let out = s.run();
+    assert_eq!(out.ok(moved)["mode"], "split");
+    let (_, msg) = out.err(early);
+    assert!(msg.contains("changes on 1/11/2026"), "a change still ahead is spoken of as ahead: {msg}");
+    out.ok(before_start);
+    let (_, msg) = out.err(gym_end);
+    assert!(msg.contains("31/12/2025") && msg.contains("10/1/2026"), "{msg}");
+    let rows = out.ok(brief)["commitments"]["series"].as_array().unwrap().clone();
+    let rent = rows.iter().find(|r| r["description"] == "Rent").unwrap();
+    assert_eq!(rent["account"], "Joint", "{rent}");
+}

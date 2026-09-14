@@ -67,7 +67,6 @@ ShellRoot {
             win.pickAccount(account.account_id, (mouse.modifiers & Qt.ShiftModifier) !== 0);
         }
         property var currencies: []
-        property int seriesCount: 0
         // Every full-width panel is mutually exclusive, but UPCOMING sat under all of them and
         // its 150px was the difference between the column fitting and the layout squeezing items
         // into each other. It is also the least useful thing on screen while a panel is open.
@@ -75,7 +74,7 @@ ShellRoot {
                                           || win.showBrief || win.showScenarios
                                           || win.showCurrencies || win.showDanger
                                           || win.showPayments || win.showExport
-                                          || win.showGraph
+                                          || win.showGraph || win.showRules
         property var projection: ({ balances: [], occurrences: [] })
         property string asOf: Qt.formatDate(new Date(), "yyyy-MM-dd")
         property string horizon: Qt.formatDate(
@@ -97,6 +96,8 @@ ShellRoot {
         property var editing: null          // the occurrence open in the editor
         property bool showEntry: false      // the record-a-payment form
         property bool showSeries: false     // the new-recurring-payment form
+        property bool showRules: false      // every recurring payment rule, and the editor
+        property bool seriesFromRules: false // the create form was opened from the rules list
         property bool showImport: false     // the CSV import screen
         property bool showExport: false     // taking a backup, and the two readable exports
         property bool showBrief: false      // the computed brief, for reading and for handing over
@@ -143,12 +144,28 @@ ShellRoot {
             Ledger.request("scenario.list", {}, (r, e) => { if (!e) win.scenarios = r || []; });
             Ledger.request("account.list", {}, (r, e) => { if (!e) win.allAccounts = r || []; });
             Ledger.request("currency.list", {}, (r, e) => { if (!e) win.currencies = r || []; });
-            Ledger.request("series.list", {}, (r, e) => {
-                if (!e) win.seriesCount = (r || []).filter(x => !x.scenario_id).length;
-            });
             Ledger.request("forecast.project",
                            { as_of: win.asOf, horizon: win.horizon, scenarios: win.activeScenarios },
                            (r, e) => { if (!e) win.projection = r; });
+        }
+
+        // From an occurrence in UPCOMING to the rule that makes it: the rules panel opens on that
+        // rule, as a change from that occurrence's date.
+        function openRule(seriesId, occurrenceOn) {
+            win.editing = null;
+            win.showEntry = false; win.showSeries = false; win.showImport = false;
+            win.showBrief = false; win.showScenarios = false; win.showCurrencies = false;
+            win.showDanger = false; win.showPayments = false; win.showExport = false;
+            win.showGraph = false;
+            win.showRules = true;
+            rulesPanel.openRule(seriesId, occurrenceOn);
+        }
+        // Back from the create form to wherever it was opened from.
+        function backFromSeries() {
+            win.showSeries = false;
+            win.seriesScenario = -1;
+            win.showRules = win.seriesFromRules;
+            win.seriesFromRules = false;
         }
 
         Component.onCompleted: win.refresh()
@@ -399,21 +416,33 @@ ShellRoot {
                     label: win.showEntry ? "Close" : "+ payment"
                     primary: !win.showEntry
                     onClicked: { win.showEntry = !win.showEntry;
-                                 if (win.showEntry) { win.showSeries = false; win.showExport = false; } }
+                                 if (win.showEntry) { win.showSeries = false; win.showRules = false; win.showExport = false; } }
                 }
+                // Every recurring payment rule, to review and edit, with "+ new" inside it: the list
+                // comes first, because a rule that already exists is more often the one wanted.
                 PushButton {
-                    label: win.showSeries ? "Close" : "+ recurring"
-                    onClicked: { win.showSeries = !win.showSeries;
+                    label: win.showRules || win.showSeries ? "Close" : "recurring"
+                    onClicked: { const open = !(win.showRules || win.showSeries);
+                                 win.showSeries = false;
+                                 win.seriesFromRules = false;
                                  // Always baseline: a scenario left over from a what-if would
                                  // silently make a real commitment hypothetical.
                                  win.seriesScenario = -1;
-                                 if (win.showSeries) { win.showEntry = false; win.showImport = false;
-                                                       win.showScenarios = false; win.showExport = false; } }
+                                 win.showRules = open;
+                                 // Everything else closes, as when UPCOMING opens a rule: an
+                                 // occurrence left open underneath would act on a rule this panel
+                                 // has since changed, and two tall panels do not fit one column.
+                                 if (open) { win.editing = null;
+                                             win.showEntry = false; win.showImport = false;
+                                             win.showScenarios = false; win.showExport = false;
+                                             win.showPayments = false; win.showGraph = false;
+                                             win.showBrief = false; win.showCurrencies = false;
+                                             win.showDanger = false; } }
                 }
                 PushButton {
                     label: win.showImport ? "Close" : "import"
                     onClicked: { win.showImport = !win.showImport;
-                                 if (win.showImport) { win.showEntry = false; win.showSeries = false;
+                                 if (win.showImport) { win.showEntry = false; win.showSeries = false; win.showRules = false;
                                                        win.showBrief = false; win.showExport = false; } }
                 }
                 // Next to import, because it is the same question pointed the other way. Every
@@ -422,7 +451,7 @@ ShellRoot {
                 PushButton {
                     label: win.showExport ? "Close" : "back up"
                     onClicked: { win.showExport = !win.showExport;
-                                 if (win.showExport) { win.showEntry = false; win.showSeries = false;
+                                 if (win.showExport) { win.showEntry = false; win.showSeries = false; win.showRules = false;
                                                        win.showImport = false; win.showBrief = false;
                                                        win.showScenarios = false; win.showDanger = false;
                                                        win.showCurrencies = false; win.showPayments = false;
@@ -431,7 +460,7 @@ ShellRoot {
                 PushButton {
                     label: win.showPayments ? "Close" : "payments"
                     onClicked: { win.showPayments = !win.showPayments;
-                                 if (win.showPayments) { win.showEntry = false; win.showSeries = false;
+                                 if (win.showPayments) { win.showEntry = false; win.showSeries = false; win.showRules = false;
                                                          win.showImport = false; win.showBrief = false;
                                                          win.showScenarios = false; win.showDanger = false;
                                                          win.showCurrencies = false; win.showExport = false;
@@ -442,7 +471,7 @@ ShellRoot {
                 PushButton {
                     label: win.showGraph ? "Close" : "graph"
                     onClicked: { win.showGraph = !win.showGraph;
-                                 if (win.showGraph) { win.showEntry = false; win.showSeries = false;
+                                 if (win.showGraph) { win.showEntry = false; win.showSeries = false; win.showRules = false;
                                                       win.showImport = false; win.showBrief = false;
                                                       win.showScenarios = false; win.showDanger = false;
                                                       win.showCurrencies = false; win.showExport = false;
@@ -451,14 +480,14 @@ ShellRoot {
                 PushButton {
                     label: win.showScenarios ? "Close" : "what if"
                     onClicked: { win.showScenarios = !win.showScenarios;
-                                 if (win.showScenarios) { win.showEntry = false; win.showSeries = false;
+                                 if (win.showScenarios) { win.showEntry = false; win.showSeries = false; win.showRules = false;
                                                           win.showImport = false; win.showBrief = false;
                                                           win.showExport = false; } }
                 }
                 PushButton {
                     label: win.showBrief ? "Close" : "brief"
                     onClicked: { win.showBrief = !win.showBrief;
-                                 if (win.showBrief) { win.showEntry = false; win.showSeries = false;
+                                 if (win.showBrief) { win.showEntry = false; win.showSeries = false; win.showRules = false;
                                                       win.showImport = false; win.showScenarios = false;
                                                       win.showExport = false; } }
                 }
@@ -877,28 +906,30 @@ ShellRoot {
                 onAddPaymentRequested: (id, name) => {
                     win.seriesScenario = id;
                     win.seriesScenarioName = name;
+                    win.seriesFromRules = false;
                     win.showScenarios = false;
+                    win.showRules = false;
                     win.showSeries = true;
                 }
             }
 
-            // The recurring-payments screen both LISTS and creates, like the accounts sidebar:
-            // one button, and an existing rule can be bounded without hunting for it.
-            SeriesList {
-                id: seriesList
+            // Every recurring payment rule: the list, and the editor for any of them. "+ new" inside it
+            // opens the create form below, which returns here when it is done.
+            RulesPanel {
+                id: rulesPanel
                 Layout.fillWidth: true
-                // Deliberately tight: the creation form below is ~390px, and on a 773px
-                // window every row here comes off its Create button. Scrolls past three.
-                //
-                // The row height comes FROM the list rather than being restated here. Restating it
-                // is what clipped the rename editor at one series: a row can be taller than 30 now,
-                // and a formula that did not know it left the description field half outside a
-                // viewport that could not be scrolled far enough to reach the rest.
-                Layout.preferredHeight: Math.min(150, 22 + seriesList.rowHeight * win.seriesCount
-                                                      + seriesList.extraHeight)
-                visible: win.showSeries && win.seriesCount > 0
-                today: win.asOf
-                onChanged: win.refresh()
+                Layout.preferredHeight: 380
+                Layout.fillHeight: true
+                visible: win.showRules
+                asOf: win.asOf
+                accounts: win.accounts
+                onNewRequested: {
+                    win.seriesScenario = -1;
+                    win.seriesFromRules = true;
+                    win.showRules = false;
+                    win.showSeries = true;
+                }
+                onDone: win.showRules = false
             }
 
             SeriesForm {
@@ -908,8 +939,8 @@ ShellRoot {
                 defaultDate: win.asOf
                 scenarioId: win.seriesScenario
                 scenarioName: win.seriesScenarioName
-                onSaved: { win.showSeries = false; win.seriesScenario = -1; }
-                onCancelled: { win.showSeries = false; win.seriesScenario = -1; }
+                onSaved: win.backFromSeries()
+                onCancelled: win.backFromSeries()
             }
 
             AnalysisPanel {
@@ -944,6 +975,7 @@ ShellRoot {
                 occurrence: win.editing
                 onChanged: win.editing = null
                 onDismissed: win.editing = null
+                onRuleRequested: (seriesId, occurrenceOn) => win.openRule(seriesId, occurrenceOn)
             }
 
             // Soaks up whatever the visible panel does not want, so panels sit at the top
@@ -951,7 +983,7 @@ ShellRoot {
             Item {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                visible: win.panelOpen && !win.showPayments && !win.showGraph
+                visible: win.panelOpen && !win.showPayments && !win.showGraph && !win.showRules
             }
 
             // ---- what is coming ----

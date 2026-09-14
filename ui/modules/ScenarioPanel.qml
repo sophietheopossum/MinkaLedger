@@ -59,9 +59,11 @@ Rectangle {
     }
     // Only baseline series can be cancelled: superseding a scenario row would be a change to a
     // change, which the projection has no notion of.
+    // A rule changed from a date is several rows; only its newest part is offered, and a cancel of
+    // it covers every part.
     function baselineSeries() {
         return (root.series || []).filter(s => (s.scenario_id === null || s.scenario_id === undefined)
-                                               && root.firstLeg(s));
+                                               && root.firstLeg(s) && s.latest !== false);
     }
     function isActive(id) { return (root.active || []).indexOf(id) >= 0; }
 
