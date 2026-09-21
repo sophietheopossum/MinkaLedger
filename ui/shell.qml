@@ -383,8 +383,16 @@ ShellRoot {
             onActivated: {
                 // Quickshell's window has no activeFocusItem of its own; the attached Window
                 // property on any item inside it does, the same way the pickers read it.
+                //
+                // `visible` is the load-bearing half of the test. Hiding a form does NOT take
+                // active focus off the field inside it: Field.qml focuses its TextInput on a
+                // click, and that TextInput stays the window's focus item for the rest of the
+                // session, invisible. Asking only whether the focus item is a text field
+                // therefore killed Escape permanently the first time anything was typed
+                // anywhere in the app. An item under a hidden parent reports visible == false,
+                // which is what separates a field being typed in from one closed hours ago.
                 const it = body.Window.activeFocusItem;
-                if (it && it.hasOwnProperty("cursorPosition"))
+                if (it && it.visible && it.hasOwnProperty("cursorPosition"))
                     return;
                 win.selectedAccounts = [];
             }
