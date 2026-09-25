@@ -329,6 +329,7 @@ ShellRoot {
             const acc = win.accounts.find(a => a.account_id === accountId);
             return {
                 label: acc ? acc.name : String(accountId),
+                kind: acc ? acc.kind : (h ? h.kind : ""),
                 currency: acc ? acc.currency : (h ? h.currency : ""),
                 points: pts
             };
@@ -337,7 +338,7 @@ ShellRoot {
         // Several lines added up: on every date any of them moves, the sum of each one's latest
         // value. A balance carries forward between its own points, so this is the sum of what
         // every account held that day, not just of the ones that moved.
-        function sumLines(members, label, currency) {
+        function sumLines(members, label, currency, kind) {
             const dates = {};
             const byDate = [];
             for (const m of members) {
@@ -359,14 +360,14 @@ ShellRoot {
                 }
                 pts.push({ on: on, balance_minor: total });
             }
-            return { label: label, currency: currency, points: pts };
+            return { label: label, kind: kind, currency: currency, points: pts };
         }
 
         readonly property var chartLines: {
             if (win.selectedAccounts.length > 0)
                 return win.selectedAccounts.map(id => win.lineFor(id));
             // Keep assets and liabilities separate, and never add different currencies.
-            // Liabilities retain their signed balances, so debt sits below zero.
+            // Keep signed balances for readouts; the chart inverts liabilities only when drawing.
             const lines = [];
             for (const kind of ["asset", "liability"]) {
                 const byCurrency = {};
@@ -374,7 +375,7 @@ ShellRoot {
                     (byCurrency[a.currency] = byCurrency[a.currency] || []).push(win.lineFor(a.account_id));
                 for (const cur of Object.keys(byCurrency).sort())
                     lines.push(win.sumLines(byCurrency[cur],
-                                           kind === "asset" ? "all assets" : "total liabilities", cur));
+                                           kind === "asset" ? "all assets" : "total liabilities", cur, kind));
             }
             return lines;
         }
@@ -796,8 +797,8 @@ ShellRoot {
                                         width: 10
                                         height: 3
                                         radius: 1
-                                        // The same rule the chart uses: a lone line that ends
-                                        // below zero is drawn red.
+                                        // The same rule the chart uses: a lone line with a
+                                        // negative closing balance is drawn red.
                                         color: win.chartLines.length === 1 && chip.endMinor < 0
                                                ? Theme.red
                                                : Theme.seriesPalette[chip.index % Theme.seriesPalette.length]

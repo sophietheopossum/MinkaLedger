@@ -3,6 +3,8 @@ import "../services"
 
 // Balance over time, hand-drawn on a Canvas: history to the left of today, projection to the
 // right, one line per account or separate asset and liability totals per currency.
+// Liability balances are negated only for plotting, so repaying debt lowers the line.
+// Readouts retain the original signed balances.
 //
 // House pattern, following MinkaMon's Sparkline/MultiTrendLine: Canvas + onPaint, repaint on
 // resize, series colours from the theme, nulls leave a gap. QtCharts is deliberately not used --
@@ -17,7 +19,7 @@ import "../services"
 //
 // ZERO IS THE HORIZONTAL AXIS and it is shared, because dividing every currency by a positive peak
 // keeps zero at zero. A ledger's most important moment is the day a projected balance crosses it.
-// When nothing in the window ever goes negative there is no space below the axis at all: the axis
+// When no plotted value goes negative there is no space below the axis at all: the axis
 // sits on the floor of the plot and the whole height is spent on the part that exists.
 //
 // TODAY IS THE VERTICAL AXIS: history to its left, projection to its right.
@@ -31,7 +33,7 @@ import "../services"
 Item {
     id: root
 
-    // [{ label, currency, colour, points: [{ on: "YYYY-MM-DD", balance_minor: int }] }], each
+    // [{ label, kind, currency, colour, points: [{ on: "YYYY-MM-DD", balance_minor: int }] }], each
     // points list ascending by date. History and projection are one list; `todayIso` splits it.
     property var lines: []
     property string todayIso: ""
@@ -59,7 +61,7 @@ Item {
     readonly property real tSpan: root.dates.length > 1
                                   ? Date.parse(root.dates[root.dates.length - 1]) - root.t0 : 0
 
-    // Per currency: the value that maps to the top of the plot, plus that currency's extremes.
+    // Per currency: the plotted value that maps to the top, plus that currency's plotted extremes.
     // The scale is the peak, so the peak of every currency draws at the same height. A currency
     // that never rises above zero has no peak to align, so its deepest point sets the scale
     // instead and it hangs the full height below the axis.
@@ -68,9 +70,9 @@ Item {
         for (const line of (root.lines || [])) {
             const cur = line.currency || root.currency;
             for (const p of (line.points || [])) {
-                const v = p.balance_minor;
-                if (v === null || v === undefined)
+                if (p.balance_minor === null || p.balance_minor === undefined)
                     continue;
+                const v = root.plotValue(line, p.balance_minor);
                 if (hi[cur] === undefined) { hi[cur] = v; lo[cur] = v; }
                 if (v > hi[cur]) hi[cur] = v;
                 if (v < lo[cur]) lo[cur] = v;
@@ -111,8 +113,11 @@ Item {
         const span = root.unitTop - root.unitLo;
         return root.padTop + root.plotH * (root.unitTop - u) / (span <= 0 ? 1 : span);
     }
+    function plotValue(line, v) {
+        return line.kind === "liability" ? -v : v;
+    }
     function yOf(line, v) {
-        return root.yOfUnit(v / root._scaleOf(line));
+        return root.yOfUnit(root.plotValue(line, v) / root._scaleOf(line));
     }
 
     // The projection is the same line drawn thinner in the air: it is a forecast, and the eye
@@ -227,7 +232,7 @@ Item {
             const dates = root.dates;
             const right = root.padLeft + root.plotW;
 
-            // The horizontal axis is zero. With no negative anywhere it lands on the floor of the
+            // The horizontal axis is zero. With no negative plotted value it lands on the floor of the
             // plot, so nothing is drawn below it and none of the height is wasted.
             const zeroY = root.yOfUnit(0);
             ctx.strokeStyle = Theme.line;
