@@ -17,6 +17,11 @@ import "../services"
 // The consequence is that heights are no longer comparable between currencies -- deliberately, as
 // they never were comparable in the first place -- so the exact numbers come from hovering.
 //
+// WITHIN A CURRENCY, ASSETS AND LIABILITIES ARE SCALED SEPARATELY, by the same rule: each kind's
+// peak reaches the full height. Debt is usually a small fraction of what is held, so sharing one
+// peak pressed the liability line flat along the axis -- the same fault as the euro line above,
+// one level down. Lines of the same currency and kind still share a peak and stay comparable.
+//
 // ZERO IS THE HORIZONTAL AXIS and it is shared, because dividing every currency by a positive peak
 // keeps zero at zero. A ledger's most important moment is the day a projected balance crosses it.
 // When no plotted value goes negative there is no space below the axis at all: the axis
@@ -61,14 +66,14 @@ Item {
     readonly property real tSpan: root.dates.length > 1
                                   ? Date.parse(root.dates[root.dates.length - 1]) - root.t0 : 0
 
-    // Per currency: the plotted value that maps to the top, plus that currency's plotted extremes.
-    // The scale is the peak, so the peak of every currency draws at the same height. A currency
-    // that never rises above zero has no peak to align, so its deepest point sets the scale
-    // instead and it hangs the full height below the axis.
+    // Per scale group -- a currency and an account kind -- the plotted value that maps to the top,
+    // plus that group's plotted extremes. The scale is the peak, so the peak of every group draws
+    // at the same height. A group that never rises above zero has no peak to align, so its
+    // deepest point sets the scale instead and it hangs the full height below the axis.
     readonly property var scales: {
         const hi = {}, lo = {};
         for (const line of (root.lines || [])) {
-            const cur = line.currency || root.currency;
+            const cur = root._groupOf(line);
             for (const p of (line.points || [])) {
                 if (p.balance_minor === null || p.balance_minor === undefined)
                     continue;
@@ -96,8 +101,11 @@ Item {
     // A little air above the tallest peak so it does not touch the top edge.
     readonly property real unitTop: 1.06
 
+    function _groupOf(line) {
+        return (line.currency || root.currency) + "|" + (line.kind || "");
+    }
     function _scaleOf(line) {
-        const s = root.scales[line.currency || root.currency];
+        const s = root.scales[root._groupOf(line)];
         return s ? s.scale : 1;
     }
 
