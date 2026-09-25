@@ -85,12 +85,13 @@ ShellRoot {
         // Balance history per open account over that window, from account.history.
         property var history: []
         // The accounts the chart draws: click one to see it alone, shift-click to add or remove,
-        // Escape to clear. Empty means every asset, summed per currency -- the household's money
-        // as one line, which is what the chart is for when nothing in particular is being asked.
+        // Escape to clear. Empty means total assets and total liabilities, summed separately
+        // per currency, for an overview of what the household holds and owes.
         property var selectedAccounts: []
         readonly property var chartAccountIds: win.selectedAccounts.length > 0
             ? win.selectedAccounts
-            : win.accounts.filter(a => a.kind === "asset").map(a => a.account_id)
+            : win.accounts.filter(a => a.kind === "asset" || a.kind === "liability")
+                          .map(a => a.account_id)
         property var scenarios: []
         property var activeScenarios: []
         property var editing: null          // the occurrence open in the editor
@@ -364,13 +365,18 @@ ShellRoot {
         readonly property var chartLines: {
             if (win.selectedAccounts.length > 0)
                 return win.selectedAccounts.map(id => win.lineFor(id));
-            // Every asset, one summed line per currency: money in different currencies is not
-            // one number, and pretending it is would be worse than two lines.
-            const byCurrency = {};
-            for (const a of win.accounts.filter(a => a.kind === "asset"))
-                (byCurrency[a.currency] = byCurrency[a.currency] || []).push(win.lineFor(a.account_id));
-            return Object.keys(byCurrency).sort().map(cur =>
-                win.sumLines(byCurrency[cur], "all assets", cur));
+            // Keep assets and liabilities separate, and never add different currencies.
+            // Liabilities retain their signed balances, so debt sits below zero.
+            const lines = [];
+            for (const kind of ["asset", "liability"]) {
+                const byCurrency = {};
+                for (const a of win.accounts.filter(a => a.kind === kind))
+                    (byCurrency[a.currency] = byCurrency[a.currency] || []).push(win.lineFor(a.account_id));
+                for (const cur of Object.keys(byCurrency).sort())
+                    lines.push(win.sumLines(byCurrency[cur],
+                                           kind === "asset" ? "all assets" : "total liabilities", cur));
+            }
+            return lines;
         }
         readonly property string chartCurrency: win.chartLines.length > 0 ? win.chartLines[0].currency : "GBP"
 
@@ -757,8 +763,8 @@ ShellRoot {
                             }
                             Text {
                                 text: win.selectedAccounts.length === 0
-                                      ? "all assets · click an account, shift-click for more"
-                                      : "shift-click to add or remove, Esc for all assets"
+                                      ? "totals · click an account, shift-click for more"
+                                      : "shift-click to add or remove, Esc for totals"
                                 color: Theme.textFaint
                                 font.family: Theme.fontFamily
                                 font.pixelSize: Theme.fontSize - 4

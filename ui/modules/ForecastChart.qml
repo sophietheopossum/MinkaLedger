@@ -2,7 +2,7 @@ import QtQuick
 import "../services"
 
 // Balance over time, hand-drawn on a Canvas: history to the left of today, projection to the
-// right, one line per account or one summed line per currency.
+// right, one line per account or separate asset and liability totals per currency.
 //
 // House pattern, following MinkaMon's Sparkline/MultiTrendLine: Canvas + onPaint, repaint on
 // resize, series colours from the theme, nulls leave a gap. QtCharts is deliberately not used --
