@@ -326,7 +326,7 @@ mod tests {
     }
 
     fn book() -> Connection {
-        let mut conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         conn.execute_batch(include_str!("../migrations/0001_init.sql")).unwrap();
         conn.execute_batch(

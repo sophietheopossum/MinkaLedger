@@ -307,7 +307,9 @@ pub fn categorise(conn: &mut Connection, batch_id: i64) -> Result<usize, ImportE
         })?
         .collect::<Result<_, _>>()?;
 
-    let rows: Vec<(i64, String, Option<String>, Option<String>, Option<String>, Minor)> = conn
+    // (id, description, payee, bank_category, txn_type, amount)
+    type Staged = (i64, String, Option<String>, Option<String>, Option<String>, Minor);
+    let rows: Vec<Staged> = conn
         .prepare(
             "SELECT id, description, payee, bank_category, txn_type, COALESCE(amount_minor,0)
                FROM import_row WHERE batch_id = ?1 AND state IN ('new','pending')",
@@ -371,7 +373,9 @@ pub fn commit(conn: &mut Connection, batch_id: i64) -> Result<usize, ImportError
     }
 
     let unclassified = unclassified_account(conn)?;
-    let rows: Vec<(i64, i64, String, String, Option<String>, Minor, String, Option<i64>, Option<String>)> =
+    // (id, account_id, occurred_on, description, payee, amount, currency, far_account_id, fingerprint)
+    type Accepted = (i64, i64, String, String, Option<String>, Minor, String, Option<i64>, Option<String>);
+    let rows: Vec<Accepted> =
         conn.prepare(
             "SELECT id, account_id, occurred_on, description, payee, amount_minor, currency,
                     far_account_id, fingerprint
@@ -494,7 +498,7 @@ Date,Description,Amount,Category
 ";
 
     fn book() -> Connection {
-        let mut conn = Connection::open_in_memory().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         conn.execute_batch(include_str!("../migrations/0001_init.sql")).unwrap();
         conn.execute_batch(

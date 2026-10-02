@@ -626,7 +626,7 @@ mod tests {
     }
 
     fn closing(p: &Projection, account_id: i64) -> Minor {
-        p.balances.iter().filter(|b| b.account_id == account_id).last().unwrap().balance_minor
+        p.balances.iter().rfind(|b| b.account_id == account_id).unwrap().balance_minor
     }
 
     #[test]

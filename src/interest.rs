@@ -115,6 +115,7 @@ pub fn derive_level_payment(
 /// payment reduce the term rather than the next instalment. A payment smaller than the interest
 /// due pays no principal at all and the debt grows; that is not an error, it is what negative
 /// amortisation is, and the forecast should show it happening rather than refuse to model it.
+#[cfg(test)]
 pub fn allocate(payment_minor: Minor, interest_due_minor: Minor) -> (Minor, Minor) {
     let to_interest = payment_minor.min(interest_due_minor).max(0);
     let to_principal = payment_minor - to_interest;

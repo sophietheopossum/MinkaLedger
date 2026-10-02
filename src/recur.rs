@@ -18,14 +18,12 @@ use rrule::{RRuleSet, Tz};
 pub enum RecurError {
     /// The rule text did not parse, with the library's reason.
     BadRule(String),
-    BadDate(String),
 }
 
 impl std::fmt::Display for RecurError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RecurError::BadRule(m) => write!(f, "bad recurrence rule: {m}"),
-            RecurError::BadDate(m) => write!(f, "bad date: {m}"),
         }
     }
 }

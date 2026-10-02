@@ -113,8 +113,7 @@ fn a_complete_card_setup_projects_payments_that_actually_happen() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|b| b["account_id"] == 2)
-        .next_back()
+        .rfind(|b| b["account_id"] == 2)
         .unwrap()["balance_minor"]
         .as_i64()
         .unwrap();
@@ -1791,7 +1790,7 @@ fn a_recurring_chain_projects_every_hop_and_behaves_as_one() {
     assert!(occ.iter().all(|o| o["chain_len"] == 2), "{occ:?}");
     assert!(occ.iter().any(|o| o["series_id"] == 2 && o["chain_seq"] == 1));
     let closing = |p: &serde_json::Value, id: i64| p["balances"].as_array().unwrap().iter()
-        .filter(|b| b["account_id"] == id).last().map(|b| b["balance_minor"].as_i64().unwrap());
+        .rfind(|b| b["account_id"] == id).map(|b| b["balance_minor"].as_i64().unwrap());
     assert_eq!((closing(proj, 1), closing(proj, 2), closing(proj, 3)), (Some(-30000), Some(1500), Some(28500)));
 
     // The brief sees one commitment, leaving Current, not two.

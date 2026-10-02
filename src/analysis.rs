@@ -315,13 +315,16 @@ struct MonthCell {
     amount: Minor,
 }
 
+/// Each complete month ("YYYY-MM") and its per-account cells, iterating in month order.
+type MonthBuckets = BTreeMap<String, Vec<MonthCell>>;
+
 /// Complete calendar months only, per account, plus the spent/received magnitudes.
 fn monthly(
     conn: &Connection,
     sc: &Scales,
     from: NaiveDate,
     to: NaiveDate,
-) -> Result<(Vec<serde_json::Value>, BTreeMap<String, Vec<MonthCell>>), AnalysisError> {
+) -> Result<(Vec<serde_json::Value>, MonthBuckets), AnalysisError> {
     let mut st = conn.prepare(
         "SELECT strftime('%Y-%m', t.occurred_on) AS ym, a.name, a.kind, p.currency,
                 SUM(p.amount_minor)
@@ -388,11 +391,11 @@ fn monthly(
 /// two months is visibly not one.
 fn typical(
     sc: &Scales,
-    buckets: &BTreeMap<String, Vec<MonthCell>>,
+    buckets: &MonthBuckets,
 ) -> Vec<serde_json::Value> {
     let mut series: BTreeMap<(String, String, String), Vec<Minor>> = BTreeMap::new();
     let mut latest: BTreeMap<(String, String, String), Minor> = BTreeMap::new();
-    for (_, cells) in buckets.iter() {
+    for cells in buckets.values() {
         for c in cells {
             let key = (c.account.clone(), c.kind.clone(), c.currency.clone());
             series.entry(key.clone()).or_default().push(c.amount);
@@ -1234,7 +1237,7 @@ mod tests {
 
     #[test]
     fn an_empty_book_is_called_empty_rather_than_reported_as_zeroes() {
-        let mut c = Connection::open_in_memory().unwrap();
+        let c = Connection::open_in_memory().unwrap();
         c.pragma_update(None, "foreign_keys", "ON").unwrap();
         crate::db::migrate(&c).unwrap();
         let b = brief(&c, &opts("2026-08-15")).unwrap();

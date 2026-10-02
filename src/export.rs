@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn forecast_rows_are_included_only_on_request_and_always_flagged() {
-        let mut c = book();
+        let c = book();
         c.execute_batch(
             "INSERT INTO series(id,description,rrule,dtstart) VALUES(1,'Rent','FREQ=MONTHLY;BYMONTHDAY=1','2026-01-01');
              INSERT INTO series_posting(series_id,account_id,currency,amount_minor,role)
