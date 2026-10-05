@@ -1051,6 +1051,53 @@ fn renaming_the_counterweight_leaves_the_next_opening_edit_balanced() {
     assert_eq!(out[8]["result"]["ok"], true);
 }
 
+/// A pin is only an id, and SQLite hands a freed id straight back out: with no AUTOINCREMENT the next
+/// row gets MAX(id)+1, so deleting the newest account gives its id to whatever is created next. That
+/// is why roles.rs VALIDATES a pin on read instead of trusting it. Trusted, the stale
+/// `opening_equity.GBP` pin below resolves to an ordinary savings account, and every later opening
+/// balance posts its counterweight into real money -- with db.check green throughout, because both
+/// legs still sum to zero.
+#[test]
+fn a_pin_left_by_a_deleted_counterweight_is_not_followed_into_the_account_that_reuses_its_id() {
+    let out = run(&[
+        r#"{"id":1,"method":"account.create","params":{"name":"Bank","kind":"asset","currency":"GBP",
+             "opening_minor":100000,"opening_on":"2026-01-01"}}"#,
+        // Clearing the opening balance leaves the counterweight with no history, so it can be deleted
+        // outright rather than only closed -- and its pin stays behind in book_meta.
+        r#"{"id":2,"method":"account.set_opening","params":{"id":1,"amount_minor":0}}"#,
+        r#"{"id":3,"method":"account.delete","params":{"id":2}}"#,
+        r#"{"id":4,"method":"account.create","params":{"name":"Savings","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":5,"method":"account.create","params":{"name":"Wallet","kind":"asset","currency":"GBP",
+             "opening_minor":5000,"opening_on":"2026-01-01"}}"#,
+        r#"{"id":6,"method":"account.balances"}"#,
+        r#"{"id":7,"method":"analysis.query","params":{"sql":"SELECT CAST(value AS INTEGER) FROM book_meta WHERE key = 'opening_equity.GBP'"}}"#,
+        r#"{"id":8,"method":"db.check"}"#,
+    ]);
+    for r in &out {
+        assert!(err_of(r).is_none(), "{r}");
+    }
+    assert_eq!(out[2]["result"]["name"], "Opening balances (GBP)", "the counterweight was deleted");
+    // The premise. If Savings did not inherit the id, the pin points at nothing and this test proves
+    // nothing about validation -- so say so rather than pass.
+    assert_eq!(out[3]["result"]["id"], 2, "Savings must reuse the deleted counterweight's id: {}", out[3]);
+
+    let balances = out[5]["result"].as_array().unwrap();
+    let bal = |name: &str| -> &serde_json::Value {
+        balances.iter().find(|b| b["name"] == name).unwrap_or_else(|| panic!("no {name}: {balances:?}"))
+    };
+    assert_eq!(bal("Savings")["balance_minor"], 0, "the stale pin redirected a counterweight into Savings");
+    assert_eq!(bal("Wallet")["balance_minor"], 5_000);
+
+    // A fresh counterweight took the leg, under the name the core creates it with, and the pin moved
+    // to it so the next lookup does not have to fall back again.
+    let eq = bal("Opening balances (GBP)");
+    assert_eq!(eq["kind"], "equity");
+    assert_eq!(eq["balance_minor"], -5_000);
+    assert_ne!(eq["account_id"], 2);
+    assert_eq!(out[6]["result"]["rows"][0][0], eq["account_id"], "the pin follows the new counterweight");
+    assert_eq!(out[7]["result"]["ok"], true);
+}
+
 /// The system guard was complete in ONE direction only: it stopped a magic account being renamed
 /// AWAY from its name, and nothing stopped an ordinary account being renamed INTO one. The collision
 /// check only refuses names already taken, so any reserved name the book did not yet hold was free to
