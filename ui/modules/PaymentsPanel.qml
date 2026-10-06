@@ -104,23 +104,97 @@ Rectangle {
         function onRevisionChanged() { if (root.visible) root.refreshCurrent(); }
     }
 
+    // A refresh after a write reloads as many payments as are already listed: going back to the
+    // first page would drop an edit made further down, and the place scrolled to with it.
     function refreshCurrent() {
-        root.search();
+        root.search(root.rows.length);
         if (root.following >= 0)
             root.follow(root.following);
     }
 
-    function search() {
-        const params = { limit: 60 };
+    // Payments arrive a page at a time, newest first, and reaching the end of the list fetches the
+    // next page. One page used to be all there was: everything older than the 60th payment simply
+    // could not be seen.
+    readonly property int pageSize: 60
+    // The core answers at most this many rows per request.
+    readonly property int requestCap: 500
+    property bool loading: false
+    // Bumped by every fresh load. A reply that belongs to an older one (a search since retyped) is
+    // dropped rather than mixed into the new list.
+    property int generation: 0
+
+    function browseParams(offset, limit) {
+        const params = { offset: offset, limit: limit };
         if (searchField.text.trim().length > 0)
             params.search = searchField.text.trim();
         if (root.accountFilter >= 0)
             params.account_id = root.accountFilter;
-        Ledger.request("txn.browse", params, (r, e) => {
+        return params;
+    }
+
+    // Replacing the rows hands the list a new model, which puts the view back at the top. A page
+    // appended or a refresh keeps the place instead: otherwise reaching the end of the list would
+    // throw it back to the newest payment, and so would an edit made far down it.
+    function replaceRows(rows, keepPlace) {
+        const y = paymentList.contentY;
+        root.rows = rows;
+        if (keepPlace && y > 0)
+            paymentList.contentY = Math.min(y, Math.max(0, paymentList.contentHeight - paymentList.height));
+    }
+
+    // Load the first `count` payments (one page when not given), replacing the list once they
+    // have all arrived, so it never flashes shorter in between. Given a count it is a refresh,
+    // and keeps the place.
+    function search(count) {
+        const want = Math.max(root.pageSize, count || 0);
+        const gen = ++root.generation;
+        const collected = [];
+        root.loading = true;
+        const step = () => {
+            const limit = Math.min(root.requestCap, want - collected.length);
+            Ledger.request("txn.browse", root.browseParams(collected.length, limit), (r, e) => {
+                if (gen !== root.generation)
+                    return;
+                if (e) { root.loading = false; root.note = e.message; return; }
+                const rows = r.rows || [];
+                for (const row of rows)
+                    collected.push(row);
+                if (rows.length === limit && collected.length < want && collected.length < r.total) {
+                    step();
+                    return;
+                }
+                root.replaceRows(collected, count > 0);
+                root.total = r.total;
+                root.note = "";
+                root.loading = false;
+                Qt.callLater(paymentList.reachMore);
+            });
+        };
+        step();
+    }
+
+    // The next page, appended. Payments already listed are skipped: one written meanwhile shifts
+    // every offset by one, and the overlap would otherwise list a payment twice.
+    function loadMore() {
+        if (root.loading || root.rows.length >= root.total)
+            return;
+        const gen = root.generation;
+        root.loading = true;
+        Ledger.request("txn.browse", root.browseParams(root.rows.length, root.pageSize), (r, e) => {
+            if (gen !== root.generation)
+                return;
+            root.loading = false;
             if (e) { root.note = e.message; return; }
-            root.rows = r.rows || [];
+            const listed = new Set(root.rows.map(x => x.id));
+            const fresh = (r.rows || []).filter(x => !listed.has(x.id));
             root.total = r.total;
             root.note = "";
+            // Only a page that added something checks again, so one that was all overlap
+            // cannot ask for itself forever.
+            if (fresh.length > 0) {
+                root.replaceRows(root.rows.concat(fresh), true);
+                Qt.callLater(paymentList.reachMore);
+            }
         });
     }
 
@@ -491,10 +565,20 @@ Rectangle {
                 border.color: Theme.line
 
                 ListView {
+                    id: paymentList
                     anchors.fill: parent
                     anchors.margins: 4
                     clip: true
                     model: root.listRows
+                    // Reaching the end asks for the next page. Every load checks again once its
+                    // rows are laid out (when atYEnd is up to date): a list that ends on screen,
+                    // or a refresh that leaves the view where it was at the bottom, changes
+                    // nothing a scroll could, so it would otherwise never reach for the rest.
+                    function reachMore() {
+                        if (paymentList.atYEnd)
+                            root.loadMore();
+                    }
+                    onAtYEndChanged: paymentList.reachMore()
                     delegate: Rectangle {
                         id: prow
                         required property var modelData
