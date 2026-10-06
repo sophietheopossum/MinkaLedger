@@ -1098,7 +1098,7 @@ pub(crate) fn revise(conn: &mut Connection, params: &Value) -> Result<Value, Edi
                 let new = slots(&rrule, dtstart, lo, hi).map_err(|e| fail("bad_rule", e.to_string()))?;
                 let counts = |d: NaiveDate| old.as_ref().is_none_or(|o| o.contains(&d)) && !new.contains(&d);
                 for (date, rows) in &claims_by_date {
-                    if day(date).is_some_and(&counts) {
+                    if day(date).is_some_and(counts) {
                         recorded_blockers.push((day(date).unwrap(), rows[0].occurred_on.clone()));
                         blockers.push(recorded_blocker(date, rows));
                     }
