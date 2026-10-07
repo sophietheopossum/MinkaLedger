@@ -1,3 +1,4 @@
+pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
@@ -596,6 +597,7 @@ ShellRoot {
                                     Repeater {
                                         model: ["asset", "liability", "income", "expense"]
                                         PushButton {
+                                            required property string modelData
                                             label: modelData
                                             primary: newAccount.kind === modelData
                                             onClicked: newAccount.kind = modelData
@@ -611,6 +613,7 @@ ShellRoot {
                                     Repeater {
                                         model: win.currencies
                                         PushButton {
+                                            required property var modelData
                                             implicitHeight: 24
                                             label: modelData.code
                                             primary: newAccount.currency === modelData.code
@@ -705,6 +708,8 @@ ShellRoot {
                             clip: true
                             model: win.accounts
                             delegate: Rectangle {
+                                id: accountRow
+                                required property var modelData
                                 width: ListView.view.width
                                 height: 26
                                 color: win.selectedAccounts.indexOf(modelData.account_id) >= 0
@@ -715,15 +720,15 @@ ShellRoot {
                                     anchors.rightMargin: 6
                                     Text {
                                         Layout.fillWidth: true
-                                        text: modelData.name
+                                        text: accountRow.modelData.name
                                         elide: Text.ElideRight
                                         color: Theme.text
                                         font.family: Theme.fontFamily
                                         font.pixelSize: Theme.fontSize - 1
                                     }
                                     Text {
-                                        text: Money.format(modelData.balance_minor, modelData.currency)
-                                        color: modelData.balance_minor < 0 ? Theme.red : Theme.text
+                                        text: Money.format(accountRow.modelData.balance_minor, accountRow.modelData.currency)
+                                        color: accountRow.modelData.balance_minor < 0 ? Theme.red : Theme.text
                                         font.family: Theme.monoFamily
                                         font.pixelSize: Theme.fontSize - 1
                                     }
@@ -734,7 +739,7 @@ ShellRoot {
                                     acceptedButtons: Qt.LeftButton | Qt.RightButton
                                     // Shift adds to (or takes from) the selection; a plain click
                                     // replaces it. Right-click copies the balance instead.
-                                    onClicked: mouse => win.accountRowClicked(rowMouse, modelData, mouse)
+                                    onClicked: mouse => win.accountRowClicked(rowMouse, accountRow.modelData, mouse)
                                 }
                             }
                         }
@@ -837,6 +842,8 @@ ShellRoot {
                             Repeater {
                                 model: win.scenarios
                                 Rectangle {
+                                    id: scenarioChip
+                                    required property var modelData
                                     height: 22
                                     width: label.implicitWidth + 16
                                     radius: 3
@@ -846,14 +853,14 @@ ShellRoot {
                                     Text {
                                         id: label
                                         anchors.centerIn: parent
-                                        text: modelData.name
+                                        text: scenarioChip.modelData.name
                                         color: Theme.text
                                         font.family: Theme.fontFamily
                                         font.pixelSize: Theme.fontSize - 2
                                     }
                                     MouseArea {
                                         anchors.fill: parent
-                                        onClicked: win.toggleScenario(modelData.id)
+                                        onClicked: win.toggleScenario(scenarioChip.modelData.id)
                                     }
                                 }
                             }
@@ -1035,6 +1042,7 @@ ShellRoot {
                         // alter an occurrence, so an unreliable hit area is not cosmetic.
                         delegate: Item {
                             id: occRow
+                            required property var modelData
                             width: ListView.view.width
                             implicitHeight: occRowLayout.implicitHeight
                             // Only a real series occurrence can be altered or recorded. Generated
@@ -1044,25 +1052,25 @@ ShellRoot {
                             MouseArea {
                                 anchors.fill: parent
                                 cursorShape: occRow.editable ? Qt.PointingHandCursor : Qt.ArrowCursor
-                                onClicked: if (occRow.editable) win.editing = modelData.rep
+                                onClicked: if (occRow.editable) win.editing = occRow.modelData.rep
                             }
                             RowLayout {
                             id: occRowLayout
                             anchors.fill: parent
                             spacing: 10
                             Text {
-                                text: modelData.value_on
-                                color: modelData.due ? Theme.warnAmber : Theme.textFaint
+                                text: occRow.modelData.value_on
+                                color: occRow.modelData.due ? Theme.warnAmber : Theme.textFaint
                                 font.family: Theme.monoFamily
                                 font.pixelSize: Theme.fontSize - 1
                             }
                             Text {
                                 Layout.fillWidth: true
-                                text: modelData.description
-                                       + (modelData.chain_len > 1 ? "  ⛓ " + modelData.chain_len + " hops" : "")
-                                       + (modelData.due ? "  (due, not yet recorded)"
-                                          : modelData.moved ? "  (moved from " + modelData.occurrence_on + ")" : "")
-                                       + "   " + modelData.route
+                                text: occRow.modelData.description
+                                       + (occRow.modelData.chain_len > 1 ? "  ⛓ " + occRow.modelData.chain_len + " hops" : "")
+                                       + (occRow.modelData.due ? "  (due, not yet recorded)"
+                                          : occRow.modelData.moved ? "  (moved from " + occRow.modelData.occurrence_on + ")" : "")
+                                       + "   " + occRow.modelData.route
                                 elide: Text.ElideRight
                                 color: Theme.text
                                 font.family: Theme.fontFamily
@@ -1073,16 +1081,16 @@ ShellRoot {
                             // projection; a what-if's is marked so it is not mistaken for a
                             // commitment.
                             Text {
-                                visible: modelData.recorded || modelData.hypothetical
-                                text: modelData.recorded ? "recorded" : "what-if"
-                                color: modelData.hypothetical ? Theme.purple : Theme.textFaint
+                                visible: occRow.modelData.recorded || occRow.modelData.hypothetical
+                                text: occRow.modelData.recorded ? "recorded" : "what-if"
+                                color: occRow.modelData.hypothetical ? Theme.purple : Theme.textFaint
                                 font.family: Theme.fontFamily
                                 font.pixelSize: Theme.fontSize - 3
                             }
                             Text {
-                                text: modelData.amountText
-                                color: modelData.tone < 0 ? Theme.red
-                                     : modelData.tone > 0 ? Theme.okGreen : Theme.text
+                                text: occRow.modelData.amountText
+                                color: occRow.modelData.tone < 0 ? Theme.red
+                                     : occRow.modelData.tone > 0 ? Theme.okGreen : Theme.text
                                 font.family: Theme.monoFamily
                                 font.pixelSize: Theme.fontSize - 1
                             }
