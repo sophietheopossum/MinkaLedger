@@ -154,7 +154,7 @@ Rectangle {
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
-        anchors.bottom: footer.top
+        anchors.bottom: adminFooter.top
         anchors.bottomMargin: 3
         clip: true
         spacing: 3
@@ -360,7 +360,7 @@ Rectangle {
     }
 
     Column {
-        id: footer
+        id: adminFooter
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
