@@ -1698,7 +1698,18 @@ fn dispatch(
             let fmt = params.get("date_format").and_then(|v| v.as_str()).unwrap_or("%d/%m/%Y");
             let mapping = params.get("mapping").ok_or_else(|| bad("mapping"))?;
             let account = params.get("account_id").and_then(|v| v.as_i64());
-            let cur = params.get("currency").and_then(|v| v.as_str()).unwrap_or("GBP");
+            // A statement is in the currency of the account it is a statement OF, so that is what a
+            // profile reads its file as unless it is told otherwise. This defaulted to GBP whatever
+            // the account held, and the import screen names no currency: a profile landing in a EUR
+            // account staged every line as GBP, which no commit can write.
+            let landing: Option<String> = match account {
+                Some(id) => Some(
+                    conn.query_row("SELECT currency FROM account WHERE id = ?1", [id], |r| r.get(0))
+                        .map_err(|_| Error { code: "not_found", message: format!("no such account: {id}") })?,
+                ),
+                None => None,
+            };
+            let cur = params.get("currency").and_then(|v| v.as_str()).or(landing.as_deref()).unwrap_or("GBP");
             let delim = params.get("delimiter").and_then(|v| v.as_str()).unwrap_or(",");
             conn.execute(
                 "INSERT INTO import_profile(name, date_format, mapping_json, account_id,

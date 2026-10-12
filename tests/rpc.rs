@@ -3044,7 +3044,7 @@ fn balance(balances: &Value, name: &str) -> i64 {
 }
 
 /// A profile for a `Date,Description,Amount` export landing in account `into`. It names no
-/// currency, so it reads the file as GBP -- which is the profile the import screen creates.
+/// currency, as the import screen names none, so it reads the file in the currency `into` holds.
 fn profile(name: &str, into: i64) -> Value {
     json!({ "name": name, "date_format": "%d/%m/%Y", "account_id": into,
             "mapping": { "date": "Date", "amount": "Amount", "description": "Description" } })
@@ -3233,8 +3233,10 @@ fn a_statement_line_is_never_written_across_currencies() {
     let balances = s.call("account.balances", json!({}));
 
     let hotel = "Date,Description,Amount\n10/08/2026,HOTEL,-80.00\n";
-    // The near side: a profile that reads GBP, landing in an account that holds EUR.
-    s.call("import.create_profile", profile("Wise", 2));
+    // The near side: a profile told to read GBP, landing in an account that holds EUR.
+    let mut as_pounds = profile("Wise", 2);
+    as_pounds["currency"] = json!("GBP");
+    s.call("import.create_profile", as_pounds);
     s.call("import.stage", json!({ "profile_id": 2, "csv": hotel }));
     let near = s.call("import.commit", json!({ "batch_id": 2 }));
     let check = s.call("db.check", json!({}));
@@ -3264,9 +3266,7 @@ fn a_line_nobody_categorised_waits_in_the_bucket_for_its_own_currency() {
     s.account("Current", "asset");
     s.call("account.create", json!({ "name": "Euro pot", "kind": "asset", "currency": "EUR" }));
     s.call("import.create_profile", profile("Monzo", 1));
-    let mut in_euros = profile("Wise", 2);
-    in_euros["currency"] = json!("EUR");
-    s.call("import.create_profile", in_euros);
+    s.call("import.create_profile", profile("Wise", 2));
 
     let tesco = "Date,Description,Amount\n01/08/2026,TESCO STORES 3345,-42.15\n";
     let hotel = "Date,Description,Amount\n10/08/2026,HOTEL,-80.00\n";
@@ -3305,4 +3305,40 @@ fn a_line_nobody_categorised_waits_in_the_bucket_for_its_own_currency() {
     assert_eq!(b.as_array().unwrap().len(), 4, "no second EUR bucket: {b}");
     assert_eq!(out.ok(check)["ok"], true);
     assert_eq!(out.err(squat).0, "reserved_name");
+}
+
+/// A statement is in the currency of the account it is a statement of. A profile used to read its
+/// file as GBP unless told otherwise, and the import screen never tells it: every line of a
+/// statement for a EUR or JPY account was staged as GBP, and no commit can write that.
+#[test]
+fn a_profile_reads_its_file_in_the_currency_of_the_account_it_lands_in() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.call("account.create", json!({ "name": "Yen pot", "kind": "asset", "currency": "JPY" }));
+    s.call("import.create_profile", profile("Monzo", 1));
+    s.call("import.create_profile", profile("Yen card", 2));
+    // Said outright, a currency is kept: an export can be in something its account is not.
+    let mut as_dollars = profile("Yen card, dollar export", 2);
+    as_dollars["currency"] = json!("USD");
+    s.call("import.create_profile", as_dollars);
+    let nowhere = s.call("import.create_profile", profile("Lost", 99));
+    let profiles = s.call("import.profiles", json!({}));
+
+    // The scale comes with the currency: the yen has no minor unit, so 1500 is 1500 and not 150000.
+    let ramen = "Date,Description,Amount\n12/08/2026,RAMEN,-1500\n";
+    s.call("import.stage", json!({ "profile_id": 2, "csv": ramen }));
+    let committed = s.call("import.commit", json!({ "batch_id": 1 }));
+    let balances = s.call("account.balances", json!({}));
+    let out = s.run();
+
+    let (code, msg) = out.err(nowhere);
+    assert!(code == "not_found" && msg.contains("no such account: 99"), "{code}: {msg}");
+    let reads: Vec<(&str, &str)> = out.ok(profiles).as_array().unwrap().iter()
+        .map(|p| (p["name"].as_str().unwrap(), p["currency"].as_str().unwrap()))
+        .collect();
+    assert_eq!(reads, vec![("Monzo", "GBP"), ("Yen card", "JPY"), ("Yen card, dollar export", "USD")]);
+
+    assert_eq!(out.ok(committed)["created"], 1);
+    let b = out.ok(balances);
+    assert_eq!((balance(b, "Yen pot"), balance(b, "Expenses:Unclassified (JPY)")), (-1500, 1500));
 }
