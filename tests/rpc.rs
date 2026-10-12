@@ -3018,3 +3018,106 @@ fn the_brief_names_the_account_a_changed_rule_pays_from_now() {
     let rent = rows.iter().find(|r| r["description"] == "Rent").unwrap();
     assert_eq!(rent["account"], "Joint", "{rent}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Importing a bank statement (import.*)
+// ---------------------------------------------------------------------------------------------
+
+const STATEMENT: &str = "\
+Date,Description,Amount
+01/08/2026,TESCO STORES 3345,-42.15
+02/08/2026,SALARY ACME LTD,2500.00
+03/08/2026,NETFLIX.COM,-10.99
+04/08/2026,CARD PAYMENT 4412,-7.50
+";
+
+/// What an `account.balances` reply says the account called `name` holds.
+fn balance(balances: &Value, name: &str) -> i64 {
+    balances
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == name)
+        .unwrap_or_else(|| panic!("no account {name} in {balances}"))["balance_minor"]
+        .as_i64()
+        .unwrap()
+}
+
+/// The importer's unit tests call `stage`, `commit` and `revert` directly, on a book with nothing
+/// else in it. This is the same promise through the methods the review screen calls, in a book that
+/// already holds a payment entered by hand: a statement writes nothing until it is committed, the
+/// review decides what the commit writes, and a revert takes back that batch and nothing else.
+#[test]
+fn a_statement_is_reviewed_before_it_reaches_the_book_and_a_revert_takes_back_only_what_it_wrote() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.account("Groceries", "expense");
+    s.account("Salary", "income");
+    s.account("Subscriptions", "expense");
+    // Already in the book by hand, so the statement's own Netflix line would pay it a second time.
+    s.call("txn.create", json!({ "occurred_on": "2026-08-03", "description": "Netflix", "postings": [
+        { "account_id": 1, "amount_minor": -1099 }, { "account_id": 4, "amount_minor": 1099 } ] }));
+    s.call("import.create_profile", json!({ "name": "Monzo", "date_format": "%d/%m/%Y", "account_id": 1,
+        "mapping": { "date": "Date", "amount": "Amount", "description": "Description" } }));
+    s.call("import.create_rule", json!({ "name": "Tesco", "pattern": "tesco", "sign": -1,
+                                         "set_far_account_id": 2 }));
+
+    let statement = json!({ "profile_id": 1, "source_name": "august.csv", "csv": STATEMENT });
+    let staged = s.call("import.stage", statement.clone());
+    let before_commit = s.call("txn.list", json!({}));
+    let categorised = s.call("import.categorise", json!({ "batch_id": 1 }));
+    // The review. The salary is filed by hand, the Netflix line is unticked, and the card payment
+    // is left for the importer to file wherever it files what nobody categorised.
+    s.call("import.set_row", json!({ "id": 2, "far_account_id": 3 }));
+    s.call("import.set_row", json!({ "id": 3, "accepted": false }));
+    let reviewed = s.call("import.rows", json!({ "batch_id": 1 }));
+    let committed = s.call("import.commit", json!({ "batch_id": 1 }));
+    let after_commit = s.call("account.balances", json!({}));
+    let check_committed = s.call("db.check", json!({}));
+    let twice = s.call("import.commit", json!({ "batch_id": 1 }));
+
+    let reverted = s.call("import.revert", json!({ "batch_id": 1 }));
+    let after_revert = s.call("account.balances", json!({}));
+    let left = s.call("txn.list", json!({}));
+    let check_reverted = s.call("db.check", json!({}));
+    let again = s.call("import.stage", statement);
+    let batches = s.call("import.batches", json!({}));
+    let out = s.run();
+
+    assert_eq!(out.ok(staged), &json!({ "batch_id": 1, "rows": 4, "new": 4, "duplicates": 0, "errors": 0 }));
+    assert_eq!(out.ok(before_commit).as_array().unwrap().len(), 1, "staging writes nothing to the book");
+    assert_eq!(out.ok(categorised)["matched"], 1, "only the Tesco line has a rule");
+
+    let rows = out.ok(reviewed).as_array().unwrap();
+    let far: Vec<Option<&str>> = rows.iter().map(|r| r["far_account"].as_str()).collect();
+    assert_eq!(far, vec![Some("Groceries"), Some("Salary"), None, None]);
+    let accepted: Vec<Option<bool>> = rows.iter().map(|r| r["accepted"].as_bool()).collect();
+    assert_eq!(accepted, vec![Some(true), Some(true), Some(false), Some(true)]);
+
+    assert_eq!(out.ok(committed)["created"], 3, "the unticked line is not written");
+    let b = out.ok(after_commit);
+    assert_eq!(balance(b, "Current"), -1099 - 4215 + 250_000 - 750);
+    assert_eq!(balance(b, "Groceries"), 4215, "filed by the rule");
+    assert_eq!(balance(b, "Salary"), -250_000, "filed by hand");
+    assert_eq!(balance(b, "Subscriptions"), 1099, "Netflix was paid once, not twice");
+    assert_eq!(balance(b, "Expenses:Unclassified"), 750, "the line nobody categorised is still visible");
+    assert_eq!(out.ok(check_committed)["ok"], true);
+    assert_eq!(out.err(twice).0, "already_committed", "a second commit must not write the statement again");
+
+    assert_eq!(out.ok(reverted)["removed"], 3);
+    let b = out.ok(after_revert);
+    assert_eq!((balance(b, "Current"), balance(b, "Subscriptions")), (-1099, 1099), "the hand entry stays");
+    for emptied in ["Groceries", "Salary", "Expenses:Unclassified"] {
+        assert_eq!(balance(b, emptied), 0, "{emptied} holds nothing the statement put there");
+    }
+    let left = out.ok(left).as_array().unwrap();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0]["description"], "Netflix");
+    assert_eq!(out.ok(check_reverted)["ok"], true);
+
+    // The revert gave the import keys back with the payments, so the same file is new again.
+    assert_eq!(out.ok(again), &json!({ "batch_id": 2, "rows": 4, "new": 4, "duplicates": 0, "errors": 0 }));
+    let states: Vec<(Option<i64>, Option<&str>)> = out.ok(batches).as_array().unwrap().iter()
+        .map(|b| (b["id"].as_i64(), b["state"].as_str())).collect();
+    assert_eq!(states, vec![(Some(2), Some("staged")), (Some(1), Some("reverted"))]);
+}
