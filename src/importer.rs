@@ -18,6 +18,7 @@
 
 use rusqlite::Connection;
 
+use crate::entry::{EntryError, NewPosting, NewTxn};
 use crate::money::{parse_minor, Minor};
 
 #[derive(Debug)]
@@ -28,6 +29,8 @@ pub enum ImportError {
     NoBatch(i64),
     BadMapping(String),
     AlreadyCommitted(i64),
+    /// A ticked row the ledger would refuse. The message names the line and says why.
+    RowRefused(String),
 }
 
 impl std::fmt::Display for ImportError {
@@ -39,6 +42,7 @@ impl std::fmt::Display for ImportError {
             ImportError::NoBatch(id) => write!(f, "no such import batch: {id}"),
             ImportError::BadMapping(m) => write!(f, "bad mapping: {m}"),
             ImportError::AlreadyCommitted(id) => write!(f, "batch {id} is already committed"),
+            ImportError::RowRefused(m) => write!(f, "{m}"),
         }
     }
 }
@@ -363,8 +367,20 @@ pub fn categorise(conn: &mut Connection, batch_id: i64) -> Result<usize, ImportE
     Ok(hits)
 }
 
+#[derive(Debug)]
+pub struct CommitReport {
+    pub created: usize,
+    /// Ticked rows left out because another batch put the same line in the book after this one
+    /// was staged.
+    pub duplicates: usize,
+}
+
 /// Turn accepted rows into real transactions. Rows with no far account go to `Expenses:Unclassified`.
-pub fn commit(conn: &mut Connection, batch_id: i64) -> Result<usize, ImportError> {
+///
+/// ALL OR NOTHING. A ticked row the ledger refuses stops the whole commit and names its line, so
+/// nothing reaches the book until the review has dealt with it -- unticked it, or filed it somewhere
+/// it can go.
+pub fn commit(conn: &mut Connection, batch_id: i64) -> Result<CommitReport, ImportError> {
     let state: String = conn
         .query_row("SELECT state FROM import_batch WHERE id=?1", [batch_id], |r| r.get(0))
         .map_err(|_| ImportError::NoBatch(batch_id))?;
@@ -372,12 +388,13 @@ pub fn commit(conn: &mut Connection, batch_id: i64) -> Result<usize, ImportError
         return Err(ImportError::AlreadyCommitted(batch_id));
     }
 
-    let unclassified = unclassified_account(conn)?;
-    // (id, account_id, occurred_on, description, payee, amount, currency, far_account_id, fingerprint)
-    type Accepted = (i64, i64, String, String, Option<String>, Minor, String, Option<i64>, Option<String>);
+    // (id, line_no, account_id, occurred_on, description, payee, amount, currency, far_account_id,
+    //  fingerprint)
+    type Accepted =
+        (i64, i64, i64, String, String, Option<String>, Minor, String, Option<i64>, Option<String>);
     let rows: Vec<Accepted> =
         conn.prepare(
-            "SELECT id, account_id, occurred_on, description, payee, amount_minor, currency,
+            "SELECT id, line_no, account_id, occurred_on, description, payee, amount_minor, currency,
                     far_account_id, fingerprint
                FROM import_row
               WHERE batch_id = ?1 AND accepted = 1 AND state IN ('new','matched')
@@ -387,29 +404,79 @@ pub fn commit(conn: &mut Connection, batch_id: i64) -> Result<usize, ImportError
         .query_map([batch_id], |r| {
             Ok((
                 r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
-                r.get(7)?, r.get(8)?,
+                r.get(7)?, r.get(8)?, r.get(9)?,
             ))
         })?
         .collect::<Result<_, _>>()?;
 
     let tx = conn.transaction()?;
-    let mut n = 0;
-    for (row_id, account_id, on, desc, payee, amount, currency, far, fp) in rows {
-        let far = far.unwrap_or(unclassified);
-        tx.execute(
-            "INSERT INTO txn(occurred_on, description, payee, source) VALUES(?1,?2,?3,'import')",
-            rusqlite::params![on, desc, payee],
-        )?;
-        let txn_id = tx.last_insert_rowid();
-        let far_currency: String =
-            tx.query_row("SELECT currency FROM account WHERE id=?1", [far], |r| r.get(0))?;
-        {
-            let mut st = tx.prepare(
-                "INSERT INTO posting(txn_id, account_id, currency, amount_minor) VALUES(?1,?2,?3,?4)",
-            )?;
-            st.execute(rusqlite::params![txn_id, account_id, currency, amount])?;
-            st.execute(rusqlite::params![txn_id, far, far_currency, -amount])?;
+    // Resolved inside the transaction, so a refused commit does not leave an empty bucket behind.
+    let unclassified = unclassified_account(&tx)?;
+    let mut report = CommitReport { created: 0, duplicates: 0 };
+    for (row_id, line_no, account_id, on, desc, payee, amount, currency, far, fp) in rows {
+        // Staging compared this row with the book as it was THEN. The same export staged twice
+        // shows every line as new both times, and the second commit would write them all again --
+        // `INSERT OR IGNORE` below hides the key collision, and a doubled statement still balances.
+        // So the question is asked again here, where the write happens. Only ANOTHER batch's key
+        // counts: two identical lines in one file are two payments, and the first has just taken
+        // the key.
+        if let Some(fp) = &fp {
+            if let Ok(existing) = tx.query_row(
+                "SELECT txn_id FROM txn_import_key
+                  WHERE account_id = ?1 AND fingerprint = ?2 AND batch_id <> ?3",
+                rusqlite::params![account_id, fp, batch_id],
+                |r| r.get::<_, i64>(0),
+            ) {
+                tx.execute(
+                    "UPDATE import_row SET state='duplicate', dup_of_txn_id=?2, accepted=0 WHERE id=?1",
+                    rusqlite::params![row_id, existing],
+                )?;
+                report.duplicates += 1;
+                continue;
+            }
         }
+
+        let far = far.unwrap_or(unclassified);
+        let line =
+            if desc.is_empty() { format!("line {line_no}") } else { format!("line {line_no} ({desc})") };
+        // A posting is in its account's currency, so both sides of a row have to hold the currency
+        // the row is in. Checked here rather than left to `create_from`, which would refuse the far
+        // side as unbalanced without saying which line, and could not see the near side at all: it
+        // takes the currency from the account and would post a GBP amount as EUR.
+        let holds = |id: i64| {
+            tx.query_row("SELECT currency, name FROM account WHERE id = ?1", [id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+        };
+        let (near_currency, near_name) = holds(account_id)?;
+        if near_currency != currency {
+            return Err(ImportError::RowRefused(format!(
+                "{line} is in {currency}, but it is being imported into {near_name}, which holds {near_currency}"
+            )));
+        }
+        let (far_currency, far_name) = holds(far)?;
+        if far_currency != currency {
+            return Err(ImportError::RowRefused(format!(
+                "{line} is in {currency}, but it would be filed under {far_name}, which holds {far_currency}"
+            )));
+        }
+
+        let new = NewTxn {
+            occurred_on: on,
+            description: desc,
+            payee,
+            note: None,
+            postings: vec![
+                NewPosting { account_id, amount_minor: amount },
+                NewPosting { account_id: far, amount_minor: -amount },
+            ],
+            series_id: None,
+            occurrence_on: None,
+        };
+        let txn_id = crate::entry::create_from(&tx, &new, "import").map_err(|e| match e {
+            EntryError::Sql(e) => ImportError::Sql(e),
+            other => ImportError::RowRefused(format!("{line}: {other}")),
+        })?;
         if let Some(fp) = fp {
             tx.execute(
                 "INSERT OR IGNORE INTO txn_import_key(txn_id, account_id, fingerprint, batch_id, line_no)
@@ -421,14 +488,14 @@ pub fn commit(conn: &mut Connection, batch_id: i64) -> Result<usize, ImportError
             "UPDATE import_row SET state='committed', txn_id=?2 WHERE id=?1",
             rusqlite::params![row_id, txn_id],
         )?;
-        n += 1;
+        report.created += 1;
     }
     tx.execute(
         "UPDATE import_batch SET state='committed', committed_at=datetime('now') WHERE id=?1",
         [batch_id],
     )?;
     tx.commit()?;
-    Ok(n)
+    Ok(report)
 }
 
 /// Let go of a transaction that is about to be deleted: every staged row set aside as a duplicate
@@ -567,7 +634,7 @@ Date,Description,Amount,Category
     fn committing_creates_balanced_transactions() {
         let mut c = book();
         let rep = stage(&mut c, 1, "monzo.csv", MONZO).unwrap();
-        let n = commit(&mut c, rep.batch_id).unwrap();
+        let n = commit(&mut c, rep.batch_id).unwrap().created;
         assert_eq!(n, 3);
         let report = crate::db::integrity(&c).unwrap();
         assert_eq!(report["ok"], serde_json::json!(true), "{report}");
@@ -592,7 +659,7 @@ Date,Description,Amount,Category
         let second = stage(&mut c, 1, "monzo.csv", MONZO).unwrap();
         assert_eq!(second.duplicates, 3, "every row is already in the book");
         assert_eq!(second.new_rows, 0);
-        let n = commit(&mut c, second.batch_id).unwrap();
+        let n = commit(&mut c, second.batch_id).unwrap().created;
         assert_eq!(n, 0, "a duplicate row is not accepted, so nothing is written");
         let total: i64 = c.query_row("SELECT COUNT(*) FROM txn", [], |r| r.get(0)).unwrap();
         assert_eq!(total, 3, "still just the three original transactions");
@@ -627,6 +694,31 @@ Date,Description,Amount,Category
         // and because the import keys went too, the file can be imported again
         let again = stage(&mut c, 1, "monzo.csv", MONZO).unwrap();
         assert_eq!(again.new_rows, 3);
+    }
+
+    #[test]
+    fn a_row_filed_under_a_system_account_is_refused_as_a_hand_typed_payment_would_be() {
+        let mut c = book();
+        c.execute_batch(
+            "INSERT INTO account(id,name,kind,currency,system)
+               VALUES(4,'Conversion:GBP','conversion','GBP',1);",
+        )
+        .unwrap();
+        let rep = stage(&mut c, 1, "monzo.csv", MONZO).unwrap();
+        c.execute(
+            "UPDATE import_row SET far_account_id = 4 WHERE batch_id = ?1 AND line_no = 3",
+            [rep.batch_id],
+        )
+        .unwrap();
+        match commit(&mut c, rep.batch_id) {
+            Err(ImportError::RowRefused(msg)) => {
+                assert!(msg.contains("line 3 (NETFLIX.COM)") && msg.contains("system account"), "{msg}")
+            }
+            other => panic!("expected the row to be refused, got {other:?}"),
+        }
+        // refused whole: the two good rows ahead of it were not written either
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM txn", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

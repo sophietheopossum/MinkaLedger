@@ -161,6 +161,7 @@ impl From<importer::ImportError> for Error {
             I::NoBatch(_) => "no_batch",
             I::BadMapping(_) => "bad_mapping",
             I::AlreadyCommitted(_) => "already_committed",
+            I::RowRefused(_) => "row_refused",
             I::Csv(_) => "csv",
             I::Sql(_) => "sql",
         };
@@ -1753,7 +1754,8 @@ fn dispatch(
         }
         "import.commit" => {
             let b = params.get("batch_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("batch_id"))?;
-            Ok(serde_json::json!({ "created": importer::commit(conn, b)? }))
+            let rep = importer::commit(conn, b)?;
+            Ok(serde_json::json!({ "created": rep.created, "duplicates": rep.duplicates }))
         }
         "import.revert" => {
             let b = params.get("batch_id").and_then(|v| v.as_i64()).ok_or_else(|| bad("batch_id"))?;

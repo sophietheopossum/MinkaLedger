@@ -220,6 +220,13 @@ pub fn create(conn: &mut Connection, new: &NewTxn) -> Result<i64, EntryError> {
 
 /// `create` without the transaction, for callers that write several transactions as one unit.
 fn create_in(tx: &Transaction, new: &NewTxn) -> Result<i64, EntryError> {
+    create_from(tx, new, "manual")
+}
+
+/// `create_in` under another `source`, for the importer: a line of a bank statement is refused for
+/// exactly what a hand-typed payment is refused for. The importer used to insert its own postings,
+/// which let a line filed under an account in another currency into the book unbalanced.
+pub(crate) fn create_from(tx: &Transaction, new: &NewTxn, source: &str) -> Result<i64, EntryError> {
     if new.postings.len() < 2 {
         return Err(EntryError::TooFewPostings);
     }
@@ -231,11 +238,12 @@ fn create_in(tx: &Transaction, new: &NewTxn) -> Result<i64, EntryError> {
 
     tx.execute(
         "INSERT INTO txn(occurred_on, description, payee, source, note, series_id, occurrence_on)
-         VALUES(?1, ?2, ?3, 'manual', ?4, ?5, ?6)",
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             new.occurred_on,
             new.description,
             new.payee,
+            source,
             new.note,
             new.series_id,
             new.occurrence_on

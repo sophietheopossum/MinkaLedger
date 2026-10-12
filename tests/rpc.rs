@@ -3043,6 +3043,13 @@ fn balance(balances: &Value, name: &str) -> i64 {
         .unwrap()
 }
 
+/// A profile for a `Date,Description,Amount` export landing in account `into`. It names no
+/// currency, so it reads the file as GBP -- which is the profile the import screen creates.
+fn profile(name: &str, into: i64) -> Value {
+    json!({ "name": name, "date_format": "%d/%m/%Y", "account_id": into,
+            "mapping": { "date": "Date", "amount": "Amount", "description": "Description" } })
+}
+
 /// The importer's unit tests call `stage`, `commit` and `revert` directly, on a book with nothing
 /// else in it. This is the same promise through the methods the review screen calls, in a book that
 /// already holds a payment entered by hand: a statement writes nothing until it is committed, the
@@ -3057,8 +3064,7 @@ fn a_statement_is_reviewed_before_it_reaches_the_book_and_a_revert_takes_back_on
     // Already in the book by hand, so the statement's own Netflix line would pay it a second time.
     s.call("txn.create", json!({ "occurred_on": "2026-08-03", "description": "Netflix", "postings": [
         { "account_id": 1, "amount_minor": -1099 }, { "account_id": 4, "amount_minor": 1099 } ] }));
-    s.call("import.create_profile", json!({ "name": "Monzo", "date_format": "%d/%m/%Y", "account_id": 1,
-        "mapping": { "date": "Date", "amount": "Amount", "description": "Description" } }));
+    s.call("import.create_profile", profile("Monzo", 1));
     s.call("import.create_rule", json!({ "name": "Tesco", "pattern": "tesco", "sign": -1,
                                          "set_far_account_id": 2 }));
 
@@ -3139,8 +3145,7 @@ fn review_of(rows: &Value) -> Vec<(&str, bool)> {
 fn an_overlapping_statement_awaiting_review_does_not_pin_the_payments_it_repeats() {
     let mut s = Script::new();
     s.account("Current", "asset");
-    s.call("import.create_profile", json!({ "name": "Monzo", "date_format": "%d/%m/%Y", "account_id": 1,
-        "mapping": { "date": "Date", "amount": "Amount", "description": "Description" } }));
+    s.call("import.create_profile", profile("Monzo", 1));
     s.call("import.stage", json!({ "profile_id": 1, "source_name": "august.csv", "csv": STATEMENT }));
     s.call("import.commit", json!({ "batch_id": 1 }));
     let overlapping = format!("{STATEMENT}05/08/2026,COFFEE,-3.50\n");
@@ -3169,4 +3174,91 @@ fn an_overlapping_statement_awaiting_review_does_not_pin_the_payments_it_repeats
     assert_eq!(out.ok(committed)["created"], 5);
     assert_eq!(balance(out.ok(balances), "Current"), -4215 + 250_000 - 1099 - 750 - 350);
     assert_eq!(out.ok(check)["ok"], true);
+}
+
+/// A row is compared with the book when its file is STAGED, and the book can move before the
+/// commit: the same export staged twice shows every line as new both times. Both batches used to
+/// commit in full, and a statement counted twice still balances, so `db.check` had nothing to say.
+#[test]
+fn a_statement_staged_twice_reaches_the_book_once() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.call("import.create_profile", profile("Monzo", 1));
+    let statement = json!({ "profile_id": 1, "source_name": "august.csv", "csv": STATEMENT });
+    let first = s.call("import.stage", statement.clone());
+    let second = s.call("import.stage", statement);
+    let commit_first = s.call("import.commit", json!({ "batch_id": 1 }));
+    let commit_second = s.call("import.commit", json!({ "batch_id": 2 }));
+    let second_rows = s.call("import.rows", json!({ "batch_id": 2 }));
+    let balances = s.call("account.balances", json!({}));
+    // Two identical lines in ONE file are a different thing: two coffees on the same day are two
+    // payments, and the first taking the import key must not make a duplicate of the second.
+    let coffees = "Date,Description,Amount\n06/08/2026,COFFEE,-3.50\n06/08/2026,COFFEE,-3.50\n";
+    s.call("import.stage", json!({ "profile_id": 1, "source_name": "coffees.csv", "csv": coffees }));
+    let commit_pair = s.call("import.commit", json!({ "batch_id": 3 }));
+    let after_pair = s.call("account.balances", json!({}));
+    let out = s.run();
+
+    for staged in [first, second] {
+        assert_eq!(out.ok(staged)["new"], 4, "nothing is in the book yet, so both look new");
+    }
+    assert_eq!(out.ok(commit_first), &json!({ "created": 4, "duplicates": 0 }));
+    assert_eq!(out.ok(commit_second), &json!({ "created": 0, "duplicates": 4 }));
+    assert_eq!(review_of(out.ok(second_rows)), vec![("duplicate", false); 4], "and the review says why");
+    let once = -4215 + 250_000 - 1099 - 750;
+    assert_eq!(balance(out.ok(balances), "Current"), once);
+
+    assert_eq!(out.ok(commit_pair), &json!({ "created": 2, "duplicates": 0 }));
+    assert_eq!(balance(out.ok(after_pair), "Current"), once - 350 - 350);
+}
+
+/// A posting is in its account's currency, so a statement line whose two sides hold different
+/// currencies cannot balance. The importer wrote it anyway: a GBP line filed under a EUR account
+/// went in as the same number on both sides, and so did every uncategorised line of a statement in
+/// anything but the display currency. Each is refused whole instead, naming the line.
+#[test]
+fn a_statement_line_is_never_written_across_currencies() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.call("account.create", json!({ "name": "Euro pot", "kind": "asset", "currency": "EUR" }));
+    s.account("Holidays", "expense");
+    s.call("import.create_profile", profile("Monzo", 1));
+    let august = "Date,Description,Amount\n01/08/2026,TESCO STORES 3345,-42.15\n09/08/2026,HOLIDAY CASH,-100.00\n";
+    s.call("import.stage", json!({ "profile_id": 1, "csv": august }));
+    s.call("import.set_row", json!({ "id": 2, "far_account_id": 2 }));
+    let refused = s.call("import.commit", json!({ "batch_id": 1 }));
+    let written = s.call("txn.list", json!({}));
+    // Filed under an account that holds what the line is in, the same batch goes through.
+    s.call("import.set_row", json!({ "id": 2, "far_account_id": 3 }));
+    let committed = s.call("import.commit", json!({ "batch_id": 1 }));
+    let balances = s.call("account.balances", json!({}));
+
+    let hotel = "Date,Description,Amount\n10/08/2026,HOTEL,-80.00\n";
+    // The near side: a profile that reads GBP, landing in an account that holds EUR.
+    s.call("import.create_profile", profile("Wise", 2));
+    s.call("import.stage", json!({ "profile_id": 2, "csv": hotel }));
+    let near = s.call("import.commit", json!({ "batch_id": 2 }));
+    // And the bucket for what nobody categorised, which holds the display currency and no other.
+    let mut in_euros = profile("Wise in euros", 2);
+    in_euros["currency"] = json!("EUR");
+    s.call("import.create_profile", in_euros);
+    s.call("import.stage", json!({ "profile_id": 3, "csv": hotel }));
+    let bucket = s.call("import.commit", json!({ "batch_id": 3 }));
+    let check = s.call("db.check", json!({}));
+    let out = s.run();
+
+    let (code, msg) = out.err(refused);
+    assert_eq!(code, "row_refused");
+    assert!(msg.contains("line 2 (HOLIDAY CASH) is in GBP") && msg.contains("Euro pot, which holds EUR"), "{msg}");
+    assert_eq!(out.ok(written), &json!([]), "refused whole: the Tesco line was not written either");
+
+    assert_eq!(out.ok(committed)["created"], 2);
+    let b = out.ok(balances);
+    assert_eq!((balance(b, "Current"), balance(b, "Holidays")), (-4215 - 10_000, 10_000));
+
+    let (code, msg) = out.err(near);
+    assert!(code == "row_refused" && msg.contains("imported into Euro pot, which holds EUR"), "{code}: {msg}");
+    let (code, msg) = out.err(bucket);
+    assert!(code == "row_refused" && msg.contains("Expenses:Unclassified, which holds GBP"), "{code}: {msg}");
+    assert_eq!(out.ok(check)["ok"], true, "nothing unbalanced reached the book by any of the three routes");
 }
