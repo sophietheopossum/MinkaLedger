@@ -691,12 +691,16 @@ pub fn record_occurrence(conn: &mut Connection, ask: &RecordOccurrence) -> Resul
     Ok(written)
 }
 
-/// Delete a transaction. Postings go with it via ON DELETE CASCADE.
-pub fn delete(conn: &Connection, id: i64) -> Result<(), EntryError> {
-    let n = conn.execute("DELETE FROM txn WHERE id = ?1", [id])?;
+/// Delete a transaction. Postings go with it via ON DELETE CASCADE. A staged import row set aside
+/// as a duplicate of it has no such clause and would block the delete, so it is released first.
+pub fn delete(conn: &mut Connection, id: i64) -> Result<(), EntryError> {
+    let tx = conn.transaction()?;
+    crate::importer::release_duplicates_of(&tx, id)?;
+    let n = tx.execute("DELETE FROM txn WHERE id = ?1", [id])?;
     if n == 0 {
         return Err(EntryError::NotFound(id));
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1208,13 +1212,13 @@ mod tests {
     fn delete_removes_postings_too() {
         let mut c = book();
         let id = create(&mut c, &txn(vec![p(1, 100), p(2, -100)])).unwrap();
-        delete(&c, id).unwrap();
+        delete(&mut c, id).unwrap();
         assert!(matches!(get(&c, id), Err(EntryError::NotFound(_))));
         let n: i64 = c
             .query_row("SELECT count(*) FROM posting WHERE txn_id = ?1", [id], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0, "postings must cascade");
-        assert!(matches!(delete(&c, id), Err(EntryError::NotFound(_))));
+        assert!(matches!(delete(&mut c, id), Err(EntryError::NotFound(_))));
     }
 
     #[test]

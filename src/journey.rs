@@ -348,7 +348,7 @@ mod tests {
         let j = create(&c, "j", "2026-08-01").unwrap();
         let t = pay(&mut c, "2026-08-01", "x", &[(1, -100), (2, 100)]);
         attach(&c, j, t, 1, "leg").unwrap();
-        entry::delete(&c, t).unwrap();
+        entry::delete(&mut c, t).unwrap();
         // ON DELETE CASCADE on journey_member.txn_id -- no dangling membership
         assert_eq!(get(&c, j).unwrap()["legs"].as_array().unwrap().len(), 0);
     }

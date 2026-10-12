@@ -431,6 +431,26 @@ pub fn commit(conn: &mut Connection, batch_id: i64) -> Result<usize, ImportError
     Ok(n)
 }
 
+/// Let go of a transaction that is about to be deleted: every staged row set aside as a duplicate
+/// OF it becomes new again, which is what staging the same file afresh would now call it.
+///
+/// `import_row.dup_of_txn_id` references `txn` with no ON DELETE action, so one such row is enough
+/// for the database to refuse the delete. That row appears as soon as an overlapping statement is
+/// STAGED -- the ordinary monthly export -- and unless this runs first, neither `txn.delete` nor
+/// `import.revert` can remove a payment the newer file also lists.
+///
+/// The row is ticked again as well as relabelled, as `stage` ticks whatever it finds new. Left
+/// unticked, committing the newer batch after reverting the older one would skip lines that are no
+/// longer in the book.
+pub fn release_duplicates_of(conn: &Connection, txn_id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE import_row SET dup_of_txn_id = NULL, state = 'new', accepted = 1
+          WHERE dup_of_txn_id = ?1",
+        [txn_id],
+    )?;
+    Ok(())
+}
+
 /// Undo exactly what a batch created. The ledger returns to its previous state.
 pub fn revert(conn: &mut Connection, batch_id: i64) -> Result<usize, ImportError> {
     let ids: Vec<i64> = conn
@@ -439,6 +459,7 @@ pub fn revert(conn: &mut Connection, batch_id: i64) -> Result<usize, ImportError
         .collect::<Result<_, _>>()?;
     let tx = conn.transaction()?;
     for id in &ids {
+        release_duplicates_of(&tx, *id)?;
         // postings and txn_import_key both cascade from txn
         tx.execute("DELETE FROM txn WHERE id = ?1", [id])?;
     }

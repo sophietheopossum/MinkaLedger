@@ -3121,3 +3121,52 @@ fn a_statement_is_reviewed_before_it_reaches_the_book_and_a_revert_takes_back_on
         .map(|b| (b["id"].as_i64(), b["state"].as_str())).collect();
     assert_eq!(states, vec![(Some(2), Some("staged")), (Some(1), Some("reverted"))]);
 }
+
+/// (state, accepted) of every row of a staged batch, in file order.
+fn review_of(rows: &Value) -> Vec<(&str, bool)> {
+    rows.as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["state"].as_str().unwrap(), r["accepted"].as_bool().unwrap()))
+        .collect()
+}
+
+/// Next month's export overlaps this month's, so the lines already in the book are staged as
+/// duplicates, each pointing at the payment it repeats. That pointer is a foreign key with no ON
+/// DELETE action: merely STAGING the newer file used to make every payment it repeated impossible
+/// to delete or revert, with nothing but "FOREIGN KEY constraint failed" to say why.
+#[test]
+fn an_overlapping_statement_awaiting_review_does_not_pin_the_payments_it_repeats() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.call("import.create_profile", json!({ "name": "Monzo", "date_format": "%d/%m/%Y", "account_id": 1,
+        "mapping": { "date": "Date", "amount": "Amount", "description": "Description" } }));
+    s.call("import.stage", json!({ "profile_id": 1, "source_name": "august.csv", "csv": STATEMENT }));
+    s.call("import.commit", json!({ "batch_id": 1 }));
+    let overlapping = format!("{STATEMENT}05/08/2026,COFFEE,-3.50\n");
+    let staged = s.call("import.stage", json!({ "profile_id": 1, "source_name": "september.csv",
+                                                "csv": overlapping }));
+
+    // The Tesco payment, which the second file's first line repeats.
+    let deleted = s.call("txn.delete", json!({ "id": 1 }));
+    let after_delete = s.call("import.rows", json!({ "batch_id": 2 }));
+    let reverted = s.call("import.revert", json!({ "batch_id": 1 }));
+    let after_revert = s.call("import.rows", json!({ "batch_id": 2 }));
+    let committed = s.call("import.commit", json!({ "batch_id": 2 }));
+    let balances = s.call("account.balances", json!({}));
+    let check = s.call("db.check", json!({}));
+    let out = s.run();
+
+    assert_eq!(out.ok(staged), &json!({ "batch_id": 2, "rows": 5, "new": 1, "duplicates": 4, "errors": 0 }));
+    assert_eq!(out.ok(deleted)["deleted"], 1);
+    // A line whose payment is gone is new again and ticked, as staging the file now would have it.
+    let (dup, new) = (("duplicate", false), ("new", true));
+    assert_eq!(review_of(out.ok(after_delete)), vec![new, dup, dup, dup, new]);
+    assert_eq!(out.ok(reverted)["removed"], 3, "the fourth payment was already deleted by hand");
+    assert_eq!(review_of(out.ok(after_revert)), vec![new; 5]);
+
+    // So the newer file can put back everything the revert took, each line once.
+    assert_eq!(out.ok(committed)["created"], 5);
+    assert_eq!(balance(out.ok(balances), "Current"), -4215 + 250_000 - 1099 - 750 - 350);
+    assert_eq!(out.ok(check)["ok"], true);
+}
