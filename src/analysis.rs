@@ -610,28 +610,27 @@ fn limits(
     // uncategorised, but the brief stopped saying so, and every category total it prints kept being
     // wrong by that much with nothing left to warn the reader. The account is also NAMED by whatever
     // it is called now, so the caveat points at something the operator can actually find.
-    let bucket = crate::roles::unclassified_existing(conn);
-    let unclassified: Vec<(String, Minor)> = match bucket.as_ref() {
-        // A book that has never imported anything has no bucket, which is an absence of
-        // uncategorised spend rather than a missing measurement.
-        None => Vec::new(),
-        Some((id, _)) => {
-            let mut st = conn.prepare(
-                "SELECT p.currency, SUM(p.amount_minor)
-                   FROM posting p JOIN txn t ON t.id = p.txn_id
-                  WHERE p.account_id = ?1 AND t.occurred_on >= ?2
-                  GROUP BY p.currency",
-            )?;
-            let rows = st
+    //
+    // One bucket per currency, each reported under its own name. A book that has never imported
+    // anything has none, which is an absence of uncategorised spend rather than a missing
+    // measurement.
+    let mut unclassified: Vec<(String, Minor, String)> = Vec::new();
+    {
+        let mut st = conn.prepare(
+            "SELECT p.currency, SUM(p.amount_minor)
+               FROM posting p JOIN txn t ON t.id = p.txn_id
+              WHERE p.account_id = ?1 AND t.occurred_on >= ?2
+              GROUP BY p.currency",
+        )?;
+        for (id, bucket_name) in crate::roles::unclassified_existing(conn)? {
+            let rows: Vec<(String, Minor)> = st
                 .query_map(rusqlite::params![id, window_from.to_string()], |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })?
                 .collect::<Result<_, _>>()?;
-            rows
+            unclassified.extend(rows.into_iter().map(|(cur, amount)| (cur, amount, bucket_name.clone())));
         }
-    };
-    let bucket_name =
-        bucket.map(|(_, n)| n).unwrap_or_else(|| crate::roles::UNCLASSIFIED_NAME.to_string());
+    }
     let mut st = conn.prepare(
         "SELECT p.currency, SUM(p.amount_minor)
            FROM posting p JOIN account a ON a.id = p.account_id
@@ -642,7 +641,7 @@ fn limits(
     let all_expense: HashMap<String, Minor> = st
         .query_map(rusqlite::params![window_from.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
-    for (cur, amount) in unclassified {
+    for (cur, amount, bucket_name) in unclassified {
         let total = *all_expense.get(&cur).unwrap_or(&0);
         let pct = if total != 0 { amount * 100 / total } else { 0 };
         add(
@@ -1195,8 +1194,10 @@ mod tests {
         }).unwrap();
         // The fixture builds the book at 0001 and inserts its accounts afterwards, so run the pin
         // backfill here -- which is exactly the order a real upgrade sees it in: db::migrate runs
-        // 0003 against a book whose accounts already exist, before any handler can rename one.
+        // 0003 against a book whose accounts already exist, before any handler can rename one, and
+        // 0005 then moves that pin under the key for the bucket's own currency.
         c.execute_batch(include_str!("../migrations/0003_role_account_pins.sql")).unwrap();
+        c.execute_batch(include_str!("../migrations/0005_unclassified_per_currency.sql")).unwrap();
         c.execute("UPDATE account SET name = 'Misc spending' WHERE id = 5", []).unwrap();
 
         let b = brief(&c, &opts("2026-08-15")).unwrap();
@@ -1209,6 +1210,33 @@ mod tests {
         // Named by what it is called NOW, or the caveat points at an account nobody can find.
         assert!(detail.contains("Misc spending"), "{detail}");
         assert!(!detail.contains("Expenses:Unclassified"), "{detail}");
+    }
+
+    #[test]
+    fn spending_with_no_category_is_reported_for_each_currency_under_its_own_bucket() {
+        let mut c = book();
+        let yen_bucket = crate::roles::unclassified(&c, "JPY").unwrap();
+        for (from, to, amount) in [(1, 5, 100_000), (6, yen_bucket, 5_000)] {
+            entry::create(&mut c, &NewTxn {
+                occurred_on: "2026-07-20".into(), description: "Card payment".into(),
+                payee: None, note: None,
+                postings: vec![NewPosting { account_id: from, amount_minor: -amount },
+                               NewPosting { account_id: to, amount_minor: amount }],
+                series_id: None,
+                occurrence_on: None,
+            }).unwrap();
+        }
+        let b = brief(&c, &opts("2026-08-15")).unwrap();
+        let details: Vec<&str> = b["limits"].as_array().unwrap().iter()
+            .filter(|l| l["limit"] == "spending that has no category")
+            .map(|l| l["detail"].as_str().unwrap())
+            .collect();
+        assert_eq!(details.len(), 2, "{details:?}");
+        // The fixture's bucket still has the bare name an older book created it with.
+        assert!(details.iter().any(|d| d.contains("1000.00 GBP") && d.contains("sits in Expenses:Unclassified.")),
+                "{details:?}");
+        assert!(details.iter().any(|d| d.contains("5000 JPY") && d.contains("Expenses:Unclassified (JPY)")),
+                "{details:?}");
     }
 
     #[test]

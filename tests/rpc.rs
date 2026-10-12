@@ -3106,14 +3106,14 @@ fn a_statement_is_reviewed_before_it_reaches_the_book_and_a_revert_takes_back_on
     assert_eq!(balance(b, "Groceries"), 4215, "filed by the rule");
     assert_eq!(balance(b, "Salary"), -250_000, "filed by hand");
     assert_eq!(balance(b, "Subscriptions"), 1099, "Netflix was paid once, not twice");
-    assert_eq!(balance(b, "Expenses:Unclassified"), 750, "the line nobody categorised is still visible");
+    assert_eq!(balance(b, "Expenses:Unclassified (GBP)"), 750, "the line nobody categorised is still visible");
     assert_eq!(out.ok(check_committed)["ok"], true);
     assert_eq!(out.err(twice).0, "already_committed", "a second commit must not write the statement again");
 
     assert_eq!(out.ok(reverted)["removed"], 3);
     let b = out.ok(after_revert);
     assert_eq!((balance(b, "Current"), balance(b, "Subscriptions")), (-1099, 1099), "the hand entry stays");
-    for emptied in ["Groceries", "Salary", "Expenses:Unclassified"] {
+    for emptied in ["Groceries", "Salary", "Expenses:Unclassified (GBP)"] {
         assert_eq!(balance(b, emptied), 0, "{emptied} holds nothing the statement put there");
     }
     let left = out.ok(left).as_array().unwrap();
@@ -3214,8 +3214,7 @@ fn a_statement_staged_twice_reaches_the_book_once() {
 
 /// A posting is in its account's currency, so a statement line whose two sides hold different
 /// currencies cannot balance. The importer wrote it anyway: a GBP line filed under a EUR account
-/// went in as the same number on both sides, and so did every uncategorised line of a statement in
-/// anything but the display currency. Each is refused whole instead, naming the line.
+/// went in as the same number on both sides. It is refused whole instead, naming the line.
 #[test]
 fn a_statement_line_is_never_written_across_currencies() {
     let mut s = Script::new();
@@ -3238,12 +3237,6 @@ fn a_statement_line_is_never_written_across_currencies() {
     s.call("import.create_profile", profile("Wise", 2));
     s.call("import.stage", json!({ "profile_id": 2, "csv": hotel }));
     let near = s.call("import.commit", json!({ "batch_id": 2 }));
-    // And the bucket for what nobody categorised, which holds the display currency and no other.
-    let mut in_euros = profile("Wise in euros", 2);
-    in_euros["currency"] = json!("EUR");
-    s.call("import.create_profile", in_euros);
-    s.call("import.stage", json!({ "profile_id": 3, "csv": hotel }));
-    let bucket = s.call("import.commit", json!({ "batch_id": 3 }));
     let check = s.call("db.check", json!({}));
     let out = s.run();
 
@@ -3258,7 +3251,58 @@ fn a_statement_line_is_never_written_across_currencies() {
 
     let (code, msg) = out.err(near);
     assert!(code == "row_refused" && msg.contains("imported into Euro pot, which holds EUR"), "{code}: {msg}");
-    let (code, msg) = out.err(bucket);
-    assert!(code == "row_refused" && msg.contains("Expenses:Unclassified, which holds GBP"), "{code}: {msg}");
-    assert_eq!(out.ok(check)["ok"], true, "nothing unbalanced reached the book by any of the three routes");
+    assert_eq!(out.ok(check)["ok"], true, "nothing unbalanced reached the book by either route");
+}
+
+/// What nobody categorised waits in a bucket, and a bucket can only balance a line in its own
+/// currency -- so there is one per currency, made the first time a statement needs it, as the
+/// opening-balance counterweights are. While the book had a single bucket in the display currency,
+/// an uncategorised line of a EUR statement went in as GBP on the far side and unbalanced the book.
+#[test]
+fn a_line_nobody_categorised_waits_in_the_bucket_for_its_own_currency() {
+    let mut s = Script::new();
+    s.account("Current", "asset");
+    s.call("account.create", json!({ "name": "Euro pot", "kind": "asset", "currency": "EUR" }));
+    s.call("import.create_profile", profile("Monzo", 1));
+    let mut in_euros = profile("Wise", 2);
+    in_euros["currency"] = json!("EUR");
+    s.call("import.create_profile", in_euros);
+
+    let tesco = "Date,Description,Amount\n01/08/2026,TESCO STORES 3345,-42.15\n";
+    let hotel = "Date,Description,Amount\n10/08/2026,HOTEL,-80.00\n";
+    let dinner = "Date,Description,Amount\n11/08/2026,DINNER,-30.00\n";
+    s.call("import.stage", json!({ "profile_id": 1, "csv": tesco }));
+    let pounds = s.call("import.commit", json!({ "batch_id": 1 }));
+    s.call("import.stage", json!({ "profile_id": 2, "csv": hotel }));
+    let euros = s.call("import.commit", json!({ "batch_id": 2 }));
+    let balances = s.call("account.balances", json!({}));
+    // A bucket is an ordinary account and can be called something friendlier. The next statement
+    // still finds it, rather than growing a second one beside it. (Account 4: the two she made,
+    // then the GBP bucket, then this one.)
+    let renamed = s.call("account.rename", json!({ "id": 4, "name": "Euro to-do" }));
+    s.call("import.stage", json!({ "profile_id": 2, "csv": dinner }));
+    let more_euros = s.call("import.commit", json!({ "batch_id": 3 }));
+    let after = s.call("account.balances", json!({}));
+    let check = s.call("db.check", json!({}));
+    // The name is the book's for every currency, including one it has never held.
+    let squat = s.call("account.create", json!({ "name": "Expenses:Unclassified (USD)", "kind": "expense" }));
+    let out = s.run();
+
+    for commit in [pounds, euros, more_euros] {
+        assert_eq!(out.ok(commit)["created"], 1);
+    }
+    let buckets: Vec<(&str, &str, i64)> = out.ok(balances).as_array().unwrap().iter()
+        .filter(|a| a["name"].as_str().unwrap().starts_with("Expenses:Unclassified"))
+        .map(|a| (a["name"].as_str().unwrap(), a["currency"].as_str().unwrap(),
+                  a["balance_minor"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(buckets, vec![("Expenses:Unclassified (EUR)", "EUR", 8000),
+                             ("Expenses:Unclassified (GBP)", "GBP", 4215)]);
+
+    out.ok(renamed);
+    let b = out.ok(after);
+    assert_eq!(balance(b, "Euro to-do"), 8000 + 3000, "found by its pin, under its new name");
+    assert_eq!(b.as_array().unwrap().len(), 4, "no second EUR bucket: {b}");
+    assert_eq!(out.ok(check)["ok"], true);
+    assert_eq!(out.err(squat).0, "reserved_name");
 }

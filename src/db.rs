@@ -16,6 +16,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0002_txn_link.sql"),
     include_str!("../migrations/0003_role_account_pins.sql"),
     include_str!("../migrations/0004_series_chain.sql"),
+    include_str!("../migrations/0005_unclassified_per_currency.sql"),
 ];
 
 pub fn current_version() -> i64 {

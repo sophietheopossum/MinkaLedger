@@ -12,9 +12,11 @@
 //! make both cases opaque and identical.
 //!
 //! THE FAR SIDE. A bank CSV tells you one side of each transaction. The other side is a guess, so
-//! every row lands against a single `Expenses:Unclassified` account unless an `import_rule` says
-//! otherwise. That keeps the book balanced and honest -- the unclassified balance is a visible
-//! to-do list rather than a silent misfiling.
+//! every row lands against the `Expenses:Unclassified (<currency>)` account for the currency it is
+//! in unless an `import_rule` says otherwise. That keeps the book balanced and honest -- the
+//! unclassified balance is a visible to-do list rather than a silent misfiling.
+
+use std::collections::HashMap;
 
 use rusqlite::Connection;
 
@@ -375,7 +377,8 @@ pub struct CommitReport {
     pub duplicates: usize,
 }
 
-/// Turn accepted rows into real transactions. Rows with no far account go to `Expenses:Unclassified`.
+/// Turn accepted rows into real transactions. Rows with no far account go to the unclassified bucket
+/// for their currency.
 ///
 /// ALL OR NOTHING. A ticked row the ledger refuses stops the whole commit and names its line, so
 /// nothing reaches the book until the review has dealt with it -- unticked it, or filed it somewhere
@@ -410,8 +413,9 @@ pub fn commit(conn: &mut Connection, batch_id: i64) -> Result<CommitReport, Impo
         .collect::<Result<_, _>>()?;
 
     let tx = conn.transaction()?;
-    // Resolved inside the transaction, so a refused commit does not leave an empty bucket behind.
-    let unclassified = unclassified_account(&tx)?;
+    // One bucket per currency, found the first time a row in that currency needs it -- and inside
+    // the transaction, so a refused commit does not leave an empty one behind.
+    let mut buckets: HashMap<String, i64> = HashMap::new();
     let mut report = CommitReport { created: 0, duplicates: 0 };
     for (row_id, line_no, account_id, on, desc, payee, amount, currency, far, fp) in rows {
         // Staging compared this row with the book as it was THEN. The same export staged twice
@@ -436,7 +440,6 @@ pub fn commit(conn: &mut Connection, batch_id: i64) -> Result<CommitReport, Impo
             }
         }
 
-        let far = far.unwrap_or(unclassified);
         let line =
             if desc.is_empty() { format!("line {line_no}") } else { format!("line {line_no} ({desc})") };
         // A posting is in its account's currency, so both sides of a row have to hold the currency
@@ -454,6 +457,17 @@ pub fn commit(conn: &mut Connection, batch_id: i64) -> Result<CommitReport, Impo
                 "{line} is in {currency}, but it is being imported into {near_name}, which holds {near_currency}"
             )));
         }
+        let far = match far {
+            Some(id) => id,
+            None => match buckets.get(&currency) {
+                Some(&id) => id,
+                None => {
+                    let id = unclassified_account(&tx, &currency)?;
+                    buckets.insert(currency.clone(), id);
+                    id
+                }
+            },
+        };
         let (far_currency, far_name) = holds(far)?;
         if far_currency != currency {
             return Err(ImportError::RowRefused(format!(
@@ -539,13 +553,13 @@ pub fn revert(conn: &mut Connection, batch_id: i64) -> Result<usize, ImportError
     Ok(ids.len())
 }
 
-/// The bucket an uncategorised row lands in, created on first use.
+/// The bucket an uncategorised row in `currency` lands in, created on first use.
 ///
 /// Resolved by crate::roles rather than by the literal name: `account.rename` can retitle this
 /// account, and a name lookup would then quietly create a SECOND one -- splitting old uncategorised
 /// spend from new across two accounts no report joins.
-fn unclassified_account(conn: &Connection) -> Result<i64, ImportError> {
-    Ok(crate::roles::unclassified(conn)?)
+fn unclassified_account(conn: &Connection, currency: &str) -> Result<i64, ImportError> {
+    Ok(crate::roles::unclassified(conn, currency)?)
 }
 
 pub fn rows(conn: &Connection, batch_id: i64) -> Result<Vec<serde_json::Value>, ImportError> {
@@ -642,7 +656,7 @@ Date,Description,Amount,Category
         let unclassified: i64 = c
             .query_row(
                 "SELECT COALESCE(SUM(p.amount_minor),0) FROM posting p
-                   JOIN account a ON a.id=p.account_id WHERE a.name='Expenses:Unclassified'",
+                   JOIN account a ON a.id=p.account_id WHERE a.name='Expenses:Unclassified (GBP)'",
                 [],
                 |r| r.get(0),
             )
