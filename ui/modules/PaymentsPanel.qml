@@ -203,9 +203,12 @@ Rectangle {
     // payment picked while another is half-edited simply replaces it.
     property int editFrom: -1
     property int editTo: -1
-    property int editAmountMinor: 0
+    // `double`, not `int`, for the reason EntryForm gives in full: a 32-bit int wraps past
+    // 2,147,483,647 minor units (2147.483647 XLM at 6dp), which is how a correction to
+    // 2677.39439 XLM arrived at the core negative and was refused as not positive.
+    property double editAmountMinor: 0
     property bool editAmountOk: false
-    property int editToMinor: 0
+    property double editToMinor: 0
     property bool editToOk: false
     // Whether the payment is the form's shape -- one leg out, one leg in, plus a conversion's own
     // legs if it has them -- and so gets the amount and account editors, or only the words.

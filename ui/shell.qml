@@ -795,7 +795,9 @@ ShellRoot {
                                     required property var modelData
                                     required property int index
                                     spacing: 5
-                                    readonly property int endMinor: chip.modelData.points.length > 0
+                                    // `double`, not `int`: a balance in minor units passes 2^31 in
+                                    // high-precision currencies (see EntryForm).
+                                    readonly property double endMinor: chip.modelData.points.length > 0
                                         ? chip.modelData.points[chip.modelData.points.length - 1].balance_minor : 0
                                     Rectangle {
                                         anchors.verticalCenter: parent.verticalCenter

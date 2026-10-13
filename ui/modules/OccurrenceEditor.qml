@@ -48,7 +48,8 @@ Rectangle {
     border.color: Theme.purple
     radius: 8
 
-    property int newAmountMinor: 0
+    // `double`, not `int`: minor units pass 2^31 in high-precision currencies (see EntryForm).
+    property double newAmountMinor: 0
     property bool amountOk: false
 
     onOccurrenceChanged: {

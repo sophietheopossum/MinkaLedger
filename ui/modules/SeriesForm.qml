@@ -45,7 +45,8 @@ Rectangle {
     // form: `stopCount` is the Repeater's model and rebuilds the rows, `stops` is what they show.
     property var stops: []
     property int stopCount: 0
-    property int amountMinor: 0
+    // `double`, not `int`: minor units pass 2^31 in high-precision currencies (see EntryForm).
+    property double amountMinor: 0
     property bool amountOk: false
     property string preset: "monthly_day"
     property int dayOfMonth: 1

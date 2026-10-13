@@ -47,10 +47,15 @@ Rectangle {
     // changes the count, and that rebuilds every row from this array.
     property var stops: []
     property int stopCount: 0
-    property int amountMinor: 0
+    // Minor units are `double`, never `int`: a QML int is 32-bit, and 2677.39439 XLM at 6dp is
+    // 2,677,394,390 minor units -- past INT_MAX. Held in an int it wrapped negative, save()'s
+    // Math.abs then stored a plausible wrong amount (1617.572906 XLM, 13/10/2026), and the
+    // payment editor refused the correction because the wrapped value failed its positivity
+    // check. A double holds every minor-unit integer the core can send here exactly (up to 2^53).
+    property double amountMinor: 0
     property bool amountOk: false
     // The second leg, only used when the two accounts are in different currencies.
-    property int toMinor: 0
+    property double toMinor: 0
     property bool toOk: false
 
     function currencyOf(id) {

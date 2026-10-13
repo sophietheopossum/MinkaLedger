@@ -168,6 +168,47 @@ fn a_multi_currency_conversion_keeps_the_book_consistent() {
     assert_eq!(eur["balance_minor"], 46664);
 }
 
+/// A conversion whose arriving leg is past `i32::MAX` minor units still records, and edits,
+/// exactly. 2677.39439 XLM at 6dp is 2,677,394,390 minor units: an ordinary amount in a
+/// high-denomination, high-precision currency, and past the range of a 32-bit int -- which is
+/// what a QML `int` property is. The frontend held `toMinor` in one (13/10/2026), so this exact
+/// conversion wrapped to -1,617,572,906 on its way here and was stored as 1617.572906 XLM, and
+/// the editor then refused the correction because the wrapped value is negative. The core's half
+/// of that contract is that amounts are `i64` end to end, and this pins it: if a future narrowing
+/// creeps into a handler, this fails instead of the book quietly losing a thousand XLM.
+#[test]
+fn a_conversion_past_i32_minor_units_records_and_edits_exactly() {
+    let out = run(&[
+        r#"{"id":1,"method":"currency.create","params":{"code":"XLM","minor_digits":6,"name":"Stellar Lumens"}}"#,
+        r#"{"id":2,"method":"account.create","params":{"name":"kraken-gbp","kind":"asset","currency":"GBP"}}"#,
+        r#"{"id":3,"method":"account.create","params":{"name":"kraken-xlm","kind":"asset","currency":"XLM"}}"#,
+        r#"{"id":4,"method":"money.parse","params":{"text":"2677.39439","minor_digits":6}}"#,
+        // Recorded with the wrong arriving amount first, as it was on the day, then corrected.
+        r#"{"id":5,"method":"txn.convert","params":{"occurred_on":"2026-10-13","description":"conversion",
+             "from_account":1,"from_minor":39212,"to_account":2,"to_minor":2600000000}}"#,
+        r#"{"id":6,"method":"txn.update","params":{"id":1,
+             "conversion":{"from_account":1,"from_minor":39212,"to_account":2,"to_minor":2677394390}}}"#,
+        r#"{"id":7,"method":"txn.get","params":{"id":1}}"#,
+        r#"{"id":8,"method":"account.balances"}"#,
+        r#"{"id":9,"method":"db.check"}"#,
+    ]);
+    for r in &out {
+        assert!(err_of(r).is_none(), "{r}");
+    }
+    assert_eq!(out[3]["result"]["minor"], 2677394390_i64, "the parse itself is past i32::MAX");
+    assert_eq!(out[3]["result"]["formatted"], "2677.394390");
+    let after = &out[6]["result"];
+    assert!(
+        after["postings"].as_array().unwrap().iter()
+            .any(|p| p["account"] == "kraken-xlm" && p["amount_minor"] == 2677394390_i64),
+        "the edit stored the corrected amount exactly: {after}"
+    );
+    let bals = out[7]["result"].as_array().unwrap();
+    let xlm = bals.iter().find(|b| b["name"] == "kraken-xlm").unwrap();
+    assert_eq!(xlm["balance_minor"], 2677394390_i64);
+    assert_eq!(out[8]["result"]["ok"], true, "both currencies balance: {}", out[8]);
+}
+
 /// The analysis surface is the one an agent drives without a human watching, so the end-to-end
 /// path matters more here than anywhere: a read-only guarantee that only holds in a unit test is
 /// not a guarantee.
