@@ -57,6 +57,11 @@ Rectangle {
     // The second leg, only used when the two accounts are in different currencies.
     property double toMinor: 0
     property bool toOk: false
+    // One write in flight at a time. The core call is async, so without this a second press
+    // while the first is still unanswered records the payment twice: the core simply obeys
+    // both, and an identical repeat payment is legitimate there -- only the form can know it
+    // was the same press. Same guard as ExportPanel's `busy`.
+    property bool saving: false
 
     function currencyOf(id) {
         const a = (root.accounts || []).find(x => x.account_id === id);
@@ -267,9 +272,20 @@ Rectangle {
         return "1 " + root.fromCurrency + " = " + (t / f).toFixed(4) + " " + root.toCurrency;
     }
 
+    function saveDone(e) {
+        root.saving = false;
+        if (e)
+            status.text = e.message;
+        else {
+            root.reset();
+            root.saved();
+        }
+    }
+
     function save() {
-        if (!root.complete)
+        if (!root.complete || root.saving)
             return;
+        root.saving = true;
         // A chain is one core call, not one txn.create per leg from here: the core writes every
         // leg or none, links each to the one before, and copies the description to all of them.
         // Doing the loop in the form would leave half a chain behind on the first refusal.
@@ -278,14 +294,7 @@ Rectangle {
                 description: descField.text,
                 from_account: root.fromAccount,
                 hops: root.chainHops()
-            }, (r, e) => {
-                if (e)
-                    status.text = e.message;
-                else {
-                    root.reset();
-                    root.saved();
-                }
-            });
+            }, (r, e) => root.saveDone(e));
             return;
         }
         // Two currencies need conversion postings through a trading account, which is a different
@@ -299,14 +308,7 @@ Rectangle {
                 from_minor: Math.abs(root.amountMinor),
                 to_account: root.toAccount,
                 to_minor: Math.abs(root.toMinor)
-            }, (r, e) => {
-                if (e)
-                    status.text = e.message;
-                else {
-                    root.reset();
-                    root.saved();
-                }
-            });
+            }, (r, e) => root.saveDone(e));
             return;
         }
         // Double entry, made by the form rather than asked of the operator: money LEAVES `from`
@@ -318,14 +320,7 @@ Rectangle {
                 { account_id: root.fromAccount, amount_minor: -root.amountMinor },
                 { account_id: root.toAccount, amount_minor: root.amountMinor }
             ]
-        }, (r, e) => {
-            if (e) {
-                status.text = e.message;
-            } else {
-                root.reset();
-                root.saved();
-            }
-        });
+        }, (r, e) => root.saveDone(e));
     }
 
     Column {
@@ -547,13 +542,15 @@ Rectangle {
         Row {
             spacing: 8
             PushButton {
-                label: root.stopCount > 0 ? "Record " + (root.stopCount + 1) + " payments" : "Record"
+                label: root.saving ? "Recording…"
+                       : root.stopCount > 0 ? "Record " + (root.stopCount + 1) + " payments" : "Record"
                 primary: true
-                enabled: root.complete
+                enabled: root.complete && !root.saving
                 onClicked: root.save()
             }
             PushButton {
                 label: "Clear"
+                enabled: !root.saving
                 onClicked: root.reset()
             }
             Text {
@@ -588,6 +585,20 @@ Rectangle {
                 color: Theme.warnAmber
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fontSize - 2
+            }
+        }
+    }
+
+    // The core dying mid-save is the one way `saving` can strand: Ledger drops the
+    // outstanding callback uninvoked. Unstick the button, but say the payment is
+    // unconfirmed -- it may well have been recorded, and blindly pressing Record
+    // again is exactly the duplicate this guard exists to prevent.
+    Connections {
+        target: Ledger
+        function onRunningChanged() {
+            if (!Ledger.running && root.saving) {
+                root.saving = false;
+                status.text = "the ledger core stopped before confirming — check whether the payment was recorded before recording it again";
             }
         }
     }

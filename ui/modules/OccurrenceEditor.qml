@@ -51,6 +51,18 @@ Rectangle {
     // `double`, not `int`: minor units pass 2^31 in high-precision currencies (see EntryForm).
     property double newAmountMinor: 0
     property bool amountOk: false
+    // One write in flight at a time, as in EntryForm: the core call is async, so
+    // without this a frustrated second press (or Record right after Apply) sends
+    // two writes whose interleaving nobody chose.
+    property bool saving: false
+
+    function finishWrite(e) {
+        root.saving = false;
+        if (e)
+            status.text = e.message;
+        else
+            root.changed();
+    }
 
     onOccurrenceChanged: {
         if (!occurrence)
@@ -88,6 +100,8 @@ Rectangle {
     }
 
     function apply(action) {
+        if (root.saving)
+            return;
         const params = {
             series_id: root.occurrence.series_id,
             occurrence_on: root.occurrence.occurrence_on,
@@ -98,43 +112,32 @@ Rectangle {
                 params.moved_to = moveField.text;
             params.amount_minor = root.signedAmount();
         }
-        Ledger.write("series.override", params, (r, e) => {
-            if (e)
-                status.text = e.message;
-            else {
-                root.changed();
-            }
-        });
+        root.saving = true;
+        Ledger.write("series.override", params, (r, e) => root.finishWrite(e));
     }
 
     // The occurrence became a real payment: write it from the fields and claim the slot.
     function record() {
+        if (root.saving)
+            return;
+        root.saving = true;
         Ledger.write("series.record", {
             series_id: root.occurrence.series_id,
             occurrence_on: root.occurrence.occurrence_on,
             occurred_on: moveField.text,
             amount_minor: root.signedAmount(),
             whole_chain: root.chained
-        }, (r, e) => {
-            if (e)
-                status.text = e.message;
-            else {
-                root.changed();
-            }
-        });
+        }, (r, e) => root.finishWrite(e));
     }
 
     function clearOverride() {
+        if (root.saving)
+            return;
+        root.saving = true;
         Ledger.write("series.clear_override", {
             series_id: root.occurrence.series_id,
             occurrence_on: root.occurrence.occurrence_on
-        }, (r, e) => {
-            if (e)
-                status.text = e.message;
-            else {
-                root.changed();
-            }
-        });
+        }, (r, e) => root.finishWrite(e));
     }
 
     Column {
@@ -213,23 +216,26 @@ Rectangle {
             spacing: 8
             PushButton {
                 visible: !root.hypothetical
-                label: root.chained ? "Record all " + root.occurrence.chain_len + " legs as paid"
+                label: root.saving ? "Recording…"
+                       : root.chained ? "Record all " + root.occurrence.chain_len + " legs as paid"
                                     : "Record as paid"
                 primary: true
-                enabled: root.amountOk && moveField.text.length === 10
+                enabled: root.amountOk && moveField.text.length === 10 && !root.saving
                 onClicked: root.record()
             }
             PushButton {
                 label: "Apply"
-                enabled: root.amountOk
+                enabled: root.amountOk && !root.saving
                 onClicked: root.apply("amend")
             }
             PushButton {
                 label: root.chained ? "Skip all " + root.occurrence.chain_len + " legs" : "Skip this one"
+                enabled: !root.saving
                 onClicked: root.apply("skip")
             }
             PushButton {
                 label: "Reset"
+                enabled: !root.saving
                 onClicked: root.clearOverride()
             }
             PushButton {
@@ -241,6 +247,19 @@ Rectangle {
                 onClicked: {
                     root.dismissed();
                 }
+            }
+        }
+    }
+
+    // Same stranded-`saving` case as EntryForm: the core dying mid-write drops
+    // the callback uninvoked. Unstick the buttons, but say the change is
+    // unconfirmed rather than quietly inviting a second attempt.
+    Connections {
+        target: Ledger
+        function onRunningChanged() {
+            if (!Ledger.running && root.saving) {
+                root.saving = false;
+                status.text = "the ledger core stopped before confirming — check whether the change was made before trying again";
             }
         }
     }
