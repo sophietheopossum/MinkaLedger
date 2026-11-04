@@ -222,7 +222,11 @@ Rectangle {
                             label: modelData
                             primary: root.map[mapRow.modelData.field] === modelData
                             onClicked: {
-                                const next = root.map;
+                                // A fresh object, not the mutated one back: assigning
+                                // the same JS object emits no mapChanged, so the
+                                // highlight here and Save profile's enabled binding
+                                // would go on reading the mapping as it was.
+                                const next = Object.assign({}, root.map);
                                 next[mapRow.modelData.field] = modelData;
                                 root.map = next;
                             }
