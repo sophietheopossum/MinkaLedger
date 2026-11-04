@@ -149,6 +149,23 @@ fn the_protocol_behaves_at_its_edges() {
     assert_eq!(out[2]["result"]["ok"], true, "a fresh book is internally consistent");
 }
 
+/// The core makes no network calls: the ECB rate fetch (and with it the whole ureq/rustls
+/// stack) was removed 4/11/2026, because nothing in the UI ever called it. Rates enter only
+/// through fx.put_rate, and conversion from a stored rate is unaffected.
+#[test]
+fn fx_fetch_is_gone_but_a_stored_rate_still_converts() {
+    let out = run(&[
+        r#"{"id":1,"method":"fx.put_rate","params":{"base":"GBP","quote":"EUR",
+             "as_of":"2026-08-01","rate":"1.1666"}}"#,
+        r#"{"id":2,"method":"fx.convert","params":{"amount_minor":10000,"from":"GBP",
+             "to":"EUR","on":"2026-08-15"}}"#,
+        r#"{"id":3,"method":"fx.fetch","params":{"on":"2026-08-15"}}"#,
+    ]);
+    assert!(err_of(&out[0]).is_none(), "{}", out[0]);
+    assert_eq!(out[1]["result"]["amount_minor"], 11666, "£100.00 at the stored rate: {}", out[1]);
+    assert_eq!(out[2]["error"]["code"], "unknown_method", "no fetcher remains: {}", out[2]);
+}
+
 #[test]
 fn a_multi_currency_conversion_keeps_the_book_consistent() {
     let out = run(&[

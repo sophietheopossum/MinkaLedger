@@ -1533,15 +1533,6 @@ fn dispatch(
                                    "num": r.num, "den": r.den }))
         }
 
-        "fx.fetch" => {
-            let on = params.get("on").and_then(|v| v.as_str())
-                .map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| bad("on")))
-                .transpose()?
-                .unwrap_or_else(|| chrono::Local::now().date_naive());
-            let (reported, n) = fx::fetch::rates_for(conn, on)?;
-            Ok(serde_json::json!({ "requested": on.to_string(), "reported": reported, "stored": n }))
-        }
-
         "fx.position" => {
             let on = params.get("on").and_then(|v| v.as_str()).ok_or_else(|| bad("on"))?;
             let on = chrono::NaiveDate::parse_from_str(on, "%Y-%m-%d").map_err(|_| bad("on"))?;
