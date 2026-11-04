@@ -44,6 +44,7 @@ Rectangle {
     property int endingKey: -1
     property string savedNote: ""
     property string note: ""
+    property bool saving: false
     property var hoverRule: null
     property real tipX: 0
     property real tipY: 0
@@ -82,6 +83,12 @@ Rectangle {
     Connections {
         target: Ledger
         function onRevisionChanged() { root.reload(); }
+        function onRunningChanged() {
+            if (!Ledger.running && root.saving) {
+                root.saving = false;
+                root.note = "the ledger core stopped before confirming — check whether the change was made before trying again";
+            }
+        }
     }
 
     /// From UPCOMING: open the rule `seriesId` belongs to, as a change from `occurrenceOn`.
@@ -329,15 +336,19 @@ Rectangle {
     // `clear` is the only way to send an end with no date, which REMOVES the end: a half-typed date
     // must never be read as that.
     function endRule(rule, until, clear) {
+        if (root.saving)
+            return;
         const params = { id: rule.current.ids[0] };
         if (!clear) {
             if (!until || until.length !== 10)
                 return;
             params.until_on = until;
         }
+        root.saving = true;
         Ledger.write("series.end", params, (r, e) => root.ended(rule, clear ? "" : until, e));
     }
     function ended(rule, until, e) {
+        root.saving = false;
         if (e) {
             root.note = e.message;
             return;
@@ -721,6 +732,7 @@ Rectangle {
                             implicitHeight: 26
                             visible: endRow.beforeNext.length === 10 && row.isRule && endRow.beforeNext >= row.rule.current.dtstart
                             label: "before the next payment (" + root.dmy(endRow.beforeNext) + ")"
+                            enabled: !root.saving
                             onClicked: root.endRule(row.rule, endRow.beforeNext, false)
                         }
                         Field {
@@ -735,8 +747,8 @@ Rectangle {
                             anchors.verticalCenter: parent.verticalCenter
                             implicitHeight: 26
                             primary: true
-                            label: "end on that date"
-                            enabled: endField.text.length === 10
+                            label: root.saving ? "Saving…" : "end on that date"
+                            enabled: endField.text.length === 10 && !root.saving
                             onClicked: root.endRule(row.rule, endField.text, false)
                         }
                         PushButton {
@@ -744,6 +756,7 @@ Rectangle {
                             implicitHeight: 26
                             visible: row.isRule && !!row.rule.current.until_on
                             label: "no end"
+                            enabled: !root.saving
                             onClicked: root.endRule(row.rule, "", true)
                         }
                         Text {

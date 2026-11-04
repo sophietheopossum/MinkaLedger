@@ -34,6 +34,9 @@ Rectangle {
     property bool creating: false
     property bool cancelling: false
     property string note: ""
+    // One write in flight at a time, as in EntryForm, so a repeat press can't
+    // create/delete/cancel the same scenario action twice.
+    property bool saving: false
     // Deleting a scenario CASCADES to its series, and the button sits next to the on/off toggle
     // -- the one you press casually. So it arms first: one click asks, the second does it.
     property int armedForDelete: -1
@@ -47,6 +50,12 @@ Rectangle {
     Connections {
         target: Ledger
         function onRevisionChanged() { root.reload(); }
+        function onRunningChanged() {
+            if (!Ledger.running && root.saving) {
+                root.saving = false;
+                root.note = "the ledger core stopped before confirming — check whether the change was made before trying again";
+            }
+        }
     }
 
     // A recurring chain is one commitment in several series; it is listed once, by its first leg.
@@ -67,9 +76,21 @@ Rectangle {
     }
     function isActive(id) { return (root.active || []).indexOf(id) >= 0; }
 
+    function finishWrite(e) {
+        root.saving = false;
+        if (e) {
+            root.note = e.message;
+            return false;
+        }
+        return true;
+    }
+
     function create(name) {
+        if (root.saving)
+            return;
+        root.saving = true;
         Ledger.write("scenario.create", { name: name }, (r, e) => {
-            if (e) { root.note = e.message; return; }
+            if (!root.finishWrite(e)) return;
             root.creating = false;
             root.selected = r.id;
             root.note = "";
@@ -78,9 +99,12 @@ Rectangle {
     }
 
     function remove(id) {
+        if (root.saving)
+            return;
+        root.saving = true;
         root.armedForDelete = -1;
         Ledger.write("scenario.delete", { id: id }, (r, e) => {
-            if (e) { root.note = e.message; return; }
+            if (!root.finishWrite(e)) return;
             if (root.selected === id) root.selected = -1;
             // Switch it off on the way out, or the forecast keeps an id that no longer exists.
             if (root.isActive(id)) root.toggled(id);
@@ -89,6 +113,9 @@ Rectangle {
     }
 
     function cancelSeries(s) {
+        if (root.saving)
+            return;
+        root.saving = true;
         Ledger.write("series.create", {
             description: "cancelled: " + s.description,
             rrule: s.rrule,
@@ -97,9 +124,12 @@ Rectangle {
             supersedes_id: s.id,
             postings: []          // no postings: this row moves no money, it only suppresses
         }, (r, e) => {
-            root.note = e ? e.message : "";
+            const ok = root.finishWrite(e);
             root.cancelling = false;
-            if (!e) root.changed();
+            if (ok) {
+                root.note = "";
+                root.changed();
+            }
         });
     }
 
@@ -128,6 +158,7 @@ Rectangle {
             PushButton {
                 label: root.creating ? "Cancel" : "+ scenario"
                 primary: !root.creating && root.scenarios.length === 0
+                enabled: !root.saving
                 onClicked: { root.creating = !root.creating; root.cancelling = false; }
             }
         }
@@ -144,9 +175,9 @@ Rectangle {
             }
             PushButton {
                 anchors.verticalCenter: parent.verticalCenter
-                label: "Create"
+                label: root.saving ? "Creating…" : "Create"
                 primary: true
-                enabled: nameField.text.length > 0
+                enabled: nameField.text.length > 0 && !root.saving
                 onClicked: { root.create(nameField.text); nameField.clear(); }
             }
         }
@@ -259,6 +290,7 @@ Rectangle {
                         PushButton {
                             label: root.armedForDelete === scRow.modelData.id ? "delete?" : "×"
                             primary: root.armedForDelete === scRow.modelData.id
+                            enabled: !root.saving
                             onClicked: {
                                 if (root.armedForDelete === scRow.modelData.id)
                                     root.remove(scRow.modelData.id);
@@ -286,6 +318,7 @@ Rectangle {
             }
             PushButton {
                 label: root.cancelling ? "Close" : "Cancel a payment"
+                enabled: !root.saving
                 onClicked: root.cancelling = !root.cancelling
             }
             Text {

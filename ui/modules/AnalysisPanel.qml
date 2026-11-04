@@ -21,6 +21,7 @@ Rectangle {
     property string asOf: ""
     property var brief: null
     property string note: ""
+    property bool saving: false
 
     color: Theme.surface
     border.width: 1
@@ -37,6 +38,12 @@ Rectangle {
         function onRevisionChanged() {
             if (root.visible) root.load();
             else root.brief = null;   // recomputed next time it is opened, never shown stale
+        }
+        function onRunningChanged() {
+            if (!Ledger.running && root.saving) {
+                root.saving = false;
+                root.note = "the ledger core stopped before confirming the save — treat any file of that name as unfinished";
+            }
         }
     }
 
@@ -79,10 +86,14 @@ Rectangle {
         defaultSuffix: "json"
         nameFilters: ["JSON (*.json)"]
         onAccepted: {
+            if (root.saving)
+                return;
+            root.saving = true;
             const path = selectedFile.toString().replace("file://", "");
             // Written by the core, not by the frontend: one JSON serialiser, and the file is
             // byte-identical to what a model would receive over the socket.
             Ledger.request("analysis.brief", { as_of: root.asOf, months: 6, path: path }, (r, e) => {
+                root.saving = false;
                 root.note = e ? e.message : ("written to " + r.written);
             });
         }
@@ -125,8 +136,8 @@ Rectangle {
                 }
             }
             PushButton {
-                label: "Save…"
-                enabled: root.brief !== null
+                label: root.saving ? "Saving…" : "Save…"
+                enabled: root.brief !== null && !root.saving
                 onClicked: saver.open()
             }
         }

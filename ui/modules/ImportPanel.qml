@@ -34,6 +34,11 @@ Rectangle {
     property var rows: []
     property string note: ""
     property int intoAccount: -1
+    // A profile/stage/commit/revert operation, including its preliminary
+    // read or peek, is in flight. Row toggles are tracked per row below so
+    // one slow answer doesn't make unrelated rows unclickable.
+    property bool busy: false
+    property var pendingRows: ({})
 
     // The mapping being built, keyed by ledger field.
     property var map: ({ date: "", amount: "", description: "" })
@@ -69,11 +74,15 @@ Rectangle {
     }
 
     function createProfile(name) {
+        if (root.busy)
+            return;
+        root.busy = true;
         Ledger.write("import.create_profile", {
             name: name, date_format: "%d/%m/%Y", account_id: root.intoAccount,
             mapping: { date: root.map.date, amount: root.map.amount,
                        description: root.map.description }
         }, (r, e) => {
+            root.busy = false;
             if (e) { root.note = e.message; return; }
             root.profileId = r.id;
             root.loadProfiles();
@@ -82,13 +91,25 @@ Rectangle {
     }
 
     function stage() {
+        if (root.busy)
+            return;
+        root.busy = true;
         Ledger.write("import.stage", { profile_id: root.profileId, path: root.path,
                                        source_name: root.path.split("/").pop() }, (r, e) => {
-            if (e) { root.note = e.message; return; }
+            if (e) {
+                root.busy = false;
+                root.note = e.message;
+                return;
+            }
             root.batchId = r.batch_id;
             root.note = r.rows + " read · " + r.new + " new · " + r.duplicates
                       + " already imported · " + r.errors + " unreadable";
-            Ledger.write("import.categorise", { batch_id: r.batch_id }, () => root.loadRows());
+            Ledger.write("import.categorise", { batch_id: r.batch_id }, (cr, ce) => {
+                root.busy = false;
+                if (ce)
+                    root.note = ce.message;
+                root.loadRows();
+            });
         });
     }
 
@@ -99,17 +120,36 @@ Rectangle {
     }
 
     function commit() {
+        if (root.busy)
+            return;
+        root.busy = true;
         Ledger.write("import.commit", { batch_id: root.batchId }, (r, e) => {
+            root.busy = false;
             root.note = e ? e.message : (r.created + " transactions created");
             if (!e) { root.loadRows(); root.changed(); }
         });
     }
 
     function revert() {
+        if (root.busy)
+            return;
+        root.busy = true;
         Ledger.write("import.revert", { batch_id: root.batchId }, (r, e) => {
+            root.busy = false;
             root.note = e ? e.message : (r.removed + " transactions removed — the ledger is as it was");
             if (!e) { root.loadRows(); root.changed(); }
         });
+    }
+
+    Connections {
+        target: Ledger
+        function onRunningChanged() {
+            if (!Ledger.running && (root.busy || Object.keys(root.pendingRows).length > 0)) {
+                root.busy = false;
+                root.pendingRows = ({});
+                root.note = "the ledger core stopped before confirming — check whether the change was made before trying again";
+            }
+        }
     }
 
     FileDialog {
@@ -134,7 +174,7 @@ Rectangle {
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fontSize - 2
             }
-            PushButton { label: "Choose file…"; primary: root.path === ""; onClicked: chooser.open() }
+            PushButton { label: "Choose file…"; primary: root.path === ""; enabled: !root.busy; onClicked: chooser.open() }
             Text {
                 anchors.verticalCenter: parent.verticalCenter
                 text: root.path === "" ? "" : root.path.split("/").pop()
@@ -201,9 +241,9 @@ Rectangle {
                 }
                 PushButton {
                     anchors.verticalCenter: parent.verticalCenter
-                    label: "Save profile"
+                    label: root.busy ? "Saving…" : "Save profile"
                     primary: true
-                    enabled: root.map.date !== "" && root.map.amount !== "" && root.intoAccount >= 0
+                    enabled: root.map.date !== "" && root.map.amount !== "" && root.intoAccount >= 0 && !root.busy
                     onClicked: root.createProfile(root.path.split("/").pop().replace(".csv", ""))
                 }
             }
@@ -212,7 +252,7 @@ Rectangle {
         Row {
             spacing: 8
             visible: root.profileId >= 0 && root.batchId < 0
-            PushButton { label: "Read the file"; primary: true; onClicked: root.stage() }
+            PushButton { label: root.busy ? "Reading…" : "Read the file"; primary: true; enabled: !root.busy; onClicked: root.stage() }
             Text {
                 anchors.verticalCenter: parent.verticalCenter
                 text: "nothing is written until you commit"
@@ -316,11 +356,25 @@ Rectangle {
                         cursorShape: (row.dup || row.bad || row.committed)
                                      ? Qt.ArrowCursor : Qt.PointingHandCursor
                         onClicked: {
-                            if (row.dup || row.bad || row.committed)
+                            if (row.dup || row.bad || row.committed || root.busy)
                                 return;
+                            const key = String(row.modelData.id);
+                            if (root.pendingRows[key])
+                                return;
+                            const next = root.pendingRows;
+                            next[key] = true;
+                            root.pendingRows = next;
                             Ledger.write("import.set_row",
                                 { id: row.modelData.id, accepted: !row.modelData.accepted },
-                                () => root.loadRows());
+                                (r, e) => {
+                                    const done = root.pendingRows;
+                                    delete done[key];
+                                    root.pendingRows = done;
+                                    if (e)
+                                        root.note = e.message;
+                                    else
+                                        root.loadRows();
+                                });
                         }
                     }
                 }
@@ -330,8 +384,8 @@ Rectangle {
         Row {
             spacing: 8
             visible: root.batchId >= 0
-            PushButton { label: "Commit"; primary: true; onClicked: root.commit() }
-            PushButton { label: "Revert"; onClicked: root.revert() }
+            PushButton { label: root.busy ? "Working…" : "Commit"; primary: true; enabled: !root.busy; onClicked: root.commit() }
+            PushButton { label: "Revert"; enabled: !root.busy; onClicked: root.revert() }
             PushButton {
                 label: "Start again"
                 onClicked: {

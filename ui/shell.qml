@@ -106,6 +106,7 @@ ShellRoot {
         property bool showScenarios: false  // the what-if panel
         property int seriesScenario: -1     // >=0 makes the recurring form build a hypothetical
         property string seriesScenarioName: ""
+        property bool creatingAccount: false // account.create (+ its opening parse) in flight
 
         // Switching a scenario on or off is just a change to the argument the projection is given;
         // nothing is written. Shared by the chips above the chart and the scenario panel, so the
@@ -120,6 +121,7 @@ ShellRoot {
 
         function createAccount(params) {
             Ledger.write("account.create", params, (r, e) => {
+                win.creatingAccount = false;
                 if (!e) {
                     accName.clear();
                     accOpening.clear();
@@ -174,6 +176,12 @@ ShellRoot {
         Connections {
             target: Ledger
             function onRevisionChanged() { win.refresh(); }
+            function onRunningChanged() {
+                // A core stop drops the create callback uninvoked; don't strand
+                // the button. The global core-stopped error is already shown.
+                if (!Ledger.running)
+                    win.creatingAccount = false;
+            }
         }
         // The window stays open for days. Everything on it is "as of today", so when the date
         // turns over the windows move with it and the book is asked again; otherwise a payment
@@ -549,6 +557,7 @@ ShellRoot {
                             Item { Layout.fillWidth: true }
                             PushButton {
                                 label: "+ account"
+                                enabled: !win.creatingAccount
                                 onClicked: { newAccount.visible = !newAccount.visible;
                                              if (newAccount.visible) win.editAccounts = false; }
                             }
@@ -600,6 +609,7 @@ ShellRoot {
                                             required property string modelData
                                             label: modelData
                                             primary: newAccount.kind === modelData
+                                            enabled: !win.creatingAccount
                                             onClicked: newAccount.kind = modelData
                                         }
                                     }
@@ -617,6 +627,7 @@ ShellRoot {
                                             implicitHeight: 24
                                             label: modelData.code
                                             primary: newAccount.currency === modelData.code
+                                            enabled: !win.creatingAccount
                                             onClicked: newAccount.currency = modelData.code
                                         }
                                     }
@@ -649,10 +660,13 @@ ShellRoot {
                                 Row {
                                     spacing: 6
                                     PushButton {
-                                        label: "Create"
+                                        label: win.creatingAccount ? "Creating…" : "Create"
                                         primary: true
-                                        enabled: accName.text.length > 0
+                                        enabled: accName.text.length > 0 && !win.creatingAccount
                                         onClicked: {
+                                            if (win.creatingAccount)
+                                                return;
+                                            win.creatingAccount = true;
                                             const params = { name: accName.text,
                                                              kind: newAccount.kind,
                                                              currency: newAccount.currency };
@@ -666,10 +680,14 @@ ShellRoot {
                                                     { text: typed,
                                                       minor_digits: Money.digits(newAccount.currency) },
                                                     (pr, pe) => {
-                                                        if (pe) { accOpening.invalid = true; return; }
+                                                        if (pe) {
+                                                            accOpening.invalid = true;
+                                                            win.creatingAccount = false;
+                                                            return;
+                                                        }
                                                         accOpening.invalid = false;
                                                         params.opening_minor =
-                                                            newAccount.kind === "liability"
+                                                            params.kind === "liability"
                                                             ? -Math.abs(pr.minor) : pr.minor;
                                                         params.opening_on = win.asOf;
                                                         win.createAccount(params);
@@ -679,7 +697,7 @@ ShellRoot {
                                             win.createAccount(params);
                                         }
                                     }
-                                    PushButton { label: "Cancel"; onClicked: newAccount.visible = false }
+                                    PushButton { label: "Cancel"; enabled: !win.creatingAccount; onClicked: newAccount.visible = false }
                                 }
                             }
                             property string kind: "expense"

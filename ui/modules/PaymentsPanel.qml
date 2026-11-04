@@ -102,6 +102,12 @@ Rectangle {
     Connections {
         target: Ledger
         function onRevisionChanged() { if (root.visible) root.refreshCurrent(); }
+        function onRunningChanged() {
+            if (!Ledger.running && root.saving) {
+                root.saving = false;
+                root.note = "the ledger core stopped before confirming — check whether the change was made before trying again";
+            }
+        }
     }
 
     // A refresh after a write reloads as many payments as are already listed: going back to the
@@ -119,6 +125,8 @@ Rectangle {
     // The core answers at most this many rows per request.
     readonly property int requestCap: 500
     property bool loading: false
+    // A delete/update/link write is in flight, distinct from browse `loading`.
+    property bool saving: false
     // Bumped by every fresh load. A reply that belongs to an older one (a search since retyped) is
     // dropped rather than mixed into the new list.
     property int generation: 0
@@ -228,7 +236,7 @@ Rectangle {
                                       && root.editFromCurrency.length > 0
                                       && root.editToCurrency.length > 0
                                       && root.editFromCurrency !== root.editToCurrency
-    readonly property bool editComplete: root.editing >= 0
+    readonly property bool editComplete: root.editing >= 0 && !root.saving
                                          && editDate.text.length === 10
                                          && editDesc.text.trim().length > 0
                                          && (!root.editSimple
@@ -247,6 +255,8 @@ Rectangle {
     // Open a payment in the editor, loaded from the row the list already holds: summarise carries
     // the account ids for exactly this, so there is no round trip before the fields fill.
     function edit(row) {
+        if (root.saving)
+            return;
         root.following = -1;
         root.chain = null;
         root.editing = row.id;
@@ -275,6 +285,8 @@ Rectangle {
         arrivesEdit.invalid = false;
     }
     function closeEditor() {
+        if (root.saving)
+            return;
         root.editing = -1;
         root.editNote = "";
         root.deleteArmed = false;
@@ -284,8 +296,12 @@ Rectangle {
     // (the production connection sets foreign_keys=ON in db.rs, so the cascade is real), and the
     // list reloads from the core rather than being patched locally.
     function deletePayment() {
+        if (root.saving)
+            return;
         const id = root.editing;
+        root.saving = true;
         Ledger.write("txn.delete", { id: id }, (r, e) => {
+            root.saving = false;
             if (e) {
                 root.editNote = e.message;
                 root.deleteArmed = false;
@@ -351,8 +367,9 @@ Rectangle {
     // are restated the way the entry form states them -- money LEAVES from and ARRIVES at to --
     // or, across currencies, as the two real amounts for the core to build the conversion from.
     function saveEdit() {
-        if (!root.editComplete)
+        if (root.saving || !root.editComplete)
             return;
+        root.saving = true;
         const id = root.editing;
         const params = { id: id, occurred_on: editDate.text, description: editDesc.text.trim() };
         if (root.editSimple && root.editCross) {
@@ -365,6 +382,7 @@ Rectangle {
             ];
         }
         Ledger.write("txn.update", params, (r, e) => {
+            root.saving = false;
             if (e) { root.editNote = e.message; return; }
             root.closeEditor();
             root.note = "";
@@ -382,6 +400,8 @@ Rectangle {
 
     function isPicked(id) { return root.picked.indexOf(id) >= 0; }
     function toggle(id) {
+        if (root.saving)
+            return;
         const next = root.picked.slice();
         const at = next.indexOf(id);
         if (at >= 0) next.splice(at, 1); else next.push(id);
@@ -391,8 +411,9 @@ Rectangle {
     // Chains the picked payments in date order rather than pick order: the order they were
     // TICKED is an artefact of scrolling, while the order money moved is a fact about them.
     function linkPicked() {
-        if (root.picked.length < 2)
+        if (root.saving || root.picked.length < 2)
             return;
+        root.saving = true;
         // listRows, not rows: a payment kept on screen after a rename is tickable like any other,
         // and looking it up here is what keeps it in date order rather than falling back to id.
         const byId = {};
@@ -413,6 +434,7 @@ Rectangle {
                 if (e && e.code !== "already_linked")
                     failed++;
                 if (--remaining === 0) {
+                    root.saving = false;
                     root.note = failed > 0 ? (failed + " link(s) could not be made") : "";
                     root.picked = [];
                     root.refreshCurrent();
@@ -431,7 +453,11 @@ Rectangle {
     }
 
     function unlink(a, b) {
+        if (root.saving)
+            return;
+        root.saving = true;
         Ledger.write("link.delete", { from_txn: a, to_txn: b }, (r, e) => {
+            root.saving = false;
             root.note = e ? e.message : "";
             if (!e) root.refreshCurrent();
         });
@@ -540,10 +566,11 @@ Rectangle {
             }
             PushButton {
                 anchors.verticalCenter: parent.verticalCenter
-                label: root.picked.length < 2
+                label: root.saving ? "Saving…"
+                       : root.picked.length < 2
                        ? "tick 2+ to link" : "Link " + root.picked.length
                 primary: root.picked.length >= 2
-                enabled: root.picked.length >= 2
+                enabled: root.picked.length >= 2 && !root.saving
                 onClicked: root.linkPicked()
             }
             PushButton {
@@ -872,13 +899,14 @@ Rectangle {
                     Row {
                         spacing: 6
                         PushButton {
-                            label: "Save"
+                            label: root.saving ? "Saving…" : "Save"
                             primary: true
                             enabled: root.editComplete
                             onClicked: root.saveEdit()
                         }
                         PushButton {
                             label: "Cancel"
+                            enabled: !root.saving
                             onClicked: root.closeEditor()
                         }
                         // Destructive, so it is separated from Save/Cancel by the label doing the
@@ -886,6 +914,7 @@ Rectangle {
                         // as the danger zone, scaled to one payment.
                         PushButton {
                             label: root.deleteArmed ? "Delete permanently" : "Delete"
+                            enabled: !root.saving
                             onClicked: {
                                 if (root.deleteArmed)
                                     root.deletePayment();

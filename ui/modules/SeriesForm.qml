@@ -53,6 +53,9 @@ Rectangle {
     property string weekday: "MO"
     property string weekendRule: "none"
     property var previewDates: []
+    // One write in flight at a time, as in EntryForm: Create stays live until
+    // the core answers, so a second press would otherwise create the series twice.
+    property bool saving: false
     // "never" | "on" | "after". Most recurring payments do not recur forever, and a rule with no
     // bound quietly projects one into every forecast you ever draw.
     property string endMode: "never"
@@ -256,9 +259,20 @@ Rectangle {
                                      && (root.stopCount === 0 || (root.routeOneCurrency && root.stopsFilledIn))
                                      && descField.text.length > 0 && root.previewDates.length > 0
 
+    function saveDone(e) {
+        root.saving = false;
+        if (e)
+            status.text = e.message;
+        else {
+            root.reset();
+            root.saved();
+        }
+    }
+
     function save() {
-        if (!root.complete)
+        if (!root.complete || root.saving)
             return;
+        root.saving = true;
         if (root.stopCount > 0) {
             const chain = {
                 description: descField.text,
@@ -272,14 +286,7 @@ Rectangle {
                 chain.scenario_id = root.scenarioId;
             if (root.endsOn.length === 10)
                 chain.until_on = root.endsOn;
-            Ledger.write("series.create_chain", chain, (r, e) => {
-                if (e)
-                    status.text = e.message;
-                else {
-                    root.reset();
-                    root.saved();
-                }
-            });
+            Ledger.write("series.create_chain", chain, (r, e) => root.saveDone(e));
             return;
         }
         const params = {
@@ -296,14 +303,7 @@ Rectangle {
             params.scenario_id = root.scenarioId;
         if (root.endsOn.length === 10)
             params.until_on = root.endsOn;
-        Ledger.write("series.create", params, (r, e) => {
-            if (e)
-                status.text = e.message;
-            else {
-                root.reset();
-                root.saved();
-            }
-        });
+        Ledger.write("series.create", params, (r, e) => root.saveDone(e));
     }
 
     Column {
@@ -650,13 +650,15 @@ Rectangle {
         Row {
             spacing: 8
             PushButton {
-                label: root.stopCount > 0 ? "Create " + (root.stopCount + 1) + " payments" : "Create"
+                label: root.saving ? "Creating…"
+                       : root.stopCount > 0 ? "Create " + (root.stopCount + 1) + " payments" : "Create"
                 primary: true
-                enabled: root.complete
+                enabled: root.complete && !root.saving
                 onClicked: root.save()
             }
             PushButton {
                 label: "Cancel"
+                enabled: !root.saving
                 onClicked: {
                     root.reset();
                     root.cancelled();
@@ -677,6 +679,18 @@ Rectangle {
                 color: Theme.warnAmber
                 font.family: Theme.fontFamily
                 font.pixelSize: Theme.fontSize - 2
+            }
+        }
+    }
+
+    // The core dying mid-save drops the callback uninvoked; unstick Create,
+    // but say the series is unconfirmed rather than inviting a blind retry.
+    Connections {
+        target: Ledger
+        function onRunningChanged() {
+            if (!Ledger.running && root.saving) {
+                root.saving = false;
+                status.text = "the ledger core stopped before confirming — check whether the series was created before creating it again";
             }
         }
     }

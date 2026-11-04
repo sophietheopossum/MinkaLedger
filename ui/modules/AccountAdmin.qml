@@ -42,6 +42,7 @@ Rectangle {
     // opening either closes the other rather than letting the height rule pick a winner.
     property int editingOpening: -1
     property int editingName: -1
+    property bool saving: false
 
     function removable(a) {
         return a.postings === 0 && a.series === 0 && a.rules === 0
@@ -71,9 +72,13 @@ Rectangle {
     }
 
     function saveOpening(a, text, date) {
+        if (root.saving)
+            return;
+        root.saving = true;
         const commit = (minor) => {
             Ledger.write("account.set_opening",
                          { id: a.id, amount_minor: minor, occurred_on: date }, (r, e) => {
+                root.saving = false;
                 root.note = e ? e.message : "";
                 if (!e) { root.editingOpening = -1; root.changed(); }
             });
@@ -84,7 +89,11 @@ Rectangle {
         }
         Ledger.request("money.parse",
                        { text: text, minor_digits: Money.digits(a.currency) }, (pr, pe) => {
-            if (pe) { root.note = pe.message; return; }
+            if (pe) {
+                root.saving = false;
+                root.note = pe.message;
+                return;
+            }
             // Same convention as the create form: a liability is stated as what is owed.
             commit(a.kind === "liability" ? -Math.abs(pr.minor) : pr.minor);
         });
@@ -118,7 +127,11 @@ Rectangle {
             root.note = "An account needs a name.";
             return;
         }
+        if (root.saving)
+            return;
+        root.saving = true;
         Ledger.write("account.rename", { id: a.id, name: name }, (r, e) => {
+            root.saving = false;
             root.note = e ? e.message : "";
             field.invalid = !!e;
             // Renaming to the name it already has is a normal success, not an error, so an
@@ -128,19 +141,38 @@ Rectangle {
     }
 
     function setClosed(a, closed) {
+        if (root.saving)
+            return;
+        root.saving = true;
         root.armed = -1;
         Ledger.write("account.close", { id: a.id, closed: closed }, (r, e) => {
+            root.saving = false;
+            root.note = e ? e.message : "";
             if (!e) root.changed();
         });
     }
     function remove(a) {
+        if (root.saving)
+            return;
+        root.saving = true;
         root.armed = -1;
         Ledger.write("account.delete", { id: a.id }, (r, e) => {
+            root.saving = false;
             root.note = e ? e.message : "";
             if (!e) root.changed();
         });
     }
     property string note: ""
+
+    Connections {
+        target: Ledger
+        function onRunningChanged() {
+            if (!Ledger.running && root.saving) {
+                root.saving = false;
+                root.note = "the ledger core stopped before confirming — check whether the change was made before trying again";
+            }
+        }
+    }
 
     // A LIST, not an unbounded Column, and a footer pinned to the panel instead of trailing the rows.
     //
@@ -237,6 +269,7 @@ Rectangle {
                         implicitHeight: 22
                         label: "name"
                         primary: root.editingName === row.modelData.id
+                        enabled: !root.saving
                         onClicked: {
                             if (root.editingName === row.modelData.id)
                                 root.editingName = -1;
@@ -252,6 +285,7 @@ Rectangle {
                                  || row.modelData.kind === "liability"
                         label: "£"
                         primary: root.editingOpening === row.modelData.id
+                        enabled: !root.saving
                         onClicked: {
                             if (root.editingOpening === row.modelData.id)
                                 root.editingOpening = -1;
@@ -263,6 +297,7 @@ Rectangle {
                         implicitWidth: 44
                         implicitHeight: 22
                         label: row.modelData.closed ? "show" : "hide"
+                        enabled: !root.saving
                         onClicked: root.setClosed(row.modelData, !row.modelData.closed)
                     }
                     PushButton {
@@ -270,7 +305,7 @@ Rectangle {
                         implicitHeight: 22
                         // Disabled rather than hidden: "why can't I delete this" is answered by
                         // the count beside the name, not by an absent control.
-                        enabled: root.removable(row.modelData)
+                        enabled: root.removable(row.modelData) && !root.saving
                         label: root.armed === row.modelData.id ? "sure?" : "×"
                         primary: root.armed === row.modelData.id
                         onClicked: {
@@ -307,8 +342,9 @@ Rectangle {
                     anchors.verticalCenter: parent.verticalCenter
                     implicitWidth: 40
                     implicitHeight: 22
-                    label: "save"
+                    label: root.saving ? "…" : "save"
                     primary: true
+                    enabled: !root.saving
                     onClicked: root.saveName(row.modelData, nameField)
                 }
             }
@@ -351,8 +387,9 @@ Rectangle {
                     anchors.verticalCenter: parent.verticalCenter
                     implicitWidth: 40
                     implicitHeight: 22
-                    label: "save"
+                    label: root.saving ? "…" : "save"
                     primary: true
+                    enabled: !root.saving
                     onClicked: root.saveOpening(row.modelData, obAmount.text, obDate.text)
                 }
             }

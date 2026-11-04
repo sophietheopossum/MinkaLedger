@@ -26,6 +26,7 @@ Rectangle {
 
     property var currencies: []
     property string note: ""
+    property bool saving: false
     property int manualDigits: 2
     property bool manual: false
 
@@ -78,13 +79,15 @@ Rectangle {
     readonly property bool existing: (root.currencies || []).some(c => c.code === root.code)
 
     function add() {
-        if (!root.validCode || root.existing)
+        if (!root.validCode || root.existing || root.saving)
             return;
+        root.saving = true;
         const digits = root.match ? root.match[1] : root.manualDigits;
         const name = root.match ? root.match[0]
                                 : (nameField.text.trim().length > 0 ? nameField.text.trim() : root.code);
         Ledger.write("currency.create",
                      { code: root.code, minor_digits: digits, name: name }, (r, e) => {
+            root.saving = false;
             if (e) { root.note = e.message; return; }
             root.note = r.code + " added — " + r.name + ", " + r.minor_digits + " decimal places";
             codeField.clear(); nameField.clear();
@@ -95,10 +98,24 @@ Rectangle {
     }
 
     function remove(c) {
+        if (root.saving)
+            return;
+        root.saving = true;
         Ledger.write("currency.delete", { code: c.code }, (r, e) => {
+            root.saving = false;
             root.note = e ? e.message : (c.code + " removed");
             if (!e) { root.reload(); root.changed(); }
         });
+    }
+
+    Connections {
+        target: Ledger
+        function onRunningChanged() {
+            if (!Ledger.running && root.saving) {
+                root.saving = false;
+                root.note = "the ledger core stopped before confirming — check whether the change was made before trying again";
+            }
+        }
     }
 
     Column {
@@ -191,9 +208,9 @@ Rectangle {
         Row {
             spacing: 8
             PushButton {
-                label: "Add currency"
+                label: root.saving ? "Saving…" : "Add currency"
                 primary: root.validCode && !root.existing
-                enabled: root.validCode && !root.existing
+                enabled: root.validCode && !root.existing && !root.saving
                 onClicked: root.add()
             }
             Text {

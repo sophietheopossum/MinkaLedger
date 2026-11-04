@@ -92,6 +92,7 @@ Rectangle {
     property string sideResult: ""
     property bool sideFailed: false
     property bool busy: false
+    property string busyKind: ""  // snapshot, bundle or csv while `busy`
 
     property bool redact: false
     property bool withForecast: false
@@ -119,7 +120,10 @@ Rectangle {
         root.collided = false;
         root.sideResult = "";
         root.sideFailed = false;
-        root.busy = false;
+        // Reopening the panel must not pretend an in-flight write has finished:
+        // the callback, or the core-stop watcher below, owns clearing this.
+        if (!root.busy)
+            root.busyKind = "";
     }
 
     function defaultFolder() {
@@ -206,6 +210,7 @@ Rectangle {
             return;
         }
         root.busy = true;
+        root.busyKind = "snapshot";
         root.result = "";
         root.failed = false;
         root.collided = false;
@@ -217,6 +222,7 @@ Rectangle {
         Ledger.request("export.snapshot", { path: path }, (r, e) => {
             if (!e) {
                 root.busy = false;
+                root.busyKind = "";
                 root.failed = false;
                 root.collided = false;
                 // The next backup should not open on a name that has just been taken.
@@ -235,6 +241,7 @@ Rectangle {
                 return;
             }
             root.busy = false;
+            root.busyKind = "";
             root.failed = true;
             root.collided = gone;
             if (gone) {
@@ -269,6 +276,8 @@ Rectangle {
     }
 
     function writeSide(kind, path) {
+        if (root.busy)
+            return;
         if (!Ledger.running) {
             root.sideFailed = true;
             root.sideResult = "The ledger core is not running — nothing can be written.";
@@ -279,7 +288,11 @@ Rectangle {
             opt.path = path;
         root.sideResult = "";
         root.sideFailed = false;
+        root.busy = true;
+        root.busyKind = kind;
         Ledger.request(kind === "bundle" ? "export.bundle" : "export.csv", opt, (r, e) => {
+            root.busy = false;
+            root.busyKind = "";
             if (e) {
                 root.sideFailed = true;
                 root.sideResult = e.message;
@@ -297,6 +310,8 @@ Rectangle {
     /// The dialog opens ON the name that would be written anyway, so choosing a place is a
     /// change of mind rather than a step — and nobody has to type a path to use this panel.
     function openChooser(kind) {
+        if (root.busy)
+            return;
         const dir = kind === "snapshot" ? root.folder : root.sideFolder;
         chooser.kind = kind;
         chooser.currentFolder = root.toUrl(dir);
@@ -311,11 +326,19 @@ Rectangle {
         target: Ledger
         function onRunningChanged() {
             if (!Ledger.running && root.busy) {
+                const kind = root.busyKind;
                 root.busy = false;
-                root.failed = true;
-                root.collided = false;
-                root.result = "The ledger core stopped before it confirmed the backup — treat any "
-                            + "file of that name as unfinished.";
+                root.busyKind = "";
+                if (kind === "snapshot") {
+                    root.failed = true;
+                    root.collided = false;
+                    root.result = "The ledger core stopped before it confirmed the backup — treat any "
+                                + "file of that name as unfinished.";
+                } else {
+                    root.sideFailed = true;
+                    root.sideResult = "The ledger core stopped before it confirmed the export — treat any "
+                                    + "file of that name as unfinished.";
+                }
             }
         }
     }
@@ -521,23 +544,23 @@ Rectangle {
             width: parent.width
             spacing: 8
             PushButton {
-                label: "Write JSON archive"
-                enabled: Ledger.running
+                label: root.busyKind === "bundle" ? "Writing…" : "Write JSON archive"
+                enabled: Ledger.running && !root.busy
                 onClicked: root.writeSide("bundle", undefined)
             }
             PushButton {
-                label: "Write CSV"
-                enabled: Ledger.running
+                label: root.busyKind === "csv" ? "Writing…" : "Write CSV"
+                enabled: Ledger.running && !root.busy
                 onClicked: root.writeSide("csv", undefined)
             }
             PushButton {
                 label: "Write JSON to…"
-                enabled: Ledger.running
+                enabled: Ledger.running && !root.busy
                 onClicked: root.openChooser("bundle")
             }
             PushButton {
                 label: "Write CSV to…"
-                enabled: Ledger.running
+                enabled: Ledger.running && !root.busy
                 onClicked: root.openChooser("csv")
             }
         }

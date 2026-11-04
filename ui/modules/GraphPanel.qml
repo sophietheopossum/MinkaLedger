@@ -79,6 +79,7 @@ Rectangle {
     property int shown: 0
     property int total: 0
     property string note: ""
+    property bool saving: false   // a link.create/link.delete is in flight
 
     // ---- the simulation ----
     // Parallel arrays indexed like `nodes`, mutated in place on every tick. Not one object per
@@ -120,6 +121,12 @@ Rectangle {
     Connections {
         target: Ledger
         function onRevisionChanged() { if (root.visible) root.load(); }
+        function onRunningChanged() {
+            if (!Ledger.running && root.saving) {
+                root.saving = false;
+                root.note = "the ledger core stopped before confirming — check whether the change was made before trying again";
+            }
+        }
     }
 
     function load() {
@@ -627,14 +634,22 @@ Rectangle {
         return !na.shared && !nb.shared && na.account_id === nb.account_id;
     }
     function fuse(a, b) {
+        if (root.saving)
+            return;
         const pair = root.linkPair(a, b);
         if (!pair) return;
+        root.saving = true;
         Ledger.write("link.create", pair, (r, e) => {
+            root.saving = false;
             root.note = e ? e.message : "";
         });
     }
     function unlink(fromTxn, toTxn) {
+        if (root.saving)
+            return;
+        root.saving = true;
         Ledger.write("link.delete", { from_txn: fromTxn, to_txn: toTxn }, (r, e) => {
+            root.saving = false;
             root.note = e ? e.message : "";
         });
     }

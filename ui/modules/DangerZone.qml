@@ -28,6 +28,7 @@ Rectangle {
     property var counts: null
     property string result: ""
     property string backup: ""
+    property bool saving: false
 
     // Both triggers: onVisibleChanged alone misses a panel that starts visible, since the signal
     // fires on a CHANGE and there was none.
@@ -71,9 +72,11 @@ Rectangle {
     readonly property bool armed: confirmField.text === root.token
 
     function reset() {
-        if (!root.armed)
+        if (!root.armed || root.saving)
             return;
+        root.saving = true;
         Ledger.write("book.reset", { confirm: root.token }, (r, e) => {
+            root.saving = false;
             if (e) {
                 root.result = e.message;
                 return;
@@ -86,6 +89,18 @@ Rectangle {
             root.load();
             root.changed();
         });
+    }
+
+    Connections {
+        target: Ledger
+        function onRunningChanged() {
+            // The core restarts onto the emptied book after a successful reset,
+            // so only report an unconfirmed wipe if it stopped before answering.
+            if (!Ledger.running && root.saving) {
+                root.saving = false;
+                root.result = "the ledger core stopped before confirming — check whether the book was emptied before trying again";
+            }
+        }
     }
 
     Column {
@@ -140,14 +155,15 @@ Rectangle {
             }
             PushButton {
                 anchors.verticalCenter: parent.verticalCenter
-                label: "Empty the book"
-                enabled: root.armed
+                label: root.saving ? "Emptying…" : "Empty the book"
+                enabled: root.armed && !root.saving
                 onClicked: root.reset()
             }
             PushButton {
                 anchors.verticalCenter: parent.verticalCenter
                 label: "Cancel"
                 primary: true
+                enabled: !root.saving
                 onClicked: root.done()
             }
         }

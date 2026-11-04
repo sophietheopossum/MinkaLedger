@@ -69,6 +69,9 @@ Rectangle {
     property bool loading: false
     property bool undoArmed: false
     property var undoCheck: null
+    // A save or undo (including undo's dry run) in flight. The dry-run check
+    // has its own `checking`; this stops the write itself being sent twice.
+    property bool saving: false
 
     function dmy(iso) {
         if (!iso || iso.length !== 10)
@@ -378,8 +381,14 @@ Rectangle {
     // describes a book that is gone, so it is asked again.
     Connections {
         target: Ledger
+        function onRunningChanged() {
+            if (!Ledger.running && root.saving) {
+                root.saving = false;
+                status.text = "the ledger core stopped before confirming — check whether the change was made before trying again";
+            }
+        }
         function onRevisionChanged() {
-            if (!root.active || !root.visible)
+            if (!root.active || !root.visible || root.saving)
                 return;
             root.undoArmed = false;
             root.undoCheck = null;
@@ -390,7 +399,7 @@ Rectangle {
 
     readonly property var drops: root.check ? (root.check.blockers || []).filter(b => b.kind === "override") : []
     readonly property var dues: root.check ? (root.check.blockers || []).filter(b => b.kind === "due") : []
-    readonly property bool canSave: root.complete && root.check !== null && !root.checking
+    readonly property bool canSave: root.complete && root.check !== null && !root.checking && !root.saving
                                     && root.check.mode !== "unchanged"
                                     && (root.check.refusal === null || root.check.refusal.code === "would_drop"
                                         || root.check.refusal.code === "would_fall_due")
@@ -422,7 +431,7 @@ Rectangle {
     }
 
     function save() {
-        if (!root.canSave)
+        if (root.saving || !root.canSave)
             return;
         if (root.needsArm && !root.armed) {
             root.armed = true;
@@ -432,7 +441,9 @@ Rectangle {
             drop_overrides: root.drops.length > 0,
             acknowledge_due: root.dues.length > 0
         });
+        root.saving = true;
         Ledger.write("series.revise", params, (r, e) => {
+            root.saving = false;
             root.armed = false;
             if (e) {
                 status.text = e.message;
@@ -444,8 +455,12 @@ Rectangle {
     }
 
     function undo() {
+        if (root.saving)
+            return;
+        root.saving = true;
         if (!root.undoArmed) {
             Ledger.request("series.undo_change", { id: root.rule.current.ids[0], as_of: root.asOf, dry_run: true }, (r, e) => {
+                root.saving = false;
                 if (e) {
                     status.text = e.message;
                     return;
@@ -459,6 +474,7 @@ Rectangle {
             id: root.rule.current.ids[0], as_of: root.asOf,
             acknowledge_due: root.undoCheck !== null && root.undoCheck.blockers.length > 0
         }, (r, e) => {
+            root.saving = false;
             root.undoArmed = false;
             if (e)
                 status.text = e.message;
@@ -872,7 +888,8 @@ Rectangle {
         Row {
             spacing: 8
             PushButton {
-                label: root.armed ? "Confirm"
+                label: root.saving ? "Saving…"
+                       : root.armed ? "Confirm"
                        : root.check && root.check.mode === "split" ? "Save from " + root.dmy(root.check.created.dtstart)
                        : root.check && root.check.mode === "unchanged" ? "Nothing to save"
                        : "Save"
@@ -882,6 +899,7 @@ Rectangle {
             }
             PushButton {
                 label: "Cancel"
+                enabled: !root.saving
                 onClicked: {
                     root.armed = false;
                     root.undoArmed = false;
@@ -891,6 +909,7 @@ Rectangle {
             PushButton {
                 visible: root.active && root.changedBefore && !root.whatIf
                 label: root.undoArmed ? "sure? undo" : "undo change from " + (root.active ? root.dmy(root.rule.current.dtstart) : "")
+                enabled: !root.saving
                 onClicked: root.undo()
             }
         }
