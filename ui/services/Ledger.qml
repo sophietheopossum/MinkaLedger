@@ -1,7 +1,6 @@
 pragma Singleton
 import QtQuick
 import Quickshell
-import Quickshell.Io
 // Through the config-root symlink: Quickshell only honours qmldir registration
 // for paths inside the shell root.
 import "../MinkaLink"
@@ -22,7 +21,7 @@ Singleton {
     property string binary: Quickshell.env("MINKA_LEDGER_BIN") || "minka-ledger"
     property string book: Quickshell.env("MINKA_LEDGER_DB") || ""
 
-    readonly property bool running: proc.running
+    readonly property bool running: core.running
     property string lastError: ""
 
     // Bumped whenever something is written, so views can re-query without polling.
@@ -34,7 +33,7 @@ Singleton {
     property var _pendingStart: []
 
     function request(method, params, onResult) {
-        if (!proc.running) {
+        if (!core.running) {
             _pendingStart.push({ method, params, onResult });
             return;
         }
@@ -67,41 +66,32 @@ Singleton {
 
     NdjsonRpc {
         id: rpc
-        writeLine: line => {
-            if (proc.running)
-                proc.write(line);
-        }
+        writeLine: line => core.write(line)
     }
 
-    Process {
-        id: proc
+    CoreProcess {
+        id: core
         // `--db ""` would create a book called "" -- omit the flag entirely and let the core pick.
         command: root.book.length > 0 ? [root.binary, "--db", root.book] : [root.binary]
-        running: true
 
-        stdout: SplitParser {
-            onRead: line => rpc.feedLine(line)
-        }
+        onLine: line => rpc.feedLine(line)
         // The core writes diagnostics to stderr; surfacing them is how a missing binary or an
         // unreadable book becomes visible rather than a silent dead UI.
-        stderr: SplitParser {
-            onRead: line => {
-                if (line.indexOf("cannot open") >= 0)
-                    root.lastError = line;
-            }
+        onStderrLine: line => {
+            if (line.indexOf("cannot open") >= 0)
+                root.lastError = line;
         }
-        onRunningChanged: {
-            if (running) {
-                root.lastError = "";
-                root._flushPendingStart();
-            } else {
-                // ONLY a DROPPED transport invalidates outstanding callbacks, so the reset belongs
-                // here and not on the way up as well. Nothing needs clearing on the way up: a
-                // previous process's callbacks were dropped when IT exited, and ids are never
-                // reused.
-                rpc.reset();
-                root.lastError = "ledger core exited";
-            }
+        onStarted: {
+            root.lastError = "";
+            root._flushPendingStart();
+        }
+        onExited: {
+            // ONLY a DROPPED transport invalidates outstanding callbacks, so the reset belongs
+            // here and not on the way up as well. Nothing needs clearing on the way up: a
+            // previous process's callbacks were dropped when IT exited, and ids are never
+            // reused.
+            rpc.reset();
+            root.lastError = "ledger core exited";
         }
     }
 }
